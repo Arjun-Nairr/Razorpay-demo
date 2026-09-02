@@ -34,7 +34,93 @@ requirements in `PROJECT_BRIEF.md`.
   stored as a project file.
 - Graphify was evaluated and deferred until a meaningful codebase exists; it
   maps code structure but does not replace product-decision handoffs.
-- Status: Prompt 01 ready for Claude Code. No implementation has started yet.
+- Status: Iteration 01 complete. Case 1 in-memory vertical slice implemented and
+  tested; see the iteration record below.
+
+## Iteration 01 — Case 1 in-memory vertical slice
+
+- Branch: `feat/case-1-recovery-slice` (off `main`).
+- Slice commit: `1a9dcc692d8fbbb8cc74dd9e11a5a62560fd27f4`
+  (`feat(engine): in-memory Case 1 recovery vertical slice`).
+- Baseline commit on `main`: `d8f9eb9`
+  (`chore: initialize repository with project documents and Python .gitignore`).
+- Repository was absent; initialized here. No Git remote exists:
+  `REMOTE_NOT_CONFIGURED` (nothing pushed).
+
+### Files added
+
+- `.gitignore` — Python + tooling caches + `.env` (keeps `.env.example`).
+- `pyproject.toml` — `hermes-recovery`, Python >=3.11, no runtime deps,
+  `dev = [pytest]`, `pytest pythonpath = ["src"]` (no install step needed).
+- `src/hermes/__init__.py`
+- `src/hermes/types.py` — typed data across the engine seam: `RazorpayWebhook`
+  /`WebhookType`, `ProposalAction`/`StrategyProposal`,
+  `PolicyOutcome`/`PolicyDecision`, `ReceiveResult`/`RunReport`,
+  `Case`/`CaseState`/`ScheduledWork`/`AuditEvent`, audit-kind constants.
+- `src/hermes/adapters.py` — `FakeRazorpayAdapter` (records + verifies captures),
+  `ScriptedStrategist` (reason-code -> canned typed proposal, `.calls` counter),
+  `InMemoryLedger` (cases, scheduled work, append-only audit, event dedup set,
+  `recovered_minor` accumulator, monotonic id/seq counters).
+- `src/hermes/engine.py` — `RecoveryEngine` with only `receive` / `run` /
+  `inspect`, plus the module-level deterministic `authorize()` policy function.
+- `tests/test_case1.py` — 11 behaviours, all through the public engine surface.
+
+Existing project documents were not modified (this file excepted).
+
+### Implemented behaviour (Case 1)
+
+- Logical time is an integer monotonic clock in logical hours; `run(until)`
+  raises `ValueError` if `until` < current clock.
+- `receive(payment.failed)`: dedups `event_id`; first failure for an obligation
+  creates exactly one `active` case, audits `INPUT_EVENT`, enqueues an immediate
+  re-evaluation. A later failure for the same obligation neither forks a case nor
+  reopens a terminal one.
+- `run(until)`: claims due work in `(due_time, work_id)` order; builds a
+  source-labelled snapshot; calls the scripted strategist (outside the state
+  mutation); audits `AI_PROPOSAL`; applies `authorize()`; audits
+  `POLICY_DECISION`; on `ALLOW` of `WAIT_FOR_PROVIDER_RETRY` sets the case
+  `waiting`, schedules re-evaluation at `now + min(wait, 72)`, audits
+  `SCHEDULED_ACTION`. Work-loop cap 50 steps/call.
+- `receive(payment.captured)`: audits `INPUT_EVENT`; verifies via
+  `FakeRazorpayAdapter`; on amount match audits `PAYMENT_CONFIRMATION`, cancels
+  pending work (`PENDING_WORK_CANCELLED`), adds `amount_minor` to
+  `recovered_minor` once (guarded by `Case.counted`), sets state `recovered`,
+  links the payment id, audits `TERMINAL_TRANSITION`. Duplicate provider event
+  id, or any capture for an already-`recovered` case, is a no-op for money.
+- `inspect({"kind": ...})` returns dict projections for `case` (by `case_id` or
+  `obligation_id`), `batch` (`cases`, `recovered_cases`, `recovered_minor`), and
+  `audit` (ordered append-only events, optionally filtered by `case_id`).
+- ₹10,000 is represented as `1_000_000` integer minor units (paise).
+
+### Verification
+
+- `cd C:\Users\dwish\Documents\Codex\2026-09-02\fors\outputs\ai-revenue-recovery`
+- `python -m pytest -q` → `11 passed in ~0.1s`.
+- `python -m compileall -q src tests` → clean.
+- No lint/type tooling is configured in `pyproject.toml`, so none was run.
+
+### Limitations (intentional, in scope for later prompts)
+
+- `authorize()` implements only the terminal-state guard and the
+  `WAIT_FOR_PROVIDER_RETRY` path; the full 10-step policy order (cooldowns,
+  attempt/message limits, consent, dispute, commercial safety, reconciliation)
+  is not implemented. Marked with a `ponytail:` comment.
+- No HMAC verification — webhooks are trusted fakes.
+- No real Razorpay / Gemini / Neon / FastAPI / Streamlit; no transactional
+  outbox (in-memory dict, single-threaded — ordering documented via comments so a
+  real ledger can keep external calls between commits).
+- Only `ProposalAction.WAIT_FOR_PROVIDER_RETRY` is authorizable; other actions
+  return `BLOCK` `action_not_supported_in_slice`.
+- `inspect` takes/returns dicts, not typed `RecoveryQuery`/`RecoveryView`.
+- Cases 2–5 not implemented.
+
+### Exact recommended next action
+
+Codex reviews commit `1a9dcc6` (diff `main..feat/case-1-recovery-slice`), then
+issues Prompt 02 for Case 3 (insufficient funds with strategy adaptation) to
+force `SEND_REMINDER` / `CREATE_RECOVERY_LINK` proposals, the message
+cooldown/limit rules, and the re-evaluation-after-failed-retry path through the
+same `receive` / `run` / `inspect` surface.
 
 ## Decisions and invariants
 
@@ -132,6 +218,8 @@ only a redacted `.env.example` when implementation begins.
 
 ## Exact next action
 
-Open the shared directory in Claude Code and paste Prompt 01 from the active
-Codex chat. After Claude returns, Codex must inspect its diff, commit, tests, and
-updated handoff before issuing Prompt 02.
+Codex reviews commit `1a9dcc6` on `feat/case-1-recovery-slice`
+(diff `main..feat/case-1-recovery-slice`; run `python -m pytest -q` to
+reproduce the 11 passing behaviours), then issues Prompt 02 as described in
+"Iteration 01 -> Exact recommended next action" above. No Git remote exists, so
+nothing has been pushed (`REMOTE_NOT_CONFIGURED`).
