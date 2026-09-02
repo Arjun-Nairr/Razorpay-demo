@@ -34,9 +34,103 @@ requirements in `PROJECT_BRIEF.md`.
   stored as a project file.
 - Graphify was evaluated and deferred until a meaningful codebase exists; it
   maps code structure but does not replace product-decision handoffs.
-- Status: Iteration 03 (corrective) complete. Atomic work claiming, protocol
-  seam, fail-closed eligibility, payment-id validation, corrected retry budget;
-  see the iteration records below.
+- Status: Iteration 04 (corrective) complete. Exclusive one-item work leases,
+  atomic webhook intake, atomic version-guarded capture finalization; see the
+  iteration records below.
+
+## Iteration 04 — Corrective: exclusive leases + atomic intake/capture
+
+- Branch: `feat/case-1-recovery-slice` (unchanged).
+- Implementation commit: `95fe631cdd1fcaa4db857e1b9d1ce6d639407d1d`
+  (`fix(engine): exclusive work leases, atomic webhook intake, atomic capture`).
+- Handoff commit: `this commit`.
+- `origin` = https://github.com/Arjun-Nairr/Razorpay-demo.git; branch pushed
+  with upstream set.
+- Correction-only: no scenarios, integrations, UI, dependencies, or product
+  policy changes. Documents unchanged except this file.
+
+### Changed files
+
+- `src/hermes/types.py` — `valid_payment_id()` helper; `CaseSnapshot.version`;
+  `ScheduledWork.claimed_at`; `IntakeCommand` / `IntakeResult` (replace
+  `OpenCaseCommand`); `CaptureCommand.expected_version` + `.expected_state`.
+- `src/hermes/protocols.py` — `Ledger.open_case` -> `Ledger.apply_intake`; notes
+  that `claim_due_work` leases at most one item and never yields a live lease.
+- `src/hermes/adapters.py` — `LEASE_TTL_HOURS = 6`; `claim_due_work` now leases
+  exactly one due item and skips any item whose lease is still live
+  (`now - claimed_at < LEASE_TTL_HOURS`), reclaiming only expired/abandoned
+  leases; `apply_intake` is the single atomic failed-intake transaction;
+  `apply_capture` now: dedups the provider event, then rejects
+  `stale_case_version` (version != expected) and `capture_on_terminal_case` and
+  `invalid_payment_id` **before** counting, then the existing global
+  payment-id dedup, then confirms.
+- `src/hermes/engine.py` — `receive` FAILED path is one `apply_intake` call
+  (no `_on_failed`, no engine check-then-write); `_on_captured` records the
+  pre-verification `snap.version` / `snap.state` into `CaptureCommand` and maps
+  a `duplicate_event` result to `ReceiveResult.duplicate`; `run` loop drops the
+  `seen_ids` guard (single-lease + live-lease skip make it unnecessary;
+  `WORK_LOOP_LIMIT` remains the hard cap); uses `types.valid_payment_id`.
+- `tests/test_case1.py` — 36 tests (was 28).
+
+### Corrections applied (each has an automated test)
+
+1. **Exclusive work claims** — `claim_due_work` leases one item and never
+   returns a live-leased item; finalization still checks token+version; an
+   abandoned lease is reclaimable after `LEASE_TTL_HOURS`.
+   `test_losing_runner_makes_zero_strategist_calls` (loser: 0 strategist calls,
+   0 steps, 0 stale_claims), `test_expired_lease_can_be_reclaimed`,
+   `test_claim_due_work_leases_one_item_per_call`,
+   `test_run_drains_all_work_this_runner_exclusively_owns`,
+   `test_stale_claim_after_capture_does_not_retransition` (retained).
+2. **Atomic webhook intake** — `apply_intake` does dedup + one-case-per-
+   obligation + INPUT_EVENT audit + initial-work enqueue in one transaction;
+   the engine no longer branches check-then-write.
+   `test_repeated_failed_delivery_creates_one_case_and_one_work` (repeated /
+   same-obligation deliveries -> one case, one initial work item),
+   `test_intake_is_a_single_ledger_command_not_check_then_write`.
+3. **Atomic capture finalization** — `CaptureCommand` carries
+   `expected_version` / `expected_state`; `apply_capture` atomically rejects a
+   stale or terminal case before counting; provider event + global payment-id
+   dedup preserved; invalid-id rejected.
+   `test_two_captured_events_racing_produce_one_recovery`,
+   `test_interleaved_capture_finalization_is_atomic` (competing capture bumps
+   the version mid-flight -> loser rejected `stale_case_version`, one recovery),
+   `test_repeated_captured_event_is_a_silent_noop`.
+
+### Verification
+
+- `cd C:\Users\dwish\Documents\Codex\2026-09-02\fors\outputs\ai-revenue-recovery`
+- `python -m pytest -q` → `36 passed in ~0.3s`.
+- `python -m compileall -q src tests` → clean.
+- No lint/type tooling configured; none run.
+- `git diff` reviewed: only the five source/test files; no docs, pyproject, or
+  unrelated changes; no secrets.
+
+### Remaining limitations (in scope for later prompts)
+
+- Concurrency is single-process cooperative. `claim_due_work` leasing +
+  `claimed_at` TTL model a DB row visibility/lock timeout; `apply_*` methods
+  model single transactions. There is no real thread/row locking, and lease
+  expiry is in logical hours advanced only by `run(until=...)`.
+- `apply_capture`'s `stale_case_version` / `capture_on_terminal_case` guards are
+  both defended; in this slice a competing capture always drives the case
+  terminal, so the version guard is what fires in the interleaved test and the
+  terminal guard is defense-in-depth.
+- `authorize()` remains the partial Case-1 policy (terminal guard +
+  eligibility-gated wait); full 10-step order still pending.
+- Cross-obligation payment-id conflict and capture-amount mismatch audit
+  `ESCALATE`/`BLOCK` without transitioning the affected case's state.
+- No HMAC / real Razorpay / Gemini / Neon / FastAPI / Streamlit; projection
+  shapes are Case-1 sized.
+
+### Exact recommended next action
+
+Codex reviews commit `95fe631cdd1fcaa4db857e1b9d1ce6d639407d1d` (diff `main..feat/case-1-recovery-slice`),
+then issues Prompt 05 for Case 3 (insufficient funds with adaptation): a
+scripted `WAIT_FOR_PROVIDER_RETRY` followed, after a failed provider-retry
+event, by `SEND_REMINDER` / `CREATE_RECOVERY_LINK`, exercising message
+cooldown/count limits and the re-evaluation-after-failed-retry path through the
+same `receive` / `run` / `inspect` surface.
 
 ## Iteration 03 — Corrective: atomic claims + adapter-neutral seam
 
@@ -399,9 +493,9 @@ only a redacted `.env.example` when implementation begins.
 
 ## Exact next action
 
-Codex reviews commit `3ac73f3` on `feat/case-1-recovery-slice`
+Codex reviews commit `95fe631cdd1fcaa4db857e1b9d1ce6d639407d1d` on `feat/case-1-recovery-slice`
 (diff `main..feat/case-1-recovery-slice`; run `python -m pytest -q` to
-reproduce the 28 passing behaviours), then issues Prompt 04 as described in
-"Iteration 03 -> Exact recommended next action" above. Remote `origin`
+reproduce the 36 passing behaviours), then issues Prompt 05 as described in
+"Iteration 04 -> Exact recommended next action" above. Remote `origin`
 (github.com/Arjun-Nairr/Razorpay-demo) is configured; `main` and
-`feat/case-1-recovery-slice` are pushed.
+`feat/case-1-recovery-slice` are pushed with upstream set.
