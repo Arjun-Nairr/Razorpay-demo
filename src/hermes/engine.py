@@ -26,9 +26,9 @@ from .types import (
     CaseSnapshot,
     DiscardWorkCommand,
     EvaluationCommand,
+    IntakeCommand,
     InvalidProposal,
     NoteEventCommand,
-    OpenCaseCommand,
     PolicyDecision,
     PolicyOutcome,
     ProposalAction,
@@ -44,14 +44,11 @@ from .types import (
     TERMINAL_STATES,
     WebhookType,
     WorkClaim,
+    valid_payment_id,
 )
 
 WORK_LOOP_LIMIT = 50  # steps per run() call
 MAX_WAIT_HOURS = 72
-
-
-def _valid_payment_id(value: str | None) -> bool:
-    return isinstance(value, str) and value.strip() != ""
 
 
 def _validate_proposal(obj: object) -> StrategyProposal:
@@ -110,54 +107,27 @@ class RecoveryEngine:
     # -- receive ---------------------------------------------------------
 
     def receive(self, webhook: RazorpayWebhook) -> ReceiveResult:
-        """Durable intake. Deduplicates the provider event, then updates state
-        through a single ledger transaction. Never calls the strategist and
-        never runs the work loop.
+        """Durable intake. Every branch resolves to exactly one atomic ledger
+        command - no engine-level check-then-write. Never calls the strategist
+        and never runs the work loop.
         """
         led = self._ledger
-        if led.has_seen_event(webhook.event_id):
-            return ReceiveResult(
-                True, True, led.case_id_for_obligation(webhook.obligation_id)
-            )
         if webhook.type is WebhookType.PAYMENT_FAILED:
-            return self._on_failed(webhook)
+            result = led.apply_intake(
+                IntakeCommand(
+                    event_id=webhook.event_id,
+                    obligation_id=webhook.obligation_id,
+                    amount_minor=webhook.amount_minor,
+                    currency=webhook.currency,
+                    reason_code=webhook.reason_code,
+                    now=self._clock,
+                )
+            )
+            return ReceiveResult(True, result.duplicate, result.case_id)
         if webhook.type is WebhookType.PAYMENT_CAPTURED:
             return self._on_captured(webhook)
         led.mark_event_seen(webhook.event_id)  # unsupported type: ignored
         return ReceiveResult(True, False, None)
-
-    def _on_failed(self, webhook: RazorpayWebhook) -> ReceiveResult:
-        led = self._ledger
-        case_id = led.case_id_for_obligation(webhook.obligation_id)
-        if case_id is not None:
-            snap = led.case_snapshot(case_id)
-            led.note_event(
-                NoteEventCommand(
-                    case_id=case_id,
-                    event_id=webhook.event_id,
-                    kind=AUDIT_INPUT_EVENT,
-                    detail={
-                        "event_id": webhook.event_id,
-                        "type": webhook.type.value,
-                        "note": "existing case; no transition",
-                        "case_state": snap.state,
-                    },
-                    now=self._clock,
-                )
-            )
-            return ReceiveResult(True, False, case_id)
-
-        case_id = led.open_case(
-            OpenCaseCommand(
-                event_id=webhook.event_id,
-                obligation_id=webhook.obligation_id,
-                amount_minor=webhook.amount_minor,
-                currency=webhook.currency,
-                reason_code=webhook.reason_code,
-                now=self._clock,
-            )
-        )
-        return ReceiveResult(True, False, case_id)
 
     def _on_captured(self, webhook: RazorpayWebhook) -> ReceiveResult:
         led = self._ledger
@@ -165,6 +135,11 @@ class RecoveryEngine:
         if case_id is None:
             led.mark_event_seen(webhook.event_id)  # nothing to attribute to
             return ReceiveResult(True, False, None)
+
+        # Fast-path reads; apply_capture re-validates dedup + version + terminal
+        # state atomically, so these never gate correctness on their own.
+        if led.has_seen_event(webhook.event_id):
+            return ReceiveResult(True, True, case_id)
 
         snap = led.case_snapshot(case_id)
         if snap.state in TERMINAL_STATES:
@@ -186,7 +161,7 @@ class RecoveryEngine:
 
         # Payment-identity validation happens BEFORE any provider recording or
         # verification. A missing/blank id can never move money or a case.
-        if not _valid_payment_id(webhook.payment_id):
+        if not valid_payment_id(webhook.payment_id):
             led.note_event(
                 NoteEventCommand(
                     case_id=case_id,
@@ -223,16 +198,21 @@ class RecoveryEngine:
             )
             return ReceiveResult(True, False, case_id)
 
-        led.apply_capture(
+        # expected_version / expected_state pin the case as observed *before*
+        # the external verification above; apply_capture rejects atomically if
+        # the case moved on (e.g. a racing captured event already finalized it).
+        result = led.apply_capture(
             CaptureCommand(
                 case_id=case_id,
                 event_id=webhook.event_id,
                 payment_id=capture.payment_id,
                 amount_minor=capture.amount_minor,
                 now=self._clock,
+                expected_version=snap.version,
+                expected_state=snap.state,
             )
         )
-        return ReceiveResult(True, False, case_id)
+        return ReceiveResult(True, result.reason == "duplicate_event", case_id)
 
     # -- run ---------------------------------------------------------
 
@@ -245,16 +225,15 @@ class RecoveryEngine:
         self._clock = until
         led = self._ledger
         steps = proposals = failures = scheduled = blocked = stale = 0
-        seen_ids: set[str] = set()
 
+        # claim_due_work leases at most one item and never returns work another
+        # runner holds a live lease on, so the loop drains only what this runner
+        # exclusively owns; WORK_LOOP_LIMIT is the hard backstop.
         while steps < WORK_LOOP_LIMIT:
             claims = led.claim_due_work(self._clock)
             if not claims:
                 break
             claim = claims[0]
-            if claim.work_id in seen_ids:
-                break  # re-leased without progress: another runner owns it
-            seen_ids.add(claim.work_id)
             steps += 1
 
             snap = led.case_snapshot(claim.case_id)

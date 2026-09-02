@@ -11,7 +11,12 @@ import pathlib
 
 import pytest
 
-from hermes.adapters import FakeRazorpayAdapter, InMemoryLedger, ScriptedStrategist
+from hermes.adapters import (
+    LEASE_TTL_HOURS,
+    FakeRazorpayAdapter,
+    InMemoryLedger,
+    ScriptedStrategist,
+)
 from hermes.engine import RecoveryEngine
 from hermes.types import AuditQuery, BatchQuery, CaseQuery, RazorpayWebhook, WebhookType
 
@@ -59,6 +64,50 @@ class HandoffStrategist:
             self._fired = True
             self._on_first_call()
         return self._inner.propose(snapshot)
+
+
+class CountingStrategist:
+    """Wraps a strategist and counts how many times propose() is invoked."""
+
+    def __init__(self, inner=None):
+        self._inner = inner or ScriptedStrategist()
+        self.calls = 0
+
+    def propose(self, snapshot):
+        self.calls += 1
+        return self._inner.propose(snapshot)
+
+
+class CrashStrategist:
+    """Dies mid-evaluation without letting the engine finalize the claim
+    (BaseException escapes the engine's ``except Exception``).
+    """
+
+    def propose(self, snapshot):
+        raise KeyboardInterrupt("process died holding a live claim")
+
+
+class ReentrantProvider:
+    """Payment provider that, on the first verify_capture, lets another actor
+    land a competing capture first - a deterministic capture-race harness.
+    """
+
+    def __init__(self, inner, on_first_verify):
+        self._inner = inner
+        self._on_first_verify = on_first_verify
+        self._fired = False
+
+    def retry_eligibility(self, obligation_id):
+        return self._inner.retry_eligibility(obligation_id)
+
+    def record_capture(self, obligation_id, payment_id, amount_minor):
+        return self._inner.record_capture(obligation_id, payment_id, amount_minor)
+
+    def verify_capture(self, obligation_id):
+        if not self._fired:
+            self._fired = True
+            self._on_first_verify()
+        return self._inner.verify_capture(obligation_id)
 
 
 @pytest.fixture
@@ -197,33 +246,85 @@ def test_batch_recovered_value_remains_correct(engine, razorpay):
     assert b.recovered_cases == 1
 
 
-# --- correction 1: atomic work claiming --------------------------------
+# --- correction 1: exclusive work claims -----------------------------
 
 
-def test_overlapping_claims_do_not_double_finalize(razorpay):
+def test_losing_runner_makes_zero_strategist_calls(razorpay):
     ledger = InMemoryLedger()
     eligible(razorpay)
-    runner_b = RecoveryEngine(ledger, ScriptedStrategist(), razorpay)
-    runner_a = RecoveryEngine(
-        ledger,
-        HandoffStrategist(ScriptedStrategist(), lambda: runner_b.run(until=1)),
-        razorpay,
+    loser_strategist = CountingStrategist()
+    loser_reports = []
+
+    def loser_attempt():
+        loser = RecoveryEngine(ledger, loser_strategist, razorpay)
+        loser_reports.append(loser.run(until=1))
+
+    winner = RecoveryEngine(
+        ledger, HandoffStrategist(ScriptedStrategist(), loser_attempt), razorpay
     )
-    runner_a.receive(failed_event())
+    winner.receive(failed_event())
 
-    report_a = runner_a.run(until=1)
+    winner_report = winner.run(until=1)
 
-    assert report_a.stale_claims == 1 and report_a.proposals == 0
-    cv = runner_a.inspect(CaseQuery(obligation_id=OBLIGATION))
-    assert cv.state == "waiting"
-    assert cv.pending_work == 1  # one follow-up, not two
-    assert cv.version == 1  # a single transition happened
+    # The winner held the lease for the whole evaluation; the loser saw nothing.
+    assert loser_strategist.calls == 0
+    assert loser_reports[0].steps == 0
+    assert loser_reports[0].proposals == 0
+    assert loser_reports[0].stale_claims == 0
+    # Exactly one finalization by the winner.
+    assert winner_report.proposals == 1 and winner_report.stale_claims == 0
+    cv = winner.inspect(CaseQuery(obligation_id=OBLIGATION))
+    assert cv.state == "waiting" and cv.pending_work == 1 and cv.version == 1
     scheduled = [
         r
-        for r in runner_a.inspect(AuditQuery(case_id=cv.case_id)).records
+        for r in winner.inspect(AuditQuery(case_id=cv.case_id)).records
         if r.kind == "SCHEDULED_ACTION" and r.detail.get("kind") == "evaluate"
     ]
     assert len(scheduled) == 1
+
+
+def test_expired_lease_can_be_reclaimed(razorpay):
+    ledger = InMemoryLedger()
+    eligible(razorpay)
+    crashed = RecoveryEngine(ledger, CrashStrategist(), razorpay)
+    crashed.receive(failed_event())
+    with pytest.raises(KeyboardInterrupt):
+        crashed.run(until=1)  # leases the work, then dies before finalizing
+
+    healthy = RecoveryEngine(ledger, ScriptedStrategist(), razorpay)
+    # While the lease is still live the work is untouchable.
+    assert healthy.run(until=1 + LEASE_TTL_HOURS - 1).steps == 0
+    assert healthy.inspect(CaseQuery(obligation_id=OBLIGATION)).state == "active"
+
+    # Once the lease expires the abandoned work is safely reclaimed.
+    report = healthy.run(until=1 + LEASE_TTL_HOURS)
+    assert report.steps == 1 and report.proposals == 1
+    cv = healthy.inspect(CaseQuery(obligation_id=OBLIGATION))
+    assert cv.state == "waiting" and cv.pending_work == 1
+
+
+def test_claim_due_work_leases_one_item_per_call(razorpay):
+    ledger = InMemoryLedger()
+    eligible(razorpay, OBLIGATION, OBLIGATION_2)
+    engine = RecoveryEngine(ledger, ScriptedStrategist(), razorpay)
+    engine.receive(failed_event(event_id="f1", obligation=OBLIGATION))
+    engine.receive(failed_event(event_id="f2", obligation=OBLIGATION_2))
+
+    first = ledger.claim_due_work(0)
+    second = ledger.claim_due_work(0)
+    assert len(first) == 1 and len(second) == 1  # one item per call, not both
+    assert first[0].work_id != second[0].work_id  # a different item each time
+
+
+def test_run_drains_all_work_this_runner_exclusively_owns(razorpay):
+    ledger = InMemoryLedger()
+    eligible(razorpay, OBLIGATION, OBLIGATION_2)
+    engine = RecoveryEngine(ledger, ScriptedStrategist(), razorpay)
+    engine.receive(failed_event(event_id="f1", obligation=OBLIGATION))
+    engine.receive(failed_event(event_id="f2", obligation=OBLIGATION_2))
+
+    report = engine.run(until=1)
+    assert report.steps == 2 and report.proposals == 2
 
 
 def test_stale_claim_after_capture_does_not_retransition(razorpay):
@@ -277,6 +378,36 @@ def test_inspect_rejects_unknown_query_type(engine):
         engine.inspect({"kind": "case"})
 
 
+# --- correction 2: atomic webhook intake ---------------------------
+
+
+def test_repeated_failed_delivery_creates_one_case_and_one_work(engine, razorpay):
+    eligible(razorpay)
+    r1 = engine.receive(failed_event())
+    r2 = engine.receive(failed_event())  # same event id, repeated delivery
+    r3 = engine.receive(failed_event(event_id="f_other"))  # new id, same obligation
+
+    assert r1.case_id == r2.case_id == r3.case_id
+    assert r2.duplicate is True
+    assert r3.duplicate is False  # not a dup event, but still no second case
+    assert batch(engine).cases == 1
+
+    # Exactly one initial evaluate work item: a single run consumes one step.
+    report = engine.run(until=1)
+    assert report.steps == 1 and report.proposals == 1
+    cv = case_view(engine, obligation_id=OBLIGATION)
+    assert cv.state == "waiting" and cv.pending_work == 1
+
+
+def test_intake_is_a_single_ledger_command_not_check_then_write():
+    src = (
+        pathlib.Path(__file__).parent.parent / "src" / "hermes" / "engine.py"
+    ).read_text()
+    assert "apply_intake" in src  # the one atomic command
+    assert "def _on_failed" not in src  # no engine-level check-then-write branch
+    assert "open_case" not in src
+
+
 # --- correction 3: payment identity validation --------------------
 
 
@@ -314,6 +445,72 @@ def test_valid_payment_id_after_rejection_still_recovers(engine, razorpay):
 
     assert case_view(engine, obligation_id=OBLIGATION).state == "recovered"
     assert batch(engine).recovered_minor == RUPEES_10K_MINOR
+
+
+# --- correction 3: atomic capture finalization -------------------
+
+
+def test_two_captured_events_racing_produce_one_recovery(engine, razorpay):
+    eligible(razorpay)
+    engine.receive(failed_event())
+    engine.run(until=1)  # case waiting, version 1
+
+    # Two distinct captured events for the same obligation.
+    engine.receive(captured_event(event_id="cap_A", payment_id="pay_A"))
+    engine.receive(captured_event(event_id="cap_B", payment_id="pay_B"))
+
+    b = batch(engine)
+    assert b.recovered_minor == RUPEES_10K_MINOR  # one amount
+    assert b.recovered_payments == 1  # one payment id
+    assert b.recovered_cases == 1
+    cv = case_view(engine, obligation_id=OBLIGATION)
+    assert cv.state == "recovered"
+    assert audit_kinds(engine, cv.case_id).count("TERMINAL_TRANSITION") == 1
+
+
+def test_interleaved_capture_finalization_is_atomic(razorpay):
+    ledger = InMemoryLedger()
+    eligible(razorpay)
+    other_reports = []
+
+    def land_competing_capture():
+        other = RecoveryEngine(ledger, ScriptedStrategist(), razorpay)
+        other_reports.append(
+            other.receive(captured_event(event_id="cap_B", payment_id="pay_B"))
+        )
+
+    provider = ReentrantProvider(razorpay, land_competing_capture)
+    engine = RecoveryEngine(ledger, ScriptedStrategist(), provider)
+    engine.receive(failed_event())
+    engine.run(until=1)  # case waiting, version 1
+
+    # engine reads the case (v1), then verify_capture lets cap_B finalize first,
+    # then engine's own apply_capture(expected_version=1) must be rejected.
+    engine.receive(captured_event(event_id="cap_A", payment_id="pay_A"))
+
+    b = engine.inspect(BatchQuery())
+    assert b.recovered_minor == RUPEES_10K_MINOR
+    assert b.recovered_payments == 1
+    cv = engine.inspect(CaseQuery(obligation_id=OBLIGATION))
+    assert cv.state == "recovered"
+    assert audit_kinds(engine, cv.case_id).count("TERMINAL_TRANSITION") == 1
+    # the losing finalization was rejected atomically before counting
+    rejected = {"stale_case_version", "capture_on_terminal_case"}
+    assert rejected & set(policy_reasons(engine, cv.case_id))
+
+
+def test_repeated_captured_event_is_a_silent_noop(engine, razorpay):
+    eligible(razorpay)
+    engine.receive(failed_event())
+    engine.run(until=1)
+    engine.receive(captured_event())
+    r = engine.receive(captured_event())  # identical event id again
+
+    assert r.duplicate is True
+    assert batch(engine).recovered_minor == RUPEES_10K_MINOR
+    assert audit_kinds(engine, case_view(engine, obligation_id=OBLIGATION).case_id).count(
+        "TERMINAL_TRANSITION"
+    ) == 1
 
 
 # --- correction 4: fail-closed retry eligibility ------------------

@@ -19,8 +19,9 @@ from .types import (
     CaseSnapshot,
     DiscardWorkCommand,
     EvaluationCommand,
+    IntakeCommand,
+    IntakeResult,
     NoteEventCommand,
-    OpenCaseCommand,
     ProviderRetryFact,
     StrategistFailureCommand,
     StrategyProposal,
@@ -52,9 +53,12 @@ class Ledger(Protocol):
     def case_snapshot(self, case_id: str) -> CaseSnapshot: ...
 
     def claim_due_work(self, now: int) -> Sequence[WorkClaim]: ...
+    # Claims at most one due item per call; a live lease is never stolen.
 
-    # -- transactions (immutable commands in, ApplyResult out) -------------
-    def open_case(self, cmd: OpenCaseCommand) -> str: ...
+    # -- transactions (immutable commands in, results out) -----------------
+    def apply_intake(self, cmd: IntakeCommand) -> IntakeResult: ...
+    # Atomic: dedup + one-case-per-obligation + event record + audit + initial
+    # work enqueue, all in one transaction.
 
     def mark_event_seen(self, event_id: str) -> None: ...
 

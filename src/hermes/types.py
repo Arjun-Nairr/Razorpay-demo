@@ -58,6 +58,11 @@ class CaptureInfo:
     amount_minor: int
 
 
+def valid_payment_id(value: str | None) -> bool:
+    """A usable provider payment id: a non-empty, non-whitespace string."""
+    return isinstance(value, str) and value.strip() != ""
+
+
 # --- AI proposal contract -----------------------------------------------------
 
 
@@ -168,6 +173,7 @@ class ScheduledWork:
     consumed: bool = False
     claim_token: str | None = None  # current lease holder
     claim_version: int = 0  # bumped on every (re)lease; stale tokens lose
+    claimed_at: int | None = None  # logical hour the current lease was taken
 
 
 @dataclass(frozen=True)
@@ -201,6 +207,7 @@ class CaseSnapshot:
     currency: str
     state: str
     failure_reason: str | None
+    version: int
 
 
 @dataclass(frozen=True)
@@ -231,13 +238,26 @@ class ApplyResult:
 
 
 @dataclass(frozen=True)
-class OpenCaseCommand:
+class IntakeCommand:
+    """Everything a ``payment.failed`` webhook needs to be admitted atomically:
+    dedup, one-case-per-obligation, event recording, audit, and initial-work
+    enqueue happen inside a single ledger transaction.
+    """
+
     event_id: str
     obligation_id: str
     amount_minor: int
     currency: str
     reason_code: str | None
     now: int
+
+
+@dataclass(frozen=True)
+class IntakeResult:
+    case_id: str | None
+    duplicate: bool  # the same provider event id was already admitted
+    created: bool  # a new case + initial work item was opened by this call
+    outcome: str
 
 
 @dataclass(frozen=True)
@@ -287,6 +307,8 @@ class CaptureCommand:
     payment_id: str
     amount_minor: int
     now: int
+    expected_version: int  # case version observed before provider verification
+    expected_state: str  # case state observed before provider verification
 
 
 # --- engine results ------------------------------------------------------

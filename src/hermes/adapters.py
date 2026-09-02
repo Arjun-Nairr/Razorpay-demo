@@ -32,8 +32,9 @@ from .types import (
     CaseState,
     DiscardWorkCommand,
     EvaluationCommand,
+    IntakeCommand,
+    IntakeResult,
     NoteEventCommand,
-    OpenCaseCommand,
     PolicyOutcome,
     ProposalAction,
     ProviderRetryFact,
@@ -41,12 +42,17 @@ from .types import (
     StrategistFailureCommand,
     StrategyProposal,
     StrategySnapshot,
+    TERMINAL_STATES,
     WorkClaim,
+    valid_payment_id,
 )
 
 # POLICY_SPEC: one retry after the initial attempt -> two total strategist attempts.
 MAX_WORK_ATTEMPTS = 2
 RETRY_BACKOFF_HOURS = 1
+# A claimed work item whose holder never finalizes becomes reclaimable after
+# this many logical hours. Models a DB visibility/lock timeout, not a real lock.
+LEASE_TTL_HOURS = 6
 
 
 # --- Payment provider ---------------------------------------------------
@@ -146,28 +152,29 @@ class InMemoryLedger:
         c = self._cases[case_id]
         return CaseSnapshot(
             c.case_id, c.obligation_id, c.amount_minor, c.currency, c.state.value,
-            c.failure_reason,
+            c.failure_reason, c.version,
         )
 
     def claim_due_work(self, now: int) -> list[WorkClaim]:
-        """Lease every due, live work item. Re-leasing bumps ``claim_version``
-        and issues a fresh ``claim_token``, so a previous holder's finalization
-        is rejected as stale. The work itself stays durable until a finalize
-        consumes it, so a failing strategist call loses nothing.
+        """Exclusively lease **one** due work item.
+
+        A work item is available only if it is unclaimed or its lease has
+        expired (``now - claimed_at >= LEASE_TTL_HOURS``). Taking the lease
+        bumps ``claim_version`` and issues a fresh ``claim_token``. A second
+        runner calling this while the lease is live gets nothing back - so it
+        never even sees the work, let alone calls the strategist for it. The
+        work stays durable until a finalize consumes it, and an abandoned lease
+        is safely reclaimable once it expires.
         """
-        due = sorted(
-            (
-                w
-                for w in self._work.values()
-                if not w.cancelled and not w.consumed and w.due_time <= now
-            ),
-            key=lambda w: (w.due_time, w.work_id),
-        )
-        claims: list[WorkClaim] = []
-        for w in due:
+        for w in sorted(self._work.values(), key=lambda w: (w.due_time, w.work_id)):
+            if w.consumed or w.cancelled or w.due_time > now:
+                continue
+            if w.claimed_at is not None and now - w.claimed_at < LEASE_TTL_HOURS:
+                continue  # a live lease is held by another runner
             w.claim_version += 1
             w.claim_token = self._next_id("claim")
-            claims.append(
+            w.claimed_at = now
+            return [
                 WorkClaim(
                     work_id=w.work_id,
                     case_id=w.case_id,
@@ -177,8 +184,8 @@ class InMemoryLedger:
                     claim_token=w.claim_token,
                     claim_version=w.claim_version,
                 )
-            )
-        return claims
+            ]
+        return []
 
     # -- projections (ledger-owned) --------------------------------
 
@@ -231,7 +238,33 @@ class InMemoryLedger:
             self._seen_events.add(cmd.event_id)
         self._append(cmd.now, cmd.case_id, cmd.kind, cmd.detail)
 
-    def open_case(self, cmd: OpenCaseCommand) -> str:
+    def apply_intake(self, cmd: IntakeCommand) -> IntakeResult:
+        """One transaction for a ``payment.failed`` webhook: deduplicate the
+        provider event, enforce one case per obligation, record the input event
+        and audit, and enqueue the initial re-evaluation work item.
+        """
+        if cmd.event_id in self._seen_events:
+            existing = self._by_obligation.get(cmd.obligation_id)
+            return IntakeResult(existing, duplicate=True, created=False,
+                                outcome="duplicate_event")
+        self._seen_events.add(cmd.event_id)
+
+        existing = self._by_obligation.get(cmd.obligation_id)
+        if existing is not None:
+            self._append(
+                cmd.now,
+                existing,
+                AUDIT_INPUT_EVENT,
+                {
+                    "event_id": cmd.event_id,
+                    "type": "payment.failed",
+                    "note": "existing case; no transition",
+                    "case_state": self._cases[existing].state.value,
+                },
+            )
+            return IntakeResult(existing, duplicate=False, created=False,
+                                outcome="existing_case")
+
         case = Case(
             case_id=self._next_id("case"),
             obligation_id=cmd.obligation_id,
@@ -242,7 +275,6 @@ class InMemoryLedger:
         )
         self._cases[case.case_id] = case
         self._by_obligation[case.obligation_id] = case.case_id
-        self._seen_events.add(cmd.event_id)
         self._append(
             cmd.now,
             case.case_id,
@@ -257,7 +289,8 @@ class InMemoryLedger:
         )
         wid = self._next_id("work")
         self._work[wid] = ScheduledWork(work_id=wid, case_id=case.case_id, due_time=cmd.now)
-        return case.case_id
+        return IntakeResult(case.case_id, duplicate=False, created=True,
+                            outcome="case_opened")
 
     def discard_work(self, cmd: DiscardWorkCommand) -> ApplyResult:
         work = self._live_claim(cmd.work_id, cmd.claim_token, cmd.claim_version)
@@ -372,6 +405,10 @@ class InMemoryLedger:
         return ApplyResult(ok=True, reason="escalated", terminal=True)
 
     def apply_capture(self, cmd: CaptureCommand) -> ApplyResult:
+        # Deduplicate this exact provider event first: a repeated delivery is a
+        # silent no-op, never a second confirmation.
+        if cmd.event_id is not None and cmd.event_id in self._seen_events:
+            return ApplyResult(ok=False, reason="duplicate_event")
         if cmd.event_id is not None:
             self._seen_events.add(cmd.event_id)
         case = self._cases[cmd.case_id]
@@ -386,6 +423,40 @@ class InMemoryLedger:
                 "amount_minor": cmd.amount_minor,
             },
         )
+        # Atomically reject a case that moved on or went terminal since the
+        # engine observed it, BEFORE any recovery is counted. Version first: a
+        # racing captured event that already finalized bumped it.
+        if case.version != cmd.expected_version:
+            self._append(
+                cmd.now,
+                case.case_id,
+                AUDIT_POLICY_DECISION,
+                {"outcome": PolicyOutcome.BLOCK.value,
+                 "reason_code": "stale_case_version",
+                 "expected_version": cmd.expected_version,
+                 "actual_version": case.version},
+            )
+            return ApplyResult(ok=False, reason="stale_case_version")
+        if case.state.value in TERMINAL_STATES:
+            self._append(
+                cmd.now,
+                case.case_id,
+                AUDIT_POLICY_DECISION,
+                {"outcome": PolicyOutcome.BLOCK.value,
+                 "reason_code": "capture_on_terminal_case",
+                 "case_state": case.state.value},
+            )
+            return ApplyResult(ok=False, reason="capture_on_terminal_case", terminal=True)
+        if not valid_payment_id(cmd.payment_id):
+            self._append(
+                cmd.now,
+                case.case_id,
+                AUDIT_POLICY_DECISION,
+                {"outcome": PolicyOutcome.BLOCK.value,
+                 "reason_code": "invalid_payment_id",
+                 "payment_id": cmd.payment_id},
+            )
+            return ApplyResult(ok=False, reason="invalid_payment_id")
         if cmd.payment_id in self._recovered_payment_ids:
             self._append(
                 cmd.now,
