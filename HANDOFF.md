@@ -34,8 +34,96 @@ requirements in `PROJECT_BRIEF.md`.
   stored as a project file.
 - Graphify was evaluated and deferred until a meaningful codebase exists; it
   maps code structure but does not replace product-decision handoffs.
-- Status: Iteration 01 complete. Case 1 in-memory vertical slice implemented and
-  tested; see the iteration record below.
+- Status: Iteration 02 (corrective) complete. Case 1 foundation hardened for
+  future Neon/Gemini/Razorpay adapters; see the iteration records below.
+
+## Iteration 02 — Corrective: adapter-safe Case 1 foundation
+
+- Branch: `feat/case-1-recovery-slice` (unchanged).
+- Commit: `a7b7d6660625c9e8fd86e1e6bf35f640ab473861`
+  (`fix(engine): harden Case 1 foundation for future real adapters`).
+- No Git remote exists: `REMOTE_NOT_CONFIGURED` (nothing pushed).
+- No new product features; no new dependencies; project documents unchanged
+  except this file.
+
+### Changed files
+
+- `src/hermes/types.py` — added `ProviderRetryFact`, `InvalidProposal`,
+  `Case.failure_reason`, `ScheduledWork.attempts/consumed`; widened `RunReport`
+  (`strategist_failures`, `scheduled`, `blocked`); added typed inspect
+  queries/projections (`CaseQuery`/`BatchQuery`/`AuditQuery`,
+  `CaseProjection`/`BatchProjection`/`AuditProjection`, `AuditRecord`),
+  `RecoveryQuery`/`RecoveryView` unions, `AUDIT_STRATEGIST_FAILURE`.
+- `src/hermes/adapters.py` — `FakeRazorpayAdapter.retry_eligibility()` /
+  `set_retry_eligibility()`; `InMemoryLedger` rewritten around cohesive
+  single-transaction operations: `open_case`, `apply_evaluation`,
+  `apply_strategist_failure`, `apply_capture`, `discard_work`, `note_event`,
+  `note_orphan_event`, plus `claim_due_work` (durable read) and
+  `recovered_payment_ids`. `MAX_WORK_ATTEMPTS = 3`, `RETRY_BACKOFF_HOURS = 1`.
+- `src/hermes/engine.py` — `authorize()` takes a `ProviderRetryFact` and blocks
+  `WAIT_FOR_PROVIDER_RETRY` when `retry_eligible` is false; `_validate_proposal`
+  rejects non-typed / out-of-range strategist output; `run()` wraps the
+  strategist call in try/except (raise, timeout, invalid output ->
+  `apply_strategist_failure`, no action, bounded retry); all state changes go
+  through ledger transactions; `inspect()` dispatches on typed query objects and
+  returns typed projections, `TypeError` on anything else.
+- `tests/test_case1.py` — rewritten to the public seam only (no
+  `engine._…`); 19 tests incl. retry-eligible/ineligible, failing strategist,
+  bounded-retry, invalid-output, global payment-id dedup, cross-obligation
+  payment-id, typed-projection, and the full Case 1 integration path. Includes a
+  guard test asserting the file contains no private-attribute access.
+
+### Corrections applied
+
+1. Provider retry eligibility is a typed provider fact in the snapshot; policy
+   blocks the wait when ineligible; the proposal cannot influence it.
+2. Strategist failure: work stays durable during the call; on failure no action
+   runs, `STRATEGIST_FAILURE` is audited, and a bounded retry (<=3 attempts) is
+   scheduled — no infinite loop.
+3. Ledger operations are cohesive and atomic (one transaction each); the engine
+   no longer performs unrelated public mutations; external calls stay outside
+   transactions.
+4. Exact-once recovery is enforced globally by payment id, not just
+   `Case.counted`: repeated event ids, distinct event ids with the same payment
+   id, and one payment id across two obligations cannot double-count.
+5. `inspect` uses typed query and projection objects; the public surface is
+   still exactly `receive` / `run` / `inspect`.
+6. Tests observe only `receive` results, `RunReport`, `inspect` projections, and
+   public exceptions.
+
+### Verification
+
+- `cd C:\Users\dwish\Documents\Codex\2026-09-02\fors\outputs\ai-revenue-recovery`
+- `python -m pytest -q` → `19 passed in ~0.2s`.
+- `python -m compileall -q src tests` → clean.
+- No lint/type tooling is configured, so none was run.
+
+### Remaining limitations (in scope for later prompts)
+
+- `authorize()` still implements only the terminal guard + the
+  `WAIT_FOR_PROVIDER_RETRY` path (now with eligibility); the full 10-step policy
+  order is not implemented (`ponytail:` comment in `engine.py`).
+- A retry-ineligible failure leaves the case `active` with no pending work
+  (audit-only outcome), matching how `capture_mismatch` is handled; a real
+  policy would `ESCALATE`.
+- Cross-obligation payment-id conflict audits `ESCALATE` but does not change the
+  second case's state.
+- No HMAC, no real Razorpay/Gemini/Neon/FastAPI/Streamlit, no real outbox
+  (single-threaded in-memory; transaction boundaries are documented, not
+  enforced).
+- A zero-hour wait could re-queue within one `run`; `WORK_LOOP_LIMIT` is the
+  backstop (Case 1's minimum wait is 24h, so it never churns).
+- `inspect` `CaseProjection`/`BatchProjection`/`AuditProjection` shapes are
+  Case-1 sized; Cases 2–5 will extend them.
+
+### Exact recommended next action
+
+Codex reviews commit `a7b7d66` (diff `main..feat/case-1-recovery-slice`), then
+issues Prompt 03 for Case 3 (insufficient funds with adaptation): a scripted
+`WAIT_FOR_PROVIDER_RETRY` that, after a failed provider retry event, is followed
+by `SEND_REMINDER` / `CREATE_RECOVERY_LINK`, exercising message
+cooldown/count limits and the re-evaluation-after-failed-retry path through the
+same `receive` / `run` / `inspect` surface.
 
 ## Iteration 01 — Case 1 in-memory vertical slice
 
@@ -218,8 +306,8 @@ only a redacted `.env.example` when implementation begins.
 
 ## Exact next action
 
-Codex reviews commit `1a9dcc6` on `feat/case-1-recovery-slice`
+Codex reviews commit `a7b7d66` on `feat/case-1-recovery-slice`
 (diff `main..feat/case-1-recovery-slice`; run `python -m pytest -q` to
-reproduce the 11 passing behaviours), then issues Prompt 02 as described in
-"Iteration 01 -> Exact recommended next action" above. No Git remote exists, so
+reproduce the 19 passing behaviours), then issues Prompt 03 as described in
+"Iteration 02 -> Exact recommended next action" above. No Git remote exists, so
 nothing has been pushed (`REMOTE_NOT_CONFIGURED`).
