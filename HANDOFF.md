@@ -43,8 +43,10 @@ requirements in `PROJECT_BRIEF.md`.
 - Branch: `feat/case-1-recovery-slice` (unchanged).
 - Commit: `3ac73f3c2d9c80dfe270de832cefbe402962248b`
   (`fix(engine): atomic claims, protocol seam, fail-closed eligibility,
-  payment-id validation`).
-- No Git remote exists: `REMOTE_NOT_CONFIGURED` (nothing pushed).
+  payment-id validation`); handoff commit `f31f8be`.
+- Remote `origin` = https://github.com/Arjun-Nairr/Razorpay-demo.git (added
+  after iteration 03). `main` and `feat/case-1-recovery-slice` pushed and
+  tracking. Earlier iterations' `REMOTE_NOT_CONFIGURED` notes are now historical.
 - Correction-only: no product features, no real integrations, no new
   dependencies, no UI, no messaging. Project documents unchanged except this
   file.
@@ -400,5 +402,6 @@ only a redacted `.env.example` when implementation begins.
 Codex reviews commit `3ac73f3` on `feat/case-1-recovery-slice`
 (diff `main..feat/case-1-recovery-slice`; run `python -m pytest -q` to
 reproduce the 28 passing behaviours), then issues Prompt 04 as described in
-"Iteration 03 -> Exact recommended next action" above. No Git remote exists, so
-nothing has been pushed (`REMOTE_NOT_CONFIGURED`).
+"Iteration 03 -> Exact recommended next action" above. Remote `origin`
+(github.com/Arjun-Nairr/Razorpay-demo) is configured; `main` and
+`feat/case-1-recovery-slice` are pushed.
