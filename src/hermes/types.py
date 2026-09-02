@@ -2,6 +2,10 @@
 
 Logical time is an integer count of logical hours on a monotonic clock. It is
 never wall-clock time in this slice.
+
+Everything the engine hands to a ledger write is an immutable command built from
+IDs, claim tokens, and frozen value objects - never a mutable stored ``Case`` or
+``ScheduledWork``. Ledger reads return frozen snapshots and projections.
 """
 
 from __future__ import annotations
@@ -34,13 +38,24 @@ class RazorpayWebhook:
 
 @dataclass(frozen=True)
 class ProviderRetryFact:
-    """Provider-derived retry eligibility. Only the provider adapter produces
-    this; neither the AI proposal nor the engine may synthesise or override it.
+    """Provider-derived retry eligibility.
+
+    Fail-closed: absent evidence resolves to ``retry_eligible=False`` with
+    ``evidence=None``. A wait may be authorized only when the provider gives an
+    explicit eligible fact *with* evidence. Neither the AI proposal nor the
+    engine may synthesise or override this.
     """
 
     obligation_id: str
     retry_eligible: bool
-    source: str = "razorpay"  # provenance label for the case snapshot
+    evidence: str | None = None  # provenance of the eligible signal, or None
+
+
+@dataclass(frozen=True)
+class CaptureInfo:
+    obligation_id: str
+    payment_id: str
+    amount_minor: int
 
 
 # --- AI proposal contract -----------------------------------------------------
@@ -55,6 +70,20 @@ class ProposalAction(StrEnum):
     TAKE_NO_ACTION = "TAKE_NO_ACTION"
     STOP = "STOP"
     ESCALATE = "ESCALATE"
+
+
+@dataclass(frozen=True)
+class StrategySnapshot:
+    """Immutable, source-labelled case view handed to the strategist."""
+
+    case_id: str
+    obligation_id: str
+    amount_minor: int
+    currency: str
+    failure_reason: str | None
+    state: str
+    provider_retry_eligible: bool
+    provider_retry_evidence: str | None
 
 
 @dataclass(frozen=True)
@@ -95,26 +124,6 @@ class PolicyDecision:
     scheduled_time: int | None = None  # logical hour to re-evaluate, when ALLOW
 
 
-# --- Engine results ----------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class ReceiveResult:
-    accepted: bool
-    duplicate: bool
-    case_id: str | None
-
-
-@dataclass(frozen=True)
-class RunReport:
-    logical_time: int
-    steps: int  # work items consumed
-    proposals: int  # strategist proposals accepted
-    strategist_failures: int = 0  # strategist raised / timed out / returned junk
-    scheduled: int = 0  # follow-up work items scheduled
-    blocked: int = 0  # proposals the policy blocked
-
-
 # --- Case states -----------------------------------------------------------
 
 TERMINAL_STATES: frozenset[str] = frozenset(
@@ -129,6 +138,9 @@ class CaseState(StrEnum):
     STOPPED = "stopped"
     ESCALATED = "escalated"
     EXHAUSTED = "exhausted"
+
+
+# --- ledger-internal records (never handed to a ledger write) ---------------
 
 
 @dataclass
@@ -154,6 +166,8 @@ class ScheduledWork:
     attempts: int = 0  # strategist attempts already spent on this work lineage
     cancelled: bool = False
     consumed: bool = False
+    claim_token: str | None = None  # current lease holder
+    claim_version: int = 0  # bumped on every (re)lease; stale tokens lose
 
 
 @dataclass(frozen=True)
@@ -174,6 +188,126 @@ AUDIT_SCHEDULED_ACTION = "SCHEDULED_ACTION"
 AUDIT_PAYMENT_CONFIRMATION = "PAYMENT_CONFIRMATION"
 AUDIT_PENDING_WORK_CANCELLED = "PENDING_WORK_CANCELLED"
 AUDIT_TERMINAL_TRANSITION = "TERMINAL_TRANSITION"
+
+
+# --- ledger reads: frozen snapshots ---------------------------------------
+
+
+@dataclass(frozen=True)
+class CaseSnapshot:
+    case_id: str
+    obligation_id: str
+    amount_minor: int
+    currency: str
+    state: str
+    failure_reason: str | None
+
+
+@dataclass(frozen=True)
+class WorkClaim:
+    """A leased unit of work. The claim is valid only while the ledger's stored
+    work still carries this exact ``claim_token`` and ``claim_version``.
+    """
+
+    work_id: str
+    case_id: str
+    kind: str
+    due_time: int
+    attempts: int
+    claim_token: str
+    claim_version: int
+
+
+@dataclass(frozen=True)
+class ApplyResult:
+    ok: bool  # False when the claim was stale / already finalized
+    reason: str = ""
+    scheduled: bool = False  # a follow-up work item was created
+    blocked: bool = False  # the policy blocked the proposal
+    terminal: bool = False  # the case reached a terminal state
+
+
+# --- ledger writes: immutable commands ----------------------------------
+
+
+@dataclass(frozen=True)
+class OpenCaseCommand:
+    event_id: str
+    obligation_id: str
+    amount_minor: int
+    currency: str
+    reason_code: str | None
+    now: int
+
+
+@dataclass(frozen=True)
+class NoteEventCommand:
+    case_id: str
+    event_id: str | None
+    kind: str
+    detail: dict
+    now: int
+
+
+@dataclass(frozen=True)
+class EvaluationCommand:
+    work_id: str
+    claim_token: str
+    claim_version: int
+    case_id: str
+    proposal: StrategyProposal
+    decision: PolicyDecision
+    now: int
+
+
+@dataclass(frozen=True)
+class StrategistFailureCommand:
+    work_id: str
+    claim_token: str
+    claim_version: int
+    case_id: str
+    error: str
+    now: int
+
+
+@dataclass(frozen=True)
+class DiscardWorkCommand:
+    work_id: str
+    claim_token: str
+    claim_version: int
+    case_id: str
+    reason: str
+    now: int
+
+
+@dataclass(frozen=True)
+class CaptureCommand:
+    case_id: str
+    event_id: str | None
+    payment_id: str
+    amount_minor: int
+    now: int
+
+
+# --- engine results ------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ReceiveResult:
+    accepted: bool
+    duplicate: bool
+    case_id: str | None
+
+
+@dataclass(frozen=True)
+class RunReport:
+    logical_time: int
+    steps: int  # work items consumed
+    proposals: int  # strategist proposals accepted
+    strategist_failures: int = 0  # strategist raised / timed out / returned junk
+    scheduled: int = 0  # follow-up work items scheduled
+    blocked: int = 0  # proposals the policy blocked
+    stale_claims: int = 0  # finalizations rejected because another runner won
 
 
 # --- inspect: typed queries and projections --------------------------------

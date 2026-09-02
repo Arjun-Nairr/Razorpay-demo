@@ -1,17 +1,14 @@
-"""In-memory test doubles for the three external seams.
+"""Deterministic in-memory implementations of the engine's three seams.
 
-Real Razorpay / Gemini / Neon adapters land in a later iteration behind these
-same shapes. The ledger deliberately exposes *cohesive* operations (open a case,
-apply an evaluation, apply a verified capture, record a strategist failure) that
-each map to a single transaction. The engine never pokes ledger state field by
-field, so the future Neon adapter can wrap each operation in BEGIN/COMMIT.
+These are permanent test infrastructure: the fake payment adapter and scripted
+strategist stay even after real Razorpay / Gemini adapters exist. The ledger
+exposes cohesive single-transaction operations plus ledger-owned projections;
+callers pass immutable commands and claim tokens, never mutable stored objects.
 
-No method here performs an external call.
+No method here performs an external network call.
 """
 
 from __future__ import annotations
-
-from dataclasses import dataclass
 
 from .types import (
     AUDIT_AI_PROPOSAL,
@@ -22,55 +19,66 @@ from .types import (
     AUDIT_SCHEDULED_ACTION,
     AUDIT_STRATEGIST_FAILURE,
     AUDIT_TERMINAL_TRANSITION,
+    ApplyResult,
     AuditEvent,
+    AuditProjection,
+    AuditRecord,
+    BatchProjection,
+    CaptureCommand,
+    CaptureInfo,
     Case,
+    CaseProjection,
+    CaseSnapshot,
     CaseState,
-    PolicyDecision,
+    DiscardWorkCommand,
+    EvaluationCommand,
+    NoteEventCommand,
+    OpenCaseCommand,
     PolicyOutcome,
     ProposalAction,
     ProviderRetryFact,
-    RazorpayWebhook,
     ScheduledWork,
+    StrategistFailureCommand,
     StrategyProposal,
+    StrategySnapshot,
+    WorkClaim,
 )
 
-MAX_WORK_ATTEMPTS = 3  # initial try + 2 bounded strategist retries
+# POLICY_SPEC: one retry after the initial attempt -> two total strategist attempts.
+MAX_WORK_ATTEMPTS = 2
 RETRY_BACKOFF_HOURS = 1
 
 
-# --- Razorpay --------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class CaptureInfo:
-    obligation_id: str
-    payment_id: str
-    amount_minor: int
+# --- Payment provider ---------------------------------------------------
 
 
 class FakeRazorpayAdapter:
-    """Holds captured payments and per-obligation retry eligibility, and
-    'verifies' captures. A captured webhook is trusted in this slice, so
-    verification only confirms the recorded amount/obligation are consistent.
+    """Holds captured payments and per-obligation retry eligibility.
+
+    Retry eligibility is fail-closed: an obligation with no recorded provider
+    signal returns ``retry_eligible=False, evidence=None``.
     """
 
     def __init__(self) -> None:
         self._captures: dict[str, CaptureInfo] = {}
-        self._retry_eligible: dict[str, bool] = {}
+        self._retry_signal: dict[str, bool] = {}
 
-    # retry eligibility (provider-derived fact)
     def set_retry_eligibility(self, obligation_id: str, eligible: bool) -> None:
-        self._retry_eligible[obligation_id] = eligible
+        """Record an explicit provider signal for this obligation."""
+        self._retry_signal[obligation_id] = eligible
 
     def retry_eligibility(self, obligation_id: str) -> ProviderRetryFact:
-        # Default: eligible. Case 1's temporary bank failure is retryable.
+        if obligation_id not in self._retry_signal:
+            return ProviderRetryFact(obligation_id, retry_eligible=False, evidence=None)
         return ProviderRetryFact(
-            obligation_id=obligation_id,
-            retry_eligible=self._retry_eligible.get(obligation_id, True),
+            obligation_id,
+            retry_eligible=self._retry_signal[obligation_id],
+            evidence="provider_retry_signal",
         )
 
-    # capture verification
-    def record_capture(self, obligation_id: str, payment_id: str, amount_minor: int) -> None:
+    def record_capture(
+        self, obligation_id: str, payment_id: str, amount_minor: int
+    ) -> None:
         self._captures.setdefault(
             obligation_id, CaptureInfo(obligation_id, payment_id, amount_minor)
         )
@@ -79,7 +87,7 @@ class FakeRazorpayAdapter:
         return self._captures.get(obligation_id)
 
 
-# --- AI strategist ------------------------------------------------------
+# --- AI strategist ---------------------------------------------------
 
 
 class ScriptedStrategist:
@@ -99,146 +107,180 @@ class ScriptedStrategist:
     def __init__(self, script: dict[str, StrategyProposal] | None = None) -> None:
         self.script = script or dict(self._DEFAULT_SCRIPT)
 
-    def propose(self, snapshot: dict) -> StrategyProposal:
-        reason = snapshot.get("failure_reason") or ""
+    def propose(self, snapshot: StrategySnapshot) -> StrategyProposal:
+        reason = snapshot.failure_reason or ""
         try:
             return self.script[reason]
         except KeyError:
             raise KeyError(f"ScriptedStrategist has no proposal for reason {reason!r}")
 
 
-# --- Recovery ledger --------------------------------------------------
+# --- Recovery ledger ------------------------------------------------
 
 
 class InMemoryLedger:
-    """Authoritative in-memory state plus cohesive, single-transaction writes."""
+    """Authoritative in-memory state. All storage is private; callers touch it
+    only through the transaction methods and projections below.
+    """
 
     def __init__(self) -> None:
-        self.cases: dict[str, Case] = {}
+        self._cases: dict[str, Case] = {}
         self._by_obligation: dict[str, str] = {}
-        self.work: list[ScheduledWork] = []
-        self.audit: list[AuditEvent] = []
-        self.seen_events: set[str] = set()
-        self.recovered_payment_ids: set[str] = set()
-        self.recovered_minor: int = 0
+        self._work: dict[str, ScheduledWork] = {}
+        self._audit: list[AuditEvent] = []
+        self._seen_events: set[str] = set()
+        self._recovered_payment_ids: set[str] = set()
+        self._recovered_minor: int = 0
         self._seq = 0
         self._id_seq = 0
 
-    # -- reads (no transaction) -------------------------------------------
+    # -- reads ---------------------------------------------------------
 
     def has_seen_event(self, event_id: str) -> bool:
-        return event_id in self.seen_events
+        return event_id in self._seen_events
 
-    def get_case(self, case_id: str) -> Case:
-        return self.cases[case_id]
+    def case_id_for_obligation(self, obligation_id: str) -> str | None:
+        return self._by_obligation.get(obligation_id)
 
-    def case_for_obligation(self, obligation_id: str) -> Case | None:
-        case_id = self._by_obligation.get(obligation_id)
-        return self.cases.get(case_id) if case_id else None
+    def case_snapshot(self, case_id: str) -> CaseSnapshot:
+        c = self._cases[case_id]
+        return CaseSnapshot(
+            c.case_id, c.obligation_id, c.amount_minor, c.currency, c.state.value,
+            c.failure_reason,
+        )
 
-    def pending_work(self, case_id: str) -> list[ScheduledWork]:
-        return [
-            w
-            for w in self.work
-            if w.case_id == case_id and not w.cancelled and not w.consumed
-        ]
-
-    def claim_due_work(self, at: int) -> list[ScheduledWork]:
-        """Due, live work in a stable order. Left durable: nothing is mutated
-        here, so a strategist call that fails afterwards loses no work.
+    def claim_due_work(self, now: int) -> list[WorkClaim]:
+        """Lease every due, live work item. Re-leasing bumps ``claim_version``
+        and issues a fresh ``claim_token``, so a previous holder's finalization
+        is rejected as stale. The work itself stays durable until a finalize
+        consumes it, so a failing strategist call loses nothing.
         """
-        return sorted(
+        due = sorted(
             (
                 w
-                for w in self.work
-                if not w.cancelled and not w.consumed and w.due_time <= at
+                for w in self._work.values()
+                if not w.cancelled and not w.consumed and w.due_time <= now
             ),
             key=lambda w: (w.due_time, w.work_id),
         )
+        claims: list[WorkClaim] = []
+        for w in due:
+            w.claim_version += 1
+            w.claim_token = self._next_id("claim")
+            claims.append(
+                WorkClaim(
+                    work_id=w.work_id,
+                    case_id=w.case_id,
+                    kind=w.kind,
+                    due_time=w.due_time,
+                    attempts=w.attempts,
+                    claim_token=w.claim_token,
+                    claim_version=w.claim_version,
+                )
+            )
+        return claims
 
-    def audit_records(self, case_id: str | None) -> list[AuditEvent]:
-        return [e for e in self.audit if case_id in (None, e.case_id)]
+    # -- projections (ledger-owned) --------------------------------
 
-    # -- transactions ---------------------------------------------------
-
-    def note_event(
-        self, now: int, event_id: str | None, case: Case, kind: str, detail: dict
-    ) -> None:
-        """Mark an event seen and append exactly one audit record. Used for
-        events that produce no state transition (duplicates on a fresh id,
-        captures on a terminal case, capture mismatches).
-        """
-        if event_id is not None:
-            self.seen_events.add(event_id)
-        self._append(now, case.case_id, kind, detail)
-
-    def note_orphan_event(self, event_id: str | None) -> None:
-        if event_id is not None:
-            self.seen_events.add(event_id)
-
-    def discard_work(
-        self, work: ScheduledWork, now: int, case: Case, reason: str
-    ) -> None:
-        """Consume a live work item that no longer applies (its case went
-        terminal by another path). Recorded so the trail explains the gap.
-        """
-        work.consumed = True
-        self._append(
-            now,
-            case.case_id,
-            AUDIT_SCHEDULED_ACTION,
-            {"kind": "discarded", "reason": reason, "work_id": work.work_id},
+    def case_projection(
+        self, *, case_id: str | None = None, obligation_id: str | None = None
+    ) -> CaseProjection:
+        if case_id is None and obligation_id is not None:
+            case_id = self._by_obligation.get(obligation_id)
+        if case_id is None or case_id not in self._cases:
+            raise KeyError(obligation_id if case_id is None else case_id)
+        c = self._cases[case_id]
+        return CaseProjection(
+            case_id=c.case_id,
+            obligation_id=c.obligation_id,
+            state=c.state.value,
+            amount_minor=c.amount_minor,
+            currency=c.currency,
+            counted=c.counted,
+            linked_payment_id=c.linked_payment_id,
+            pending_work=len(self._pending_work(c.case_id)),
+            version=c.version,
         )
 
-    def open_case(self, webhook: RazorpayWebhook, now: int) -> Case:
-        """One transaction: create the case, mark the event seen, record the
-        input-event audit, and enqueue an immediate re-evaluation.
-        """
+    def batch_projection(self) -> BatchProjection:
+        return BatchProjection(
+            cases=len(self._cases),
+            recovered_cases=sum(
+                1 for c in self._cases.values() if c.state is CaseState.RECOVERED
+            ),
+            recovered_minor=self._recovered_minor,
+            recovered_payments=len(self._recovered_payment_ids),
+        )
+
+    def audit_projection(self, case_id: str | None) -> AuditProjection:
+        return AuditProjection(
+            records=tuple(
+                AuditRecord(e.seq, e.logical_time, e.case_id, e.kind, dict(e.detail))
+                for e in self._audit
+                if case_id in (None, e.case_id)
+            )
+        )
+
+    # -- transactions ---------------------------------------------
+
+    def mark_event_seen(self, event_id: str) -> None:
+        self._seen_events.add(event_id)
+
+    def note_event(self, cmd: NoteEventCommand) -> None:
+        if cmd.event_id is not None:
+            self._seen_events.add(cmd.event_id)
+        self._append(cmd.now, cmd.case_id, cmd.kind, cmd.detail)
+
+    def open_case(self, cmd: OpenCaseCommand) -> str:
         case = Case(
             case_id=self._next_id("case"),
-            obligation_id=webhook.obligation_id,
-            amount_minor=webhook.amount_minor,
-            currency=webhook.currency,
-            created_time=now,
-            failure_reason=webhook.reason_code,
+            obligation_id=cmd.obligation_id,
+            amount_minor=cmd.amount_minor,
+            currency=cmd.currency,
+            created_time=cmd.now,
+            failure_reason=cmd.reason_code,
         )
-        self.cases[case.case_id] = case
+        self._cases[case.case_id] = case
         self._by_obligation[case.obligation_id] = case.case_id
-        self.seen_events.add(webhook.event_id)
+        self._seen_events.add(cmd.event_id)
         self._append(
-            now,
+            cmd.now,
             case.case_id,
             AUDIT_INPUT_EVENT,
             {
-                "event_id": webhook.event_id,
-                "type": webhook.type.value,
-                "obligation_id": webhook.obligation_id,
-                "amount_minor": webhook.amount_minor,
-                "reason_code": webhook.reason_code,
+                "event_id": cmd.event_id,
+                "type": "payment.failed",
+                "obligation_id": cmd.obligation_id,
+                "amount_minor": cmd.amount_minor,
+                "reason_code": cmd.reason_code,
             },
         )
-        self.work.append(
-            ScheduledWork(
-                work_id=self._next_id("work"), case_id=case.case_id, due_time=now
-            )
-        )
-        return case
+        wid = self._next_id("work")
+        self._work[wid] = ScheduledWork(work_id=wid, case_id=case.case_id, due_time=cmd.now)
+        return case.case_id
 
-    def apply_evaluation(
-        self,
-        work: ScheduledWork,
-        case: Case,
-        proposal: StrategyProposal,
-        decision: PolicyDecision,
-        now: int,
-    ) -> None:
-        """One transaction: consume the claimed work, record the proposal and
-        the policy decision, and (only on ALLOW of a wait) transition the case
-        and schedule the next re-evaluation.
-        """
+    def discard_work(self, cmd: DiscardWorkCommand) -> ApplyResult:
+        work = self._live_claim(cmd.work_id, cmd.claim_token, cmd.claim_version)
+        if work is None:
+            return ApplyResult(ok=False, reason="stale_claim")
         work.consumed = True
         self._append(
-            now,
+            cmd.now,
+            cmd.case_id,
+            AUDIT_SCHEDULED_ACTION,
+            {"kind": "discarded", "reason": cmd.reason, "work_id": cmd.work_id},
+        )
+        return ApplyResult(ok=True, reason="discarded")
+
+    def apply_evaluation(self, cmd: EvaluationCommand) -> ApplyResult:
+        work = self._live_claim(cmd.work_id, cmd.claim_token, cmd.claim_version)
+        if work is None:
+            return ApplyResult(ok=False, reason="stale_claim")
+        work.consumed = True
+        case = self._cases[cmd.case_id]
+        proposal, decision = cmd.proposal, cmd.decision
+        self._append(
+            cmd.now,
             case.case_id,
             AUDIT_AI_PROPOSAL,
             {
@@ -250,7 +292,7 @@ class InMemoryLedger:
             },
         )
         self._append(
-            now,
+            cmd.now,
             case.case_id,
             AUDIT_POLICY_DECISION,
             {
@@ -265,137 +307,151 @@ class InMemoryLedger:
         ):
             case.state = CaseState.WAITING
             case.version += 1
-            due = decision.scheduled_time if decision.scheduled_time is not None else now
-            self.work.append(
-                ScheduledWork(
-                    work_id=self._next_id("work"),
-                    case_id=case.case_id,
-                    due_time=due,
-                    attempts=0,
-                )
+            due = decision.scheduled_time if decision.scheduled_time is not None else cmd.now
+            wid = self._next_id("work")
+            self._work[wid] = ScheduledWork(
+                work_id=wid, case_id=case.case_id, due_time=due, attempts=0
             )
             self._append(
-                now,
+                cmd.now,
                 case.case_id,
                 AUDIT_SCHEDULED_ACTION,
                 {"kind": "evaluate", "due_time": due},
             )
+            return ApplyResult(ok=True, scheduled=True)
+        return ApplyResult(ok=True, blocked=decision.outcome is PolicyOutcome.BLOCK)
 
-    def apply_strategist_failure(
-        self, work: ScheduledWork, case: Case, error: str, now: int
-    ) -> bool:
-        """One transaction: consume the claimed work, audit the failure, and
-        (within a bounded budget) schedule one retry. No recovery action runs.
-        Returns True if a retry was scheduled.
-        """
+    def apply_strategist_failure(self, cmd: StrategistFailureCommand) -> ApplyResult:
+        work = self._live_claim(cmd.work_id, cmd.claim_token, cmd.claim_version)
+        if work is None:
+            return ApplyResult(ok=False, reason="stale_claim")
         work.consumed = True
         next_attempt = work.attempts + 1
         rescheduled = next_attempt < MAX_WORK_ATTEMPTS
         self._append(
-            now,
-            case.case_id,
+            cmd.now,
+            cmd.case_id,
             AUDIT_STRATEGIST_FAILURE,
             {
-                "error": error,
+                "error": cmd.error,
                 "attempt": work.attempts,
                 "rescheduled": rescheduled,
                 "exhausted": not rescheduled,
             },
         )
         if rescheduled:
-            self.work.append(
-                ScheduledWork(
-                    work_id=self._next_id("work"),
-                    case_id=case.case_id,
-                    due_time=now + RETRY_BACKOFF_HOURS,
-                    kind="evaluate_retry",
-                    attempts=next_attempt,
-                )
+            wid = self._next_id("work")
+            self._work[wid] = ScheduledWork(
+                work_id=wid,
+                case_id=cmd.case_id,
+                due_time=cmd.now + RETRY_BACKOFF_HOURS,
+                kind="evaluate_retry",
+                attempts=next_attempt,
             )
             self._append(
-                now,
-                case.case_id,
+                cmd.now,
+                cmd.case_id,
                 AUDIT_SCHEDULED_ACTION,
                 {
                     "kind": "evaluate_retry",
-                    "due_time": now + RETRY_BACKOFF_HOURS,
+                    "due_time": cmd.now + RETRY_BACKOFF_HOURS,
                     "attempt": next_attempt,
                 },
             )
-        return rescheduled
-
-    def apply_capture(
-        self,
-        event_id: str | None,
-        case: Case,
-        payment_id: str,
-        amount_minor: int,
-        now: int,
-    ) -> bool:
-        """One transaction: record the input event, enforce global payment-id
-        exact-once, confirm the payment, cancel pending work, add recovered
-        value once, and mark the case recovered. Returns True if the case was
-        recovered by this call.
-        """
-        if event_id is not None:
-            self.seen_events.add(event_id)
+            return ApplyResult(ok=True, scheduled=True)
+        # retry budget exhausted -> deterministic terminal escalation
+        case = self._cases[cmd.case_id]
+        case.state = CaseState.ESCALATED
+        case.version += 1
         self._append(
-            now,
+            cmd.now,
+            cmd.case_id,
+            AUDIT_TERMINAL_TRANSITION,
+            {"state": CaseState.ESCALATED.value, "reason": "strategist_retry_exhausted"},
+        )
+        return ApplyResult(ok=True, reason="escalated", terminal=True)
+
+    def apply_capture(self, cmd: CaptureCommand) -> ApplyResult:
+        if cmd.event_id is not None:
+            self._seen_events.add(cmd.event_id)
+        case = self._cases[cmd.case_id]
+        self._append(
+            cmd.now,
             case.case_id,
             AUDIT_INPUT_EVENT,
-            {"event_id": event_id, "type": "payment.captured", "payment_id": payment_id,
-             "amount_minor": amount_minor},
+            {
+                "event_id": cmd.event_id,
+                "type": "payment.captured",
+                "payment_id": cmd.payment_id,
+                "amount_minor": cmd.amount_minor,
+            },
         )
-
-        if payment_id in self.recovered_payment_ids:
-            # Same payment already counted (possibly for another obligation).
+        if cmd.payment_id in self._recovered_payment_ids:
             self._append(
-                now,
+                cmd.now,
                 case.case_id,
                 AUDIT_POLICY_DECISION,
-                {"outcome": PolicyOutcome.ESCALATE.value,
-                 "reason_code": "payment_id_already_recovered",
-                 "payment_id": payment_id},
+                {
+                    "outcome": PolicyOutcome.ESCALATE.value,
+                    "reason_code": "payment_id_already_recovered",
+                    "payment_id": cmd.payment_id,
+                },
             )
-            return False
+            return ApplyResult(ok=True, reason="payment_id_already_recovered")
 
         self._append(
-            now,
+            cmd.now,
             case.case_id,
             AUDIT_PAYMENT_CONFIRMATION,
-            {"payment_id": payment_id, "amount_minor": amount_minor},
+            {"payment_id": cmd.payment_id, "amount_minor": cmd.amount_minor},
         )
-        cancelled = self.pending_work(case.case_id)
+        cancelled = self._pending_work(case.case_id)
         for w in cancelled:
             w.cancelled = True
         if cancelled:
             self._append(
-                now,
+                cmd.now,
                 case.case_id,
                 AUDIT_PENDING_WORK_CANCELLED,
                 {"count": len(cancelled), "reason": "payment_captured"},
             )
-
-        self.recovered_payment_ids.add(payment_id)
+        self._recovered_payment_ids.add(cmd.payment_id)
         if not case.counted:
-            self.recovered_minor += amount_minor
+            self._recovered_minor += cmd.amount_minor
             case.counted = True
         case.state = CaseState.RECOVERED
-        case.linked_payment_id = payment_id
+        case.linked_payment_id = cmd.payment_id
         case.version += 1
         self._append(
-            now,
+            cmd.now,
             case.case_id,
             AUDIT_TERMINAL_TRANSITION,
-            {"state": CaseState.RECOVERED.value, "recovered_minor": amount_minor},
+            {"state": CaseState.RECOVERED.value, "recovered_minor": cmd.amount_minor},
         )
-        return True
+        return ApplyResult(ok=True, scheduled=False, terminal=True)
 
-    # -- internals ----------------------------------------------------
+    # -- internals -------------------------------------------------
+
+    def _pending_work(self, case_id: str) -> list[ScheduledWork]:
+        return [
+            w
+            for w in self._work.values()
+            if w.case_id == case_id and not w.cancelled and not w.consumed
+        ]
+
+    def _live_claim(
+        self, work_id: str, token: str, version: int
+    ) -> ScheduledWork | None:
+        w = self._work.get(work_id)
+        if w is None or w.consumed or w.cancelled:
+            return None
+        if w.claim_token != token or w.claim_version != version:
+            return None
+        return w
 
     def _append(self, now: int, case_id: str, kind: str, detail: dict) -> None:
         self._seq += 1
-        self.audit.append(AuditEvent(self._seq, now, case_id, kind, dict(detail)))
+        self._audit.append(AuditEvent(self._seq, now, case_id, kind, dict(detail)))
 
     def _next_id(self, prefix: str) -> str:
         self._id_seq += 1

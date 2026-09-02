@@ -1,34 +1,34 @@
 """RecoveryEngine: the one deep module that owns the recovery workflow.
 
 Public surface is exactly three methods: ``receive``, ``run``, ``inspect``.
-Everything else is internal. Tests exercise only the public surface.
 
 Boundary: the AI strategist *proposes*; deterministic policy *authorizes*.
 Hermes never changes plans, prices, discounts, billing dates, payment methods,
 or account access.
 
-Transaction discipline: external calls (strategist, Razorpay) run *outside* any
-ledger transaction. Each ledger ``open_case`` / ``apply_*`` call is one atomic
-unit, so a future Neon adapter wraps each in BEGIN/COMMIT and a mid-flight
-strategist failure can never lose scheduled work.
+The engine depends only on the ``Ledger`` / ``Strategist`` / ``PaymentProvider``
+protocols. It never holds a mutable stored record: it reads frozen snapshots and
+leased ``WorkClaim`` tokens, and every write is an immutable command. External
+calls (strategist, provider) run outside every ledger transaction; a claim that
+another runner has since won is rejected as stale with no effect.
 """
 
 from __future__ import annotations
 
-from .adapters import FakeRazorpayAdapter, InMemoryLedger, ScriptedStrategist
+from .protocols import Ledger, PaymentProvider, Strategist
 from .types import (
     AUDIT_INPUT_EVENT,
     AUDIT_POLICY_DECISION,
-    Case,
-    CaseProjection,
-    CaseQuery,
-    CaseState,
-    AuditProjection,
     AuditQuery,
-    AuditRecord,
-    BatchProjection,
     BatchQuery,
+    CaptureCommand,
+    CaseQuery,
+    CaseSnapshot,
+    DiscardWorkCommand,
+    EvaluationCommand,
     InvalidProposal,
+    NoteEventCommand,
+    OpenCaseCommand,
     PolicyDecision,
     PolicyOutcome,
     ProposalAction,
@@ -38,14 +38,20 @@ from .types import (
     RecoveryQuery,
     RecoveryView,
     RunReport,
+    StrategistFailureCommand,
     StrategyProposal,
+    StrategySnapshot,
     TERMINAL_STATES,
     WebhookType,
+    WorkClaim,
 )
 
 WORK_LOOP_LIMIT = 50  # steps per run() call
 MAX_WAIT_HOURS = 72
-_TERMINAL = TERMINAL_STATES
+
+
+def _valid_payment_id(value: str | None) -> bool:
+    return isinstance(value, str) and value.strip() != ""
 
 
 def _validate_proposal(obj: object) -> StrategyProposal:
@@ -63,7 +69,7 @@ def _validate_proposal(obj: object) -> StrategyProposal:
 
 def authorize(
     proposal: StrategyProposal,
-    case: Case,
+    case: CaseSnapshot,
     now: int,
     retry_fact: ProviderRetryFact,
 ) -> PolicyDecision:
@@ -71,16 +77,16 @@ def authorize(
 
     Provider-truth (a captured payment) is handled in ``receive``. Here we cover
     terminal-state protection and WAIT_FOR_PROVIDER_RETRY authorization, which
-    now requires a provider-derived retry-eligible fact. The AI proposal cannot
-    set or override that fact.
+    is fail-closed: it needs an explicit provider-derived eligible fact *with*
+    evidence. The AI proposal cannot set or override that fact.
 
     ponytail: partial policy. The full 10-step order (cooldowns, attempt/message
     limits, consent, commercial safety, reconciliation) arrives with cases 2-5.
     """
-    if case.state.value in _TERMINAL:
+    if case.state in TERMINAL_STATES:
         return PolicyDecision(PolicyOutcome.BLOCK, "terminal_case")
     if proposal.action is ProposalAction.WAIT_FOR_PROVIDER_RETRY:
-        if not retry_fact.retry_eligible:
+        if not retry_fact.retry_eligible or retry_fact.evidence is None:
             return PolicyDecision(PolicyOutcome.BLOCK, "provider_retry_ineligible")
         wait = max(0, min(proposal.proposed_wait_hours, MAX_WAIT_HOURS))
         return PolicyDecision(
@@ -92,16 +98,16 @@ def authorize(
 class RecoveryEngine:
     def __init__(
         self,
-        ledger: InMemoryLedger | None = None,
-        strategist: ScriptedStrategist | None = None,
-        razorpay: FakeRazorpayAdapter | None = None,
+        ledger: Ledger,
+        strategist: Strategist,
+        razorpay: PaymentProvider,
     ) -> None:
-        self._ledger = ledger or InMemoryLedger()
-        self._strategist = strategist or ScriptedStrategist()
-        self._razorpay = razorpay or FakeRazorpayAdapter()
+        self._ledger = ledger
+        self._strategist = strategist
+        self._razorpay = razorpay
         self._clock = 0  # monotonic logical hour
 
-    # -- receive -----------------------------------------------------------
+    # -- receive ---------------------------------------------------------
 
     def receive(self, webhook: RazorpayWebhook) -> ReceiveResult:
         """Durable intake. Deduplicates the provider event, then updates state
@@ -110,89 +116,125 @@ class RecoveryEngine:
         """
         led = self._ledger
         if led.has_seen_event(webhook.event_id):
-            existing = led.case_for_obligation(webhook.obligation_id)
-            return ReceiveResult(True, True, existing.case_id if existing else None)
-
+            return ReceiveResult(
+                True, True, led.case_id_for_obligation(webhook.obligation_id)
+            )
         if webhook.type is WebhookType.PAYMENT_FAILED:
             return self._on_failed(webhook)
         if webhook.type is WebhookType.PAYMENT_CAPTURED:
             return self._on_captured(webhook)
-        led.note_orphan_event(webhook.event_id)  # unsupported type: ignored
+        led.mark_event_seen(webhook.event_id)  # unsupported type: ignored
         return ReceiveResult(True, False, None)
 
     def _on_failed(self, webhook: RazorpayWebhook) -> ReceiveResult:
         led = self._ledger
-        case = led.case_for_obligation(webhook.obligation_id)
-        if case is not None:
-            # One case per obligation; a later failure never forks a case or
-            # reopens a terminal one.
+        case_id = led.case_id_for_obligation(webhook.obligation_id)
+        if case_id is not None:
+            snap = led.case_snapshot(case_id)
             led.note_event(
-                self._clock,
-                webhook.event_id,
-                case,
-                AUDIT_INPUT_EVENT,
-                {
-                    "event_id": webhook.event_id,
-                    "type": webhook.type.value,
-                    "note": "existing case; no transition",
-                    "case_state": case.state.value,
-                },
+                NoteEventCommand(
+                    case_id=case_id,
+                    event_id=webhook.event_id,
+                    kind=AUDIT_INPUT_EVENT,
+                    detail={
+                        "event_id": webhook.event_id,
+                        "type": webhook.type.value,
+                        "note": "existing case; no transition",
+                        "case_state": snap.state,
+                    },
+                    now=self._clock,
+                )
             )
-            return ReceiveResult(True, False, case.case_id)
+            return ReceiveResult(True, False, case_id)
 
-        case = led.open_case(webhook, self._clock)
-        return ReceiveResult(True, False, case.case_id)
+        case_id = led.open_case(
+            OpenCaseCommand(
+                event_id=webhook.event_id,
+                obligation_id=webhook.obligation_id,
+                amount_minor=webhook.amount_minor,
+                currency=webhook.currency,
+                reason_code=webhook.reason_code,
+                now=self._clock,
+            )
+        )
+        return ReceiveResult(True, False, case_id)
 
     def _on_captured(self, webhook: RazorpayWebhook) -> ReceiveResult:
         led = self._ledger
-        case = led.case_for_obligation(webhook.obligation_id)
-        if case is None:
-            led.note_orphan_event(webhook.event_id)  # no case to attribute to
+        case_id = led.case_id_for_obligation(webhook.obligation_id)
+        if case_id is None:
+            led.mark_event_seen(webhook.event_id)  # nothing to attribute to
             return ReceiveResult(True, False, None)
 
-        if case.state.value in _TERMINAL:
+        snap = led.case_snapshot(case_id)
+        if snap.state in TERMINAL_STATES:
             led.note_event(
-                self._clock,
-                webhook.event_id,
-                case,
-                AUDIT_INPUT_EVENT,
-                {
-                    "event_id": webhook.event_id,
-                    "type": webhook.type.value,
-                    "payment_id": webhook.payment_id,
-                    "note": "terminal case; no transition",
-                },
+                NoteEventCommand(
+                    case_id=case_id,
+                    event_id=webhook.event_id,
+                    kind=AUDIT_INPUT_EVENT,
+                    detail={
+                        "event_id": webhook.event_id,
+                        "type": webhook.type.value,
+                        "payment_id": webhook.payment_id,
+                        "note": "terminal case; no transition",
+                    },
+                    now=self._clock,
+                )
             )
-            return ReceiveResult(True, False, case.case_id)
+            return ReceiveResult(True, False, case_id)
 
+        # Payment-identity validation happens BEFORE any provider recording or
+        # verification. A missing/blank id can never move money or a case.
+        if not _valid_payment_id(webhook.payment_id):
+            led.note_event(
+                NoteEventCommand(
+                    case_id=case_id,
+                    event_id=webhook.event_id,
+                    kind=AUDIT_POLICY_DECISION,
+                    detail={
+                        "outcome": PolicyOutcome.BLOCK.value,
+                        "reason_code": "invalid_payment_id",
+                        "payment_id": webhook.payment_id,
+                    },
+                    now=self._clock,
+                )
+            )
+            return ReceiveResult(True, False, case_id)
+
+        payment_id = webhook.payment_id.strip()  # type: ignore[union-attr]
         # External verification, outside any ledger transaction.
         self._razorpay.record_capture(
-            webhook.obligation_id, webhook.payment_id or "", webhook.amount_minor
+            webhook.obligation_id, payment_id, webhook.amount_minor
         )
         capture = self._razorpay.verify_capture(webhook.obligation_id)
-        if capture is None or capture.amount_minor != case.amount_minor:
+        if capture is None or capture.amount_minor != snap.amount_minor:
             led.note_event(
-                self._clock,
-                webhook.event_id,
-                case,
-                AUDIT_POLICY_DECISION,
-                {
-                    "outcome": PolicyOutcome.ESCALATE.value,
-                    "reason_code": "capture_mismatch",
-                },
+                NoteEventCommand(
+                    case_id=case_id,
+                    event_id=webhook.event_id,
+                    kind=AUDIT_POLICY_DECISION,
+                    detail={
+                        "outcome": PolicyOutcome.ESCALATE.value,
+                        "reason_code": "capture_mismatch",
+                    },
+                    now=self._clock,
+                )
             )
-            return ReceiveResult(True, False, case.case_id)
+            return ReceiveResult(True, False, case_id)
 
         led.apply_capture(
-            webhook.event_id,
-            case,
-            capture.payment_id,
-            capture.amount_minor,
-            self._clock,
+            CaptureCommand(
+                case_id=case_id,
+                event_id=webhook.event_id,
+                payment_id=capture.payment_id,
+                amount_minor=capture.amount_minor,
+                now=self._clock,
+            )
         )
-        return ReceiveResult(True, False, case.case_id)
+        return ReceiveResult(True, False, case_id)
 
-    # -- run -------------------------------------------------------------
+    # -- run ---------------------------------------------------------
 
     def run(self, until: int) -> RunReport:
         """Advance the logical clock to ``until`` and process due work."""
@@ -202,47 +244,60 @@ class RecoveryEngine:
             )
         self._clock = until
         led = self._ledger
-        steps = proposals = failures = scheduled = blocked = 0
+        steps = proposals = failures = scheduled = blocked = stale = 0
+        seen_ids: set[str] = set()
 
-        # ponytail: a zero-hour wait could re-queue same tick; WORK_LOOP_LIMIT is
-        # the backstop. Case 1's minimum wait is 24h, so it never churns.
         while steps < WORK_LOOP_LIMIT:
-            due = led.claim_due_work(self._clock)
-            if not due:
+            claims = led.claim_due_work(self._clock)
+            if not claims:
                 break
-            work = due[0]
-            case = led.get_case(work.case_id)
+            claim = claims[0]
+            if claim.work_id in seen_ids:
+                break  # re-leased without progress: another runner owns it
+            seen_ids.add(claim.work_id)
+            steps += 1
 
-            if case.state.value in _TERMINAL:
-                led.discard_work(work, self._clock, case, reason="terminal_case")
-                steps += 1
+            snap = led.case_snapshot(claim.case_id)
+            if snap.state in TERMINAL_STATES:
+                led.discard_work(self._discard_cmd(claim, "terminal_case"))
                 continue
 
-            retry_fact = self._razorpay.retry_eligibility(case.obligation_id)
-            snapshot = self._snapshot(case, retry_fact)
+            retry_fact = self._razorpay.retry_eligibility(snap.obligation_id)
 
             # External strategist call: outside the transaction, work still durable.
             try:
-                proposal = _validate_proposal(self._strategist.propose(snapshot))
-            except Exception as exc:  # raised / timed out / invalid output
-                rescheduled = led.apply_strategist_failure(
-                    work, case, type(exc).__name__, self._clock
+                proposal = _validate_proposal(
+                    self._strategist.propose(self._snapshot(snap, retry_fact))
                 )
+            except Exception as exc:  # raised / timed out / invalid output
+                result = led.apply_strategist_failure(
+                    self._failure_cmd(claim, type(exc).__name__)
+                )
+                if not result.ok:
+                    stale += 1
+                    continue
                 failures += 1
-                scheduled += int(rescheduled)
-                steps += 1
+                scheduled += int(result.scheduled)
                 continue
 
-            decision = authorize(proposal, case, self._clock, retry_fact)
-            led.apply_evaluation(work, case, proposal, decision, self._clock)
+            decision = authorize(proposal, snap, self._clock, retry_fact)
+            result = led.apply_evaluation(
+                EvaluationCommand(
+                    work_id=claim.work_id,
+                    claim_token=claim.claim_token,
+                    claim_version=claim.claim_version,
+                    case_id=claim.case_id,
+                    proposal=proposal,
+                    decision=decision,
+                    now=self._clock,
+                )
+            )
+            if not result.ok:
+                stale += 1
+                continue
             proposals += 1
-            steps += 1
-            if decision.outcome is PolicyOutcome.ALLOW and (
-                proposal.action is ProposalAction.WAIT_FOR_PROVIDER_RETRY
-            ):
-                scheduled += 1
-            elif decision.outcome is PolicyOutcome.BLOCK:
-                blocked += 1
+            scheduled += int(result.scheduled)
+            blocked += int(result.blocked)
 
         return RunReport(
             logical_time=self._clock,
@@ -251,66 +306,56 @@ class RecoveryEngine:
             strategist_failures=failures,
             scheduled=scheduled,
             blocked=blocked,
+            stale_claims=stale,
         )
 
-    # -- inspect --------------------------------------------------------
+    # -- inspect -------------------------------------------------
 
     def inspect(self, query: RecoveryQuery) -> RecoveryView:
-        """Typed read-only projections."""
+        """Typed read-only projections, all built by the ledger."""
         led = self._ledger
         if isinstance(query, CaseQuery):
-            case = self._resolve_case(query)
-            return CaseProjection(
-                case_id=case.case_id,
-                obligation_id=case.obligation_id,
-                state=case.state.value,
-                amount_minor=case.amount_minor,
-                currency=case.currency,
-                counted=case.counted,
-                linked_payment_id=case.linked_payment_id,
-                pending_work=len(led.pending_work(case.case_id)),
-                version=case.version,
+            return led.case_projection(
+                case_id=query.case_id, obligation_id=query.obligation_id
             )
         if isinstance(query, BatchQuery):
-            cases = led.cases.values()
-            return BatchProjection(
-                cases=len(led.cases),
-                recovered_cases=sum(1 for c in cases if c.state is CaseState.RECOVERED),
-                recovered_minor=led.recovered_minor,
-                recovered_payments=len(led.recovered_payment_ids),
-            )
+            return led.batch_projection()
         if isinstance(query, AuditQuery):
-            return AuditProjection(
-                records=tuple(
-                    AuditRecord(e.seq, e.logical_time, e.case_id, e.kind, dict(e.detail))
-                    for e in led.audit_records(query.case_id)
-                )
-            )
+            return led.audit_projection(query.case_id)
         raise TypeError(f"unsupported query type: {type(query).__name__}")
 
-    # -- internals ---------------------------------------------------
+    # -- internals ---------------------------------------------
 
-    def _resolve_case(self, query: CaseQuery) -> Case:
-        led = self._ledger
-        if query.case_id is not None:
-            return led.get_case(query.case_id)
-        if query.obligation_id is not None:
-            case = led.case_for_obligation(query.obligation_id)
-            if case is None:
-                raise KeyError(query.obligation_id)
-            return case
-        raise ValueError("CaseQuery needs case_id or obligation_id")
+    def _snapshot(
+        self, snap: CaseSnapshot, retry_fact: ProviderRetryFact
+    ) -> StrategySnapshot:
+        return StrategySnapshot(
+            case_id=snap.case_id,
+            obligation_id=snap.obligation_id,
+            amount_minor=snap.amount_minor,
+            currency=snap.currency,
+            failure_reason=snap.failure_reason,
+            state=snap.state,
+            provider_retry_eligible=retry_fact.retry_eligible,
+            provider_retry_evidence=retry_fact.evidence,
+        )
 
-    def _snapshot(self, case: Case, retry_fact: ProviderRetryFact) -> dict:
-        # Source-labelled case snapshot for the strategist. The strategist may
-        # read provider_retry but policy checks the fact independently, so it
-        # cannot influence eligibility.
-        return {
-            "case_id": case.case_id,
-            "obligation_id": case.obligation_id,
-            "amount_minor": case.amount_minor,
-            "failure_reason": case.failure_reason,
-            "state": case.state.value,
-            "provider_retry": retry_fact,
-            "provider_retry_eligible": retry_fact.retry_eligible,
-        }
+    def _discard_cmd(self, claim: WorkClaim, reason: str) -> DiscardWorkCommand:
+        return DiscardWorkCommand(
+            work_id=claim.work_id,
+            claim_token=claim.claim_token,
+            claim_version=claim.claim_version,
+            case_id=claim.case_id,
+            reason=reason,
+            now=self._clock,
+        )
+
+    def _failure_cmd(self, claim: WorkClaim, error: str) -> StrategistFailureCommand:
+        return StrategistFailureCommand(
+            work_id=claim.work_id,
+            claim_token=claim.claim_token,
+            claim_version=claim.claim_version,
+            case_id=claim.case_id,
+            error=error,
+            now=self._clock,
+        )
