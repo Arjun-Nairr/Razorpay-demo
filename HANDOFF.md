@@ -34,8 +34,99 @@ requirements in `PROJECT_BRIEF.md`.
   stored as a project file.
 - Graphify was evaluated and deferred until a meaningful codebase exists; it
   maps code structure but does not replace product-decision handoffs.
-- Status: Iteration 02 (corrective) complete. Case 1 foundation hardened for
-  future Neon/Gemini/Razorpay adapters; see the iteration records below.
+- Status: Iteration 03 (corrective) complete. Atomic work claiming, protocol
+  seam, fail-closed eligibility, payment-id validation, corrected retry budget;
+  see the iteration records below.
+
+## Iteration 03 — Corrective: atomic claims + adapter-neutral seam
+
+- Branch: `feat/case-1-recovery-slice` (unchanged).
+- Commit: `3ac73f3c2d9c80dfe270de832cefbe402962248b`
+  (`fix(engine): atomic claims, protocol seam, fail-closed eligibility,
+  payment-id validation`).
+- No Git remote exists: `REMOTE_NOT_CONFIGURED` (nothing pushed).
+- Correction-only: no product features, no real integrations, no new
+  dependencies, no UI, no messaging. Project documents unchanged except this
+  file.
+
+### Changed files
+
+- `src/hermes/protocols.py` — **new**. `Ledger`, `Strategist`,
+  `PaymentProvider` `typing.Protocol` interfaces. The engine imports only these.
+- `src/hermes/types.py` — added `CaseSnapshot`, `WorkClaim`, `ApplyResult`,
+  immutable command objects (`OpenCaseCommand`, `NoteEventCommand`,
+  `EvaluationCommand`, `StrategistFailureCommand`, `DiscardWorkCommand`,
+  `CaptureCommand`), `StrategySnapshot`; `ProviderRetryFact.evidence`;
+  `ScheduledWork.claim_token/claim_version`; `RunReport.stale_claims`.
+- `src/hermes/adapters.py` — `InMemoryLedger` storage made private
+  (`_cases`/`_recovered_minor`/`_recovered_payment_ids`/…); `claim_due_work`
+  leases work (fresh token + `claim_version += 1`); transaction methods take
+  commands and validate the lease via `_live_claim`; added ledger-owned
+  `case_projection` / `batch_projection` / `audit_projection`.
+  `FakeRazorpayAdapter.retry_eligibility` is fail-closed (no signal ->
+  `retry_eligible=False, evidence=None`). `MAX_WORK_ATTEMPTS = 2`.
+- `src/hermes/engine.py` — constructor takes `Ledger`/`Strategist`/
+  `PaymentProvider` (no defaults, no concrete import); `receive`/`run` build
+  immutable commands and pass claim tokens; `run` rejects stale finalizations
+  (counts `stale_claims`) and stops if a work id re-leases without progress;
+  `_valid_payment_id` gate before capture; `authorize` requires an explicit
+  eligible fact *with* evidence; `inspect` returns ledger projections only.
+- `tests/test_case1.py` — rewritten to the public seam; 28 tests.
+
+### Corrections applied (each has an automated test)
+
+1. **Atomic work claiming** — `claim_due_work` leases with token + version; only
+   the live lease can finalize. `test_overlapping_claims_do_not_double_finalize`
+   (reentrant second runner wins; first runner's finalize is stale — one
+   transition, one follow-up), `test_stale_claim_after_capture_does_not_retransition`.
+2. **Adapter-neutral seam** — Protocols added; engine depends only on them;
+   immutable commands; no mutable stored objects into writes; `inspect` uses
+   ledger projections. `test_engine_depends_only_on_protocol_seam`,
+   `test_inspect_returns_typed_projections`, `test_inspect_rejects_unknown_query_type`.
+3. **Payment identity validation** — missing/empty/whitespace payment ids
+   rejected before `record_capture`/`verify_capture`, audited `invalid_payment_id`,
+   no revenue, no recovery. `test_invalid_payment_id_is_rejected_before_capture`
+   (parametrized), `test_valid_payment_id_after_rejection_still_recovers`.
+4. **Fail-closed retry eligibility** — missing evidence -> ineligible/blocked;
+   authorize needs an explicit eligible fact with evidence.
+   `test_retry_eligibility_{true_allows,false_blocks,missing_evidence_blocks}_wait`.
+5. **Retry budget = one retry (two total attempts)** — on exhaustion the case
+   goes to an explicit `escalated` terminal state, not idle-active.
+   `test_strategist_retry_budget_is_one_then_escalates`,
+   `test_strategist_failure_loses_no_work_and_executes_no_action`.
+
+### Verification
+
+- `cd C:\Users\dwish\Documents\Codex\2026-09-02\fors\outputs\ai-revenue-recovery`
+- `python -m pytest -q` → `28 passed in ~0.3s`.
+- `python -m compileall -q src tests` → clean.
+- No lint/type tooling is configured in the repo, so none was run.
+- `git diff` reviewed: only the four source files + new `protocols.py`; no doc,
+  pyproject, or unrelated changes; no secrets.
+
+### Remaining limitations (in scope for later prompts)
+
+- `authorize()` still implements only the terminal guard + the eligibility-gated
+  `WAIT_FOR_PROVIDER_RETRY` path; the full 10-step policy order is pending.
+- Concurrency is single-process cooperative: `claim_due_work` leasing +
+  `claim_version` model the contention a real Neon `SELECT … FOR UPDATE` /
+  optimistic-version check would enforce; there is no real thread/row locking.
+- Cross-obligation payment-id conflict and capture-amount mismatch audit
+  `ESCALATE` but do not change the second/again case's state.
+- No HMAC, no real Razorpay/Gemini/Neon/FastAPI/Streamlit; `InMemoryLedger`
+  transaction boundaries are documented, not enforced by a DB.
+- A zero-hour wait could re-queue within one `run`; `WORK_LOOP_LIMIT` plus the
+  re-lease guard are the backstop (Case 1's minimum wait is 24h).
+- Projection shapes are Case-1 sized; Cases 2–5 will extend them.
+
+### Exact recommended next action
+
+Codex reviews commit `3ac73f3` (diff `main..feat/case-1-recovery-slice`), then
+issues Prompt 04 for Case 3 (insufficient funds with adaptation): a scripted
+`WAIT_FOR_PROVIDER_RETRY` that, after a failed provider-retry event, is followed
+by `SEND_REMINDER` / `CREATE_RECOVERY_LINK`, exercising message cooldown/count
+limits and the re-evaluation-after-failed-retry path through the same
+`receive` / `run` / `inspect` surface.
 
 ## Iteration 02 — Corrective: adapter-safe Case 1 foundation
 
@@ -306,8 +397,8 @@ only a redacted `.env.example` when implementation begins.
 
 ## Exact next action
 
-Codex reviews commit `a7b7d66` on `feat/case-1-recovery-slice`
+Codex reviews commit `3ac73f3` on `feat/case-1-recovery-slice`
 (diff `main..feat/case-1-recovery-slice`; run `python -m pytest -q` to
-reproduce the 19 passing behaviours), then issues Prompt 03 as described in
-"Iteration 02 -> Exact recommended next action" above. No Git remote exists, so
+reproduce the 28 passing behaviours), then issues Prompt 04 as described in
+"Iteration 03 -> Exact recommended next action" above. No Git remote exists, so
 nothing has been pushed (`REMOTE_NOT_CONFIGURED`).
