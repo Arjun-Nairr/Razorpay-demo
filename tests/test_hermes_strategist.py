@@ -342,6 +342,55 @@ def test_real_transport_build_requires_key(monkeypatch):
     s = HermesStrategist()  # no transport_factory -> real path
     with pytest.raises(RuntimeError, match="GEMINI_API_KEY"):
         s.propose(snapshot())
+    # transport setup failure is audited too, not left as last_run_meta=None
+    meta = s.last_run_meta
+    assert meta is not None
+    assert meta.validation_result == "transport_error:RuntimeError"
+    assert meta.repair_used is False
+    assert meta.raw_response == "" and meta.usage is None
+    assert meta.model == DEFAULT_MODEL and meta.prompt_version == PROMPT_VERSION
+    assert meta.latency_ms >= 0.0
+
+
+def test_transport_factory_setup_failure_is_audited_and_redacted():
+    marker = "sensitive-setup-marker-xyz"
+
+    def boom_factory():
+        raise RuntimeError(marker)
+
+    s = HermesStrategist(transport_factory=boom_factory)
+    with pytest.raises(RuntimeError, match=marker):  # original error still propagates
+        s.propose(snapshot())
+    meta = s.last_run_meta
+    assert meta is not None  # not None despite failing before any model call
+    assert meta.validation_result == "transport_error:RuntimeError"
+    assert meta.repair_used is False
+    assert meta.raw_response == "" and meta.usage is None
+    assert meta.model == DEFAULT_MODEL and meta.prompt_version == PROMPT_VERSION
+    assert meta.latency_ms >= 0.0
+    # the sensitive marker is in neither recorded field
+    assert marker not in meta.validation_result
+    assert marker not in (meta.raw_response or "")
+
+
+def test_setup_failure_does_not_leak_prior_run_metadata():
+    good = StubTransport(VALID_JSON)
+    n = {"calls": 0}
+
+    def flaky_factory():
+        n["calls"] += 1
+        if n["calls"] == 1:
+            return good
+        raise RuntimeError("second setup boom")
+
+    s = HermesStrategist(transport_factory=flaky_factory)
+    s.propose(snapshot())
+    assert s.last_run_meta.validation_result == "valid"  # first run ok
+
+    with pytest.raises(RuntimeError):
+        s.propose(snapshot())  # second run fails during transport construction
+    assert s.last_run_meta.validation_result == "transport_error:RuntimeError"  # not stale "valid"
+    assert s.last_run_meta.repair_used is False
 
 
 # --- guardrail ----------------------------------------------

@@ -268,8 +268,23 @@ class HermesStrategist:
     # -- Strategist protocol ------------------------------------------------
 
     def propose(self, snapshot: StrategySnapshot) -> StrategyProposal:
-        transport = (self._transport_factory or self._build_real_transport)()
+        # Never leave stale metadata from a prior call visible if this one
+        # fails early. Time from before transport construction so setup
+        # latency is included.
+        self._last_run_meta = None
         started = time.monotonic()
+
+        # -- transport construction ---------------------------------------
+        # Covers a raising transport_factory, the lazy SDK import,
+        # genai.Client(...) init, and a missing GEMINI_API_KEY. Only the
+        # exception *type name* is recorded - never its message or any
+        # credential/SDK detail it might carry.
+        try:
+            transport = (self._transport_factory or self._build_real_transport)()
+        except Exception as exc:
+            self._record(started, "", None, repair_used=False,
+                         validation=f"transport_error:{type(exc).__name__}")
+            raise
 
         # -- first model call ------------------------------------------------
         try:

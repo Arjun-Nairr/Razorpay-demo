@@ -41,17 +41,19 @@ requirements in `PROJECT_BRIEF.md`.
   strategy -> recovery-link -> `hermes_assisted` path is proven end to end
   through `receive`/`run`/`inspect`, and Case 1's 36-test suite remains green.
 - Status: Runtime spike (`IMPLEMENTATION_SPEC.md` slice 2) complete on
-  `feat/hermes-runtime-spike`, plus a corrections pass. **Fallback path
+  `feat/hermes-runtime-spike`, plus two corrections passes. **Fallback path
   shipped**: a direct google-genai (Gemini 3.7 Flash) `HermesStrategist`
   behind the existing `Strategist` protocol, offline-tested; the Hermes-Agent
   library path was not taken (Windows `pip`/`git` long-path failure on the
   pinned commit). Corrections hardened the wall-clock timeout (daemon thread,
   returns near budget), made the offline suite SDK-independent (green with and
   without `google-genai==2.22.0`), enforced an exact six-key JSON contract,
-  clamped the repair budget to at most one, and made timeout/transport
-  failures record safe metadata. 99 tests pass; Case 1/3 untouched. Next:
-  the user runs `scripts/hermes_smoke.py` with a real key, then Codex
-  reviews, then slice 3 (FastAPI signed simulated ingress).
+  clamped the repair budget to at most one, and made every failure path -
+  including transport-*construction* failures (raising factory, lazy SDK
+  import, `Client(...)` init, missing key) - record safe redacted metadata
+  instead of escaping with `last_run_meta=None`. 101 tests pass; Case 1/3
+  untouched. Next: the user runs `scripts/hermes_smoke.py` with a real key,
+  then Codex reviews, then slice 3 (FastAPI signed simulated ingress).
 
 ## Iteration 06 — Runtime spike: isolated Gemini strategist (fallback path)
 
@@ -134,6 +136,38 @@ changed; `types.py` / `engine.py` / `adapters.py` / `protocols.py` /
 6. **Reproducible SDK version.** `[gemini]` extra pinned exactly to
    `google-genai==2.22.0` (still optional; not in default or `dev`).
 
+### Corrections pass 2 — 2026-09-03 (commit `__CORR2_SHA__`)
+
+Single fix to `HermesStrategist.propose`: transport construction (a
+raising `transport_factory`, the lazy SDK import, `genai.Client(...)`
+init, or a missing `GEMINI_API_KEY`) previously ran *before* the timer
+and outside any handler, so those failures escaped with
+`last_run_meta = None` (or stale from a prior call).
+
+Now `propose` (a) clears `self._last_run_meta` first, (b) starts the
+timer before construction, (c) wraps construction in `except Exception`
+(never `BaseException`), (d) records safe metadata before re-raising the
+original error - `validation_result = "transport_error:<ExceptionType>"`
+(type name only, never the message / credentials / SDK detail),
+`repair_used = False`, `raw_response = ""`, `usage = None`, with model,
+prompt version, and elapsed latency retained. The timeout implementation,
+runtime wiring, and audit-ledger wiring are unchanged.
+
+New/extended tests:
+`test_transport_factory_setup_failure_is_audited_and_redacted` (an
+injected factory raising `RuntimeError("sensitive-setup-marker-xyz")`
+re-raises the error but records non-null metadata; the marker is in
+neither `validation_result` nor `raw_response`),
+`test_setup_failure_does_not_leak_prior_run_metadata` (a run that
+succeeds then a run whose factory fails -> metadata is the new
+`transport_error:RuntimeError`, not the stale `"valid"`), and the
+existing `test_real_transport_build_requires_key` now also asserts the
+missing-key failure records redacted metadata. Timeout, repair,
+strict-schema, and lazy-import tests are unchanged and green.
+
+Files changed: `src/hermes/hermes_strategist.py`,
+`tests/test_hermes_strategist.py`, `HANDOFF.md`.
+
 ### Changed files (exactly these + this handoff)
 
 > The list below is the *original* Iteration 06 state. Where it and the
@@ -191,11 +225,11 @@ changed; `types.py` / `engine.py` / `adapters.py` / `protocols.py` /
 
 ### Verification
 
-- `python -m pytest -q` -> **99 passed** (57 unchanged: 36 Case 1 + 21
-  Case 3, both suites byte-for-byte untouched; + 42 offline spike tests
-  after the corrections pass expanded the parametrized cases).
+- `python -m pytest -q` -> **101 passed** (57 unchanged: 36 Case 1 + 21
+  Case 3, both suites byte-for-byte untouched; + 44 offline spike tests
+  after corrections passes 1 and 2).
 - Same suite run in a fresh venv with `google-genai==2.22.0` installed ->
-  **99 passed** (environment independence proven; offline path needs no SDK,
+  **101 passed** (environment independence proven; offline path needs no SDK,
   and installing the SDK does not change any result).
 - `python -m compileall -q src tests scripts` -> clean.
 - `git diff --check` -> clean (only CRLF-on-checkout warnings).
