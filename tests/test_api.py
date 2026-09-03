@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import types
 
 import pytest
 
@@ -311,3 +312,193 @@ def test_two_apps_have_independent_engines():
     post_webhook(tc1, failure_envelope(sub="sub_A"), event_id="evt_a")
     assert e1.inspect(BatchQuery()).cases == 1
     assert e2.inspect(BatchQuery()).cases == 0  # no shared global state
+
+
+# =====================================================================
+# Correction pass: safe simulated-ingress boundaries
+# =====================================================================
+
+
+# --- 1. configuration validation ---------------------------------
+
+
+@pytest.mark.parametrize("bad_secret", ["", "   ", "\t\n"])
+def test_blank_webhook_secret_rejected_by_apiconfig(bad_secret):
+    with pytest.raises(ValueError, match="webhook_secret"):
+        ApiConfig(webhook_secret=bad_secret)
+
+
+def test_blank_webhook_secret_rejected_by_create_app():
+    cfg = types.SimpleNamespace(webhook_secret="   ", evidence_mode="SIMULATED")
+    with pytest.raises(ValueError, match="webhook_secret"):
+        create_app(engine=make_engine(), config=cfg)
+
+
+@pytest.mark.parametrize("mode", ["REAL_TEST_MODE", "real_test_mode", "simulated", "PROD", ""])
+def test_non_simulated_evidence_mode_rejected(mode):
+    with pytest.raises(ValueError, match="SIMULATED"):
+        ApiConfig(webhook_secret="x", evidence_mode=mode)
+
+
+def test_non_simulated_evidence_mode_rejected_by_create_app():
+    cfg = types.SimpleNamespace(webhook_secret="ok", evidence_mode="REAL_TEST_MODE")
+    with pytest.raises(ValueError, match="SIMULATED"):
+        create_app(engine=make_engine(), config=cfg)
+
+
+# --- 2. currency validation -----------------------------------
+
+
+def _envelope_with_currency(currency, *, drop=False):
+    env = failure_envelope()
+    if drop:
+        env["payload"]["payment"]["entity"].pop("currency", None)
+    else:
+        env["payload"]["payment"]["entity"]["currency"] = currency
+    return env
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        _envelope_with_currency(None, drop=True),
+        _envelope_with_currency(None),
+        _envelope_with_currency(""),
+        _envelope_with_currency("  "),
+        _envelope_with_currency("IN"),
+        _envelope_with_currency("INRR"),
+        _envelope_with_currency("inr"),
+        _envelope_with_currency("1NR"),
+        _envelope_with_currency("US$"),
+        _envelope_with_currency(356),
+    ],
+)
+def test_invalid_currency_rejected_without_creating_a_case(env):
+    tc, eng = make_client()
+    r = post_webhook(tc, env, event_id="evt_cur")
+    assert r.status_code == 422
+    assert r.json()["detail"] == "unsupported or malformed event payload"
+    assert eng.inspect(BatchQuery()).cases == 0
+
+
+def test_valid_three_letter_uppercase_currency_accepted():
+    tc, _ = make_client()
+    r = post_webhook(tc, _envelope_with_currency("EUR"), event_id="evt_eur")
+    assert r.status_code == 200
+    proj = tc.get(f"/cases/{r.json()['case_id']}").json()
+    assert proj["currency"] == "EUR"
+
+
+# --- 3. missing merchant context -------------------------------
+
+
+def test_normalization_never_grants_consent_or_reachable_channel():
+    wh = normalize_event(failure_envelope(), "evt_mc", ApiConfig(webhook_secret="x"))
+    assert wh.consent is False
+    assert wh.reachable_channel is False
+
+
+def test_payload_supplied_consent_cannot_enable_contact():
+    env = failure_envelope()
+    env["payload"]["payment"]["entity"]["consent"] = True
+    env["payload"]["payment"]["entity"]["reachable_channel"] = True
+    env["payload"]["merchant_context"] = {"consent": True, "reachable_channel": True}
+
+    wh = normalize_event(env, "evt_smuggle", ApiConfig(webhook_secret="x"))
+
+    assert wh.consent is False
+    assert wh.reachable_channel is False
+
+
+# --- 4. invalid request handling ------------------------------
+
+
+@pytest.mark.parametrize(
+    "sig",
+    [
+        b"\xf1" * 64,           # non-ASCII bytes (latin-1), right length
+        "not-hex-" + "a" * 56,  # right length, non-hex chars
+        "abc",                  # too short
+        "a" * 63,               # off by one
+        "a" * 65,               # off by one
+        "",                     # empty
+        "  " + "a" * 62,        # whitespace padding
+    ],
+)
+def test_malformed_or_non_ascii_signature_returns_401_not_error(sig):
+    tc, eng = make_client()
+    r = post_webhook(tc, failure_envelope(), signature=sig, event_id="evt_sig")
+    assert r.status_code == 401  # never a 500 / unhandled TypeError
+    assert r.json()["detail"] == "invalid signature"
+    assert eng.inspect(BatchQuery()).cases == 0
+
+
+class _SpyEngine:
+    """Records whether run() was called; enough surface for /demo/run wiring."""
+
+    def __init__(self):
+        self.run_called = False
+
+    def run(self, *, until):  # pragma: no cover - must not be reached in these tests
+        self.run_called = True
+        raise AssertionError("engine.run was called for a non-object body")
+
+
+@pytest.mark.parametrize(
+    "raw_body",
+    [b"[1, 2, 3]", b"null", b'"a string"', b"42", b"3.14", b"true", b"[]"],
+)
+def test_non_object_demo_run_body_returns_400_without_running_engine(raw_body):
+    spy = _SpyEngine()
+    app = create_app(engine=spy, config=ApiConfig(webhook_secret=SECRET))
+    tc = TestClient(app)
+
+    r = tc.post("/demo/run", content=raw_body,
+                headers={"content-type": "application/json"})
+
+    assert r.status_code == 400
+    assert spy.run_called is False
+
+
+def test_demo_run_object_body_without_until_returns_400():
+    tc, _ = make_client()
+    assert tc.post("/demo/run", json={"unrelated": 1}).status_code == 400
+
+
+# --- 5. safe errors (no caller data echoed) ------------------
+
+
+def test_unsupported_event_never_echoes_a_sensitive_marker():
+    marker = "MARKER-DO-NOT-ECHO-9f8e7d"
+    env = failure_envelope(event=f"evil.{marker}")
+    env["payload"]["payment"]["entity"]["error_description"] = marker
+    env["payload"]["subscription"]["entity"]["id"] = f"sub_{marker}"
+
+    tc, eng = make_client()
+    r = post_webhook(tc, env, event_id=f"evt_{marker}")
+
+    assert r.status_code == 422
+    assert marker not in r.text
+    assert r.json()["detail"] == "unsupported or malformed event payload"
+    assert eng.inspect(BatchQuery()).cases == 0
+
+
+def test_malformed_json_body_with_marker_is_not_echoed():
+    marker = "MARKER-IN-RAW-BODY-1234"
+    raw = ('{"event": "payment.failed", "note": "' + marker + '"').encode()  # truncated JSON
+    tc, _ = make_client()
+    r = tc.post(
+        "/webhooks/razorpay",
+        content=raw,
+        headers={"x-razorpay-signature": sign(raw), "x-razorpay-event-id": "evt_m"},
+    )
+    assert r.status_code == 400
+    assert marker not in r.text
+
+
+def test_invalid_signature_value_is_not_echoed():
+    tc, _ = make_client()
+    weird_sig = "f" * 64  # valid hex format, wrong value
+    r = post_webhook(tc, failure_envelope(), signature=weird_sig, event_id="evt_noecho")
+    assert r.status_code == 401
+    assert weird_sig not in r.text

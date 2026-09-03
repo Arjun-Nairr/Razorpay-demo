@@ -40,14 +40,20 @@ requirements in `PROJECT_BRIEF.md`.
   expected-state capture guard is closed, the wait -> failed-retry -> changed-
   strategy -> recovery-link -> `hermes_assisted` path is proven end to end
   through `receive`/`run`/`inspect`, and Case 1's 36-test suite remains green.
-- Status: **Slice 3 (FastAPI signed simulated Razorpay ingress) complete** on
-  `feat/fastapi-simulated-ingress` - see Iteration 07. Delivery adapter only
-  (raw-body HMAC-SHA256 verify, event-id dedup, normalization -> `SIMULATED`,
-  `RecoveryEngine.receive`); `/health`, `/webhooks/razorpay`, `/demo/run`,
-  `/cases/{id}`; new optional `[api]` extra; 133 tests pass; engine/types/
-  Case 1/3 untouched. `feat/hermes-runtime-spike` (`7ada2bb`, incl. the two
-  authorized sanitized commits) is on `origin`. Next: Codex review, then Neon
-  persistence (slice 4).
+- Status: **Slice 3 (FastAPI signed simulated Razorpay ingress) complete**,
+  plus a safe-boundaries correction pass, on `feat/fastapi-simulated-ingress`
+  - see Iteration 07. Delivery adapter only (raw-body HMAC-SHA256 verify with
+  strict 64-hex format check, event-id dedup, normalization -> `SIMULATED`,
+  `consent`/`reachable_channel` forced `False`, strict 3-letter currency,
+  fixed non-echoing error strings, config rejects blank secret /
+  non-`SIMULATED` mode); `/health`, `/webhooks/razorpay`, `/demo/run`
+  (non-object body -> 400, no engine), `/cases/{id}`; new optional `[api]`
+  extra. **174 tests pass**; engine/types/Case 1/3 untouched.
+  `.env.example` now also has a blank `DATABASE_URL=` for the planned
+  Postgres/Neon ledger. `feat/hermes-runtime-spike` (`7ada2bb`, incl. the two
+  authorized sanitized commits) is on `origin`. Next: user adds the two local
+  credentials, then Codex review, then slice 4 (Neon persistence + Gemini
+  strategist integration).
 - Prior: Runtime spike (`IMPLEMENTATION_SPEC.md` slice 2) complete on
   `feat/hermes-runtime-spike`, plus two corrections passes. **Fallback path
   shipped**: a direct google-genai (Gemini 3.7 Flash) `HermesStrategist`
@@ -485,9 +491,10 @@ recorded failures stays an open policy question, unchanged here.
 - One optional extra per concern (`[gemini]`, `[api]`); neither in default or
   `dev`. API tests skip cleanly without `[api]`.
 - Merchant facts (`customer_notify`/`consent`/`reachable_channel`) are **not**
-  read from the Razorpay payload - they are not Razorpay data. Normalization
-  uses the `RazorpayWebhook` defaults; a merchant-context ingress is a later
-  slice (matches the existing `types.py` docstring note).
+  read from the Razorpay payload - they are not Razorpay data. *(Corrected in
+  the correction pass below: normalization now sets `consent=False` and
+  `reachable_channel=False` explicitly rather than inheriting the permissive
+  `RazorpayWebhook` defaults.)* A merchant-context ingress is a later slice.
 - The obligation id is `payload.subscription.entity.id`; a fixture without it
   is `422` (unsupported shape) rather than a guessed fallback.
 - `evidence_mode` is an `ApiConfig` field defaulting to `"SIMULATED"`; this
@@ -504,14 +511,91 @@ recorded failures stays an open policy question, unchanged here.
 - No persistence: the engine (and its logical clock) is per-process and
   in-memory. Neon is next.
 
+### Correction pass — safe simulated-ingress boundaries + credential prep
+
+One consolidated pass (commit `fix(api): enforce safe simulated ingress
+boundaries`). Only `src/hermes/api.py`, `tests/test_api.py`, `.env.example`,
+`HANDOFF.md`. No engine/types/adapters/protocols/strategist change; Case 1/3
+tests untouched.
+
+1. **Configuration** - `ApiConfig` now validates on construction *and*
+   `create_app` re-validates before wiring routes: a blank/whitespace
+   `webhook_secret` raises `ValueError`; any `evidence_mode` other than the
+   literal `"SIMULATED"` (incl. `REAL_TEST_MODE`) raises `ValueError`. There is
+   no real/Test Mode path in this adapter.
+2. **Currency** - `payload.payment.entity.currency` must be exactly three
+   uppercase ASCII letters (`\A[A-Z]{3}\Z`). Missing / non-string / blank /
+   malformed -> `422`, no case created. **Never defaulted to `INR`.**
+3. **Missing merchant context** - normalization now sets `consent=False` and
+   `reachable_channel=False` explicitly (was silently inheriting the permissive
+   `RazorpayWebhook` defaults). Payment-payload `consent` / `reachable_channel`
+   / `merchant_context` fields are ignored. Authorized customer communication
+   will require a future **trusted merchant-context source** (the merchant's
+   own contract/consent records) - not built here, and the domain defaults for
+   non-API callers are unchanged (change is at the ingress boundary only).
+4. **Invalid request handling** - the `X-Razorpay-Signature` value is
+   format-checked (`\A[0-9a-fA-F]{64}\Z`) *before* `hmac.compare_digest`;
+   missing / non-ASCII / wrong-length values now return `401` instead of
+   raising a `TypeError`. `/demo/run` rejects any non-object JSON body
+   (arrays, `null`, strings, numbers, booleans) with `400` and never touches
+   the engine. Raw-byte signature verification still precedes webhook JSON
+   parsing.
+5. **Safe errors** - all client-facing error strings are fixed module
+   constants; unsupported events, malformed JSON, and bad signatures never
+   echo the caller's event value, raw body, signature, identifiers, or an
+   exception message. A `422` for an unsupported event carrying a synthetic
+   sensitive marker does not return the marker.
+
+### Credential preparation (no live calls made)
+
+`.env.example` now carries two blank entries plus comments:
+
+```
+GEMINI_API_KEY=
+DATABASE_URL=
+```
+
+- **`GEMINI_API_KEY`** - the user's **replacement** Gemini key. The key
+  exposed earlier in chat must stay revoked and must never be reused.
+- **`DATABASE_URL`** - the Postgres connection string copied from the user's
+  **Neon project -> Connect panel**, including the TLS parameters Neon
+  supplies (e.g. `?sslmode=require`). The planned ledger (slice 4) speaks
+  ordinary **Postgres** - it is *not* a Neon management/API key and *not* a
+  new REST integration.
+- The user adds both values themselves to the existing gitignored
+  project-root `.env` and then just says "ready". This task did not open,
+  read, print, or modify `.env`.
+- **Shell env overrides `.env`.** If an old `GEMINI_API_KEY` is exported in
+  the shell it wins over the file - clear it (`unset GEMINI_API_KEY` /
+  `Remove-Item Env:GEMINI_API_KEY`).
+- No Gemini call, no Neon connection, no tables, no migration - credential
+  prep is not a blocker for finishing these offline fixes and neither
+  integration is claimed complete.
+
+### Verification (post-correction)
+
+- `python -m pytest -q` -> **174 passed** (133 from Iteration 07 + 41 new API
+  regression tests). Case 1/3 suites still byte-for-byte untouched.
+- `python -m compileall -q src tests scripts` -> clean.
+- `git diff --check` -> clean.
+- Secret scan of tracked changes: only the test literal
+  `whsec_simulated_test_only`, the identifier `webhook_secret`, and the two
+  **blank** `.env.example` keys; no real key / token / connection string / PEM.
+- `.env` remains gitignored (`.gitignore:20`) and untracked; confirmed
+  without opening it.
+
 ### Exact next action
 
-1. Codex review of Iteration 07 (diff
+1. User adds the two blank credentials to their local `.env` (see "Credential
+   preparation" above) and replies "ready".
+2. Codex review of Iteration 07 + this correction pass (diff
    `feat/hermes-runtime-spike..feat/fastapi-simulated-ingress`).
-2. Then slice 4 - **Neon persistence**: implement the `Ledger` contract
-   against Neon (webhook inbox, cases, due work, proposals, policy decisions,
-   action intents/outcomes, audit, attribution, persisted logical clock),
-   SQLite only if Neon blocks the deadline.
+3. Then slice 4 - **Neon persistence + Gemini strategist integration**:
+   implement the `Ledger` contract against Postgres/Neon (webhook inbox,
+   cases, due work, proposals, policy decisions, action intents/outcomes,
+   audit, attribution, persisted logical clock) using `DATABASE_URL`; wire
+   `HermesStrategist` behind the engine using `GEMINI_API_KEY`. SQLite only
+   if Neon blocks the deadline.
 
 ## Architecture reconciliation — 2026-09-03
 
