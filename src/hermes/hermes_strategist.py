@@ -32,9 +32,8 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as _FuturesTimeout
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
@@ -45,6 +44,16 @@ DEFAULT_TIMEOUT_S = 60.0
 DEFAULT_API_KEY_ENV = "GEMINI_API_KEY"
 PROMPT_VERSION = "hermes-strategist/2026-09-03.1"
 _MAX_RAW_CHARS = 4000  # bounded raw-response capture for run metadata
+
+# The model must return a JSON object with EXACTLY these keys - no more, no less.
+REQUIRED_KEYS: tuple[str, ...] = (
+    "action",
+    "diagnosis",
+    "rationale",
+    "confidence",
+    "proposed_wait_hours",
+    "message_intent",
+)
 
 # The isolation settings the Hermes-Agent path WOULD have applied to every
 # fresh ``AIAgent``. Asserted verbatim by the offline tests so a later swap to
@@ -152,9 +161,10 @@ def _user_prompt(snap: StrategySnapshot, *, repair_reason: str | None = None) ->
 
 def parse_proposal(raw: str) -> StrategyProposal:
     """Parse strict JSON into a :class:`StrategyProposal`. Structural only:
-    shape, required keys, types, enum membership, numeric ranges. Content rules
-    (no URL / currency / provider id in ``message_intent``) stay with the
-    engine's ``_validate_proposal``. Raises :class:`InvalidProposal`."""
+    exact key set, types, enum membership, numeric ranges, blank-message
+    normalization. Content rules (no URL / currency / provider id in
+    ``message_intent``) stay with the engine's ``_validate_proposal``. Raises
+    :class:`InvalidProposal`."""
     try:
         obj = json.loads(raw)
     except (ValueError, TypeError) as exc:
@@ -162,10 +172,14 @@ def parse_proposal(raw: str) -> StrategyProposal:
     if not isinstance(obj, dict):
         raise InvalidProposal(f"top-level JSON is {type(obj).__name__}, expected object")
 
-    required = {"action", "diagnosis", "rationale", "confidence"}
-    missing = sorted(required - obj.keys())
+    keys = set(obj.keys())
+    allowed = set(REQUIRED_KEYS)
+    missing = sorted(allowed - keys)
     if missing:
         raise InvalidProposal(f"missing keys: {missing}")
+    extra = sorted(keys - allowed)
+    if extra:
+        raise InvalidProposal(f"unexpected keys: {extra}")
 
     try:
         action = ProposalAction(obj["action"])
@@ -178,7 +192,7 @@ def parse_proposal(raw: str) -> StrategyProposal:
     if not 0.0 <= float(conf) <= 1.0:
         raise InvalidProposal(f"confidence out of range 0..1: {conf!r}")
 
-    wait = obj.get("proposed_wait_hours", 0)
+    wait = obj["proposed_wait_hours"]
     if isinstance(wait, bool) or not isinstance(wait, int) or wait < 0:
         raise InvalidProposal(f"proposed_wait_hours must be int >= 0: {wait!r}")
 
@@ -189,7 +203,7 @@ def parse_proposal(raw: str) -> StrategyProposal:
     if not isinstance(rationale, str) or not rationale.strip():
         raise InvalidProposal("rationale must be a non-empty string")
 
-    message_intent = obj.get("message_intent")
+    message_intent = obj["message_intent"]
     if message_intent is not None and not isinstance(message_intent, str):
         raise InvalidProposal(f"message_intent must be string or null: {message_intent!r}")
     if isinstance(message_intent, str):
@@ -217,10 +231,12 @@ class HermesStrategist:
         Gemini model id (default ``gemini-3.7-flash``).
     timeout_s:
         Application-level wall-clock budget for a single model call; exceeding
-        it raises :class:`TimeoutError`.
+        it raises :class:`TimeoutError` promptly (the abandoned worker thread is
+        a daemon and its result is discarded).
     max_repair_attempts:
-        At most one bounded repair call after an invalid first reply (default 1;
-        0 disables repair).
+        Repair budget after an invalid first reply. Hard-clamped to ``{0, 1}``:
+        any value >= 1 becomes 1, anything else 0. A caller can never trigger
+        more than one repair call.
     api_key_env:
         Environment variable the real client reads the key from. Never a literal.
     transport_factory:
@@ -239,7 +255,8 @@ class HermesStrategist:
     ) -> None:
         self._model = model
         self._timeout_s = float(timeout_s)
-        self._max_repair_attempts = max(0, int(max_repair_attempts))
+        # Contract: at most one repair, ever. Clamp explicitly to {0, 1}.
+        self._max_repair_attempts = 1 if int(max_repair_attempts) >= 1 else 0
         self._api_key_env = api_key_env
         self._transport_factory = transport_factory
         self._last_run_meta: StrategistRunMeta | None = None
@@ -253,47 +270,84 @@ class HermesStrategist:
     def propose(self, snapshot: StrategySnapshot) -> StrategyProposal:
         transport = (self._transport_factory or self._build_real_transport)()
         started = time.monotonic()
-        raw, usage = self._call(transport, _user_prompt(snapshot))
-        repair_used = False
+
+        # -- first model call ------------------------------------------------
+        try:
+            raw, usage = self._call(transport, _user_prompt(snapshot))
+        except TimeoutError:
+            self._record(started, "", None, repair_used=False, validation="timeout")
+            raise
+        except Exception as exc:  # transport / SDK failure
+            self._record(started, "", None, repair_used=False,
+                         validation=f"transport_error:{type(exc).__name__}")
+            raise
 
         try:
             proposal = parse_proposal(raw)
-            validation = "valid"
+            self._record(started, raw, usage, repair_used=False, validation="valid")
+            return proposal
         except InvalidProposal as first_error:
             if self._max_repair_attempts < 1:
                 self._record(started, raw, usage, repair_used=False,
                              validation=f"invalid:{first_error}")
                 raise
-            repair_used = True
-            raw, repair_usage = self._call(
-                transport, _user_prompt(snapshot, repair_reason=str(first_error))
-            )
-            usage = repair_usage or usage
-            try:
-                proposal = parse_proposal(raw)
-                validation = "repaired"
-            except InvalidProposal as second_error:
-                self._record(started, raw, usage, repair_used=True,
-                             validation=f"invalid:{second_error}")
-                raise
+            first_reason = str(first_error)  # `first_error` is out of scope below
 
-        self._record(started, raw, usage, repair_used=repair_used, validation=validation)
+        # -- exactly one repair call --------------------------------------
+        try:
+            raw2, usage2 = self._call(
+                transport, _user_prompt(snapshot, repair_reason=first_reason)
+            )
+        except TimeoutError:
+            # keep the first reply's raw/usage - it is the available evidence
+            self._record(started, raw, usage, repair_used=True, validation="timeout")
+            raise
+        except Exception as exc:
+            self._record(started, raw, usage, repair_used=True,
+                         validation=f"transport_error:{type(exc).__name__}")
+            raise
+
+        usage = usage2 or usage
+        try:
+            proposal = parse_proposal(raw2)
+        except InvalidProposal as second_error:
+            self._record(started, raw2, usage, repair_used=True,
+                         validation=f"invalid:{second_error}")
+            raise
+        self._record(started, raw2, usage, repair_used=True, validation="repaired")
         return proposal
 
     # -- internals -------------------------------------------------------
 
     def _call(self, transport: _Transport, user_prompt: str) -> tuple[str, dict[str, Any] | None]:
-        """One model call under the application-level timeout. The worker thread
-        cannot be force-killed; on timeout it is left to finish and its result
-        discarded (acceptable for a single short spike call)."""
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(transport.generate, system=_SYSTEM_PROMPT, user=user_prompt)
+        """One model call under the application-level wall-clock timeout.
+
+        The call runs on a daemon thread. On timeout this method raises
+        :class:`TimeoutError` immediately; the worker is abandoned (it cannot be
+        force-killed) and, being a daemon, never blocks interpreter exit. Its
+        eventual result or exception is discarded. No executor, so no
+        ``shutdown(wait=True)`` and no ``atexit`` join.
+        """
+        box: dict[str, Any] = {}
+
+        def _worker() -> None:
             try:
-                return future.result(timeout=self._timeout_s)
-            except _FuturesTimeout:
-                raise TimeoutError(
-                    f"strategist model call exceeded {self._timeout_s:.3g}s budget"
-                )
+                box["result"] = transport.generate(system=_SYSTEM_PROMPT, user=user_prompt)
+            except BaseException as exc:  # noqa: BLE001  captured, surfaced below
+                box["error"] = exc
+
+        worker = threading.Thread(
+            target=_worker, name="hermes-strategist-call", daemon=True
+        )
+        worker.start()
+        worker.join(self._timeout_s)
+        if worker.is_alive():
+            raise TimeoutError(
+                f"strategist model call exceeded {self._timeout_s:.3g}s budget"
+            )
+        if "error" in box:
+            raise box["error"]
+        return box["result"]
 
     def _record(
         self,

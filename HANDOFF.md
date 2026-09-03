@@ -41,11 +41,16 @@ requirements in `PROJECT_BRIEF.md`.
   strategy -> recovery-link -> `hermes_assisted` path is proven end to end
   through `receive`/`run`/`inspect`, and Case 1's 36-test suite remains green.
 - Status: Runtime spike (`IMPLEMENTATION_SPEC.md` slice 2) complete on
-  `feat/hermes-runtime-spike`. **Fallback path shipped**: a direct
-  google-genai (Gemini 3.7 Flash) `HermesStrategist` behind the existing
-  `Strategist` protocol, offline-tested; the Hermes-Agent library path was
-  not taken (Windows `pip`/`git` long-path failure on the pinned commit).
-  Next: the user runs `scripts/hermes_smoke.py` with a real key, then Codex
+  `feat/hermes-runtime-spike`, plus a corrections pass. **Fallback path
+  shipped**: a direct google-genai (Gemini 3.7 Flash) `HermesStrategist`
+  behind the existing `Strategist` protocol, offline-tested; the Hermes-Agent
+  library path was not taken (Windows `pip`/`git` long-path failure on the
+  pinned commit). Corrections hardened the wall-clock timeout (daemon thread,
+  returns near budget), made the offline suite SDK-independent (green with and
+  without `google-genai==2.22.0`), enforced an exact six-key JSON contract,
+  clamped the repair budget to at most one, and made timeout/transport
+  failures record safe metadata. 99 tests pass; Case 1/3 untouched. Next:
+  the user runs `scripts/hermes_smoke.py` with a real key, then Codex
   reviews, then slice 3 (FastAPI signed simulated ingress).
 
 ## Iteration 06 — Runtime spike: isolated Gemini strategist (fallback path)
@@ -69,12 +74,71 @@ requirements in `PROJECT_BRIEF.md`.
   object is `6e8f8418e6378eb2617e4de074e13dedd091b8af`, which is *not* a
   commit - do not put that in a `git+...@` URL). `hermes-agent` version at
   that tag is `0.21.0`, `requires-python >=3.11,<3.14`.
-- No dependency added to default/`dev`. New optional extra `[gemini]`
-  (`google-genai>=1,<3`) - named `gemini`, not `hermes`, since the Hermes
-  path did not ship; deviation from deliverable 1's `hermes` key, recorded
-  here.
+- No dependency added to default/`dev`. New optional extra `[gemini]` -
+  named `gemini`, not `hermes`, since the Hermes path did not ship;
+  deviation from deliverable 1's `hermes` key, recorded here.
+
+### Corrections pass — 2026-09-03 (second commit on `feat/hermes-runtime-spike`)
+
+Correction-only follow-up to Iteration 06. Only `pyproject.toml`,
+`src/hermes/hermes_strategist.py`, and `tests/test_hermes_strategist.py`
+changed; `types.py` / `engine.py` / `adapters.py` / `protocols.py` /
+`scripts/hermes_smoke.py` / Case 1 & 3 tests untouched.
+
+1. **Real wall-clock timeout.** `_call` no longer uses a
+   `ThreadPoolExecutor` context manager (whose `__exit__` ->
+   `shutdown(wait=True)` blocked `propose()` until the slow transport
+   finished). It now runs the transport on a `daemon` `threading.Thread`
+   and `join(timeout_s)`; if still alive it raises `TimeoutError`
+   immediately, abandons the worker (daemon -> never blocks interpreter
+   exit), and discards its eventual result/exception. No executor, so no
+   `atexit` join either. Regression test
+   `test_propose_returns_near_timeout_not_transport_completion`: a 1.5 s
+   transport with a 0.05 s budget returns in well under 0.6 s (tolerant
+   ceiling for CI).
+2. **SDK-independent offline tests.** Removed the "`google.genai` is
+   absent" assertion. New `test_real_google_import_never_happens_on_the_stub_path`
+   monkeypatches `builtins.__import__` to raise on any `google` /
+   `google.*` import, then runs a full stub-transport `propose()` -
+   proving the lazy import while the offline path succeeds. Suite verified
+   green **both** without the SDK and with `google-genai==2.22.0`
+   installed (fresh venv). Still zero network, zero key.
+3. **Strict six-key JSON shape.** `parse_proposal` now requires exactly
+   `action`, `diagnosis`, `rationale`, `confidence`, `proposed_wait_hours`,
+   `message_intent` (module constant `REQUIRED_KEYS`). Missing -> reject;
+   any unknown/extra key -> reject. Type / enum / range / blank-message
+   normalization / repair behaviour unchanged. New tests:
+   `test_missing_any_required_key_is_rejected` (parametrized over all six),
+   `test_unknown_extra_key_is_rejected`, and
+   `test_type_enum_and_range_faults_still_rejected` re-cast as full
+   six-key payloads with exactly one bad field so those paths still fire.
+4. **Max one repair, structurally.** Constructor clamps
+   `max_repair_attempts` explicitly to `{0, 1}` (`1 if int(x) >= 1 else 0`).
+   `test_repair_budget_cannot_exceed_one` (parametrized 2/5/99) proves an
+   always-invalid model still yields exactly two transport calls (first +
+   one repair), never more.
+5. **Failure metadata.** `propose()` now wraps every model call:
+   `TimeoutError` -> `last_run_meta.validation_result = "timeout"`;
+   any other transport/SDK exception ->
+   `"transport_error:<ExceptionType>"` (type name only - the exception
+   message/content is never recorded). Metadata is populated **before**
+   the exception is re-raised and carries model, `prompt_version`,
+   elapsed `latency_ms`, `repair_used` (whether the repair call had
+   started), bounded `raw_response` (the first reply when a repair call
+   fails, else `""`), and `usage` (the first reply's usage when
+   available, else `None`). Tests: `test_initial_call_timeout_records_safe_metadata`,
+   `test_initial_transport_failure_records_safe_metadata` (asserts a
+   synthetic sensitive marker in the exception does NOT reach the
+   metadata), `test_repair_call_failure_records_metadata_with_first_reply_evidence`,
+   `test_repair_call_timeout_records_metadata`.
+6. **Reproducible SDK version.** `[gemini]` extra pinned exactly to
+   `google-genai==2.22.0` (still optional; not in default or `dev`).
 
 ### Changed files (exactly these + this handoff)
+
+> The list below is the *original* Iteration 06 state. Where it and the
+> "Corrections pass" subsection above disagree (timeout mechanism, exact test
+> count, SDK pin), the corrections subsection is current.
 
 - `pyproject.toml` - new `[project.optional-dependencies] gemini` extra;
   comment block records the Hermes-Agent pin + Windows caveat for a retry.
@@ -127,32 +191,54 @@ requirements in `PROJECT_BRIEF.md`.
 
 ### Verification
 
-- `python -m pytest -q` -> **74 passed** (57 unchanged: 36 Case 1 + 21
-  Case 3, both suites byte-for-byte untouched; + 17 new offline spike tests).
+- `python -m pytest -q` -> **99 passed** (57 unchanged: 36 Case 1 + 21
+  Case 3, both suites byte-for-byte untouched; + 42 offline spike tests
+  after the corrections pass expanded the parametrized cases).
+- Same suite run in a fresh venv with `google-genai==2.22.0` installed ->
+  **99 passed** (environment independence proven; offline path needs no SDK,
+  and installing the SDK does not change any result).
 - `python -m compileall -q src tests scripts` -> clean.
 - `git diff --check` -> clean (only CRLF-on-checkout warnings).
-- Staged diff scanned: exactly the six files above + `HANDOFF.md`; no
-  `types/engine/adapters/protocols.py`, no doc except this file; no secret
-  literals (`grep` for `AIza…` / key / secret / PEM patterns - none).
+- Staged diff after corrections: exactly `pyproject.toml`,
+  `src/hermes/hermes_strategist.py`, `tests/test_hermes_strategist.py`
+  (+ this handoff). No `types/engine/adapters/protocols.py`, no other doc,
+  no `scripts/`, no Case 1/3 tests. No real key or secret literal (the only
+  `sk-`/marker-shaped string is a synthetic value inside a test asserting it
+  is NOT leaked into metadata).
 - Real Gemini round-trip: **NOT run here** (no key in this environment, by
-  design). Pending: user runs `pip install ".[gemini]"`, sets
-  `GEMINI_API_KEY`, runs `python scripts/hermes_smoke.py`, pastes the JSON
-  output below.
+  design; the corrections pass did not add one). Pending: user runs the
+  smoke script and pastes output below.
 
   ```
   (paste hermes_smoke.py output here)
   ```
 
+  Smoke-test instructions:
+  1. `python -m pip install ".[gemini]"`  (installs `google-genai==2.22.0`)
+  2. set the key - PowerShell: `$env:GEMINI_API_KEY = "..."` ; bash:
+     `export GEMINI_API_KEY=...`
+  3. `python scripts/hermes_smoke.py`  -> prints one JSON object with
+     `run_meta` (model, prompt_version, latency, usage, validation_result,
+     repair_used, bounded raw) and the parsed `proposal`. The key is never
+     printed. Exit 0 = validated proposal, 1 = failure (type shown), 2 = no key.
+  4. paste the JSON into the block above.
+
 ### Remaining limitations
 
-- The one real model call is unproven until the user runs the smoke script;
-  the real-transport shape (`client.models.generate_content`, `resp.text`,
-  `resp.usage_metadata`) was verified against `google-genai 2.22.0` in an
-  isolated venv but not exercised end to end.
-- The timeout worker thread cannot be force-killed; on timeout it finishes
-  in the background and its result is discarded (fine for one short call).
+- The one real model call is still unproven until the user runs the smoke
+  script; the real-transport shape (`client.models.generate_content`,
+  `resp.text`, `resp.usage_metadata`) was verified against
+  `google-genai 2.22.0` by signature probe in an isolated venv but not
+  exercised end to end.
+- On timeout the daemon worker thread keeps running in the background until
+  the transport call returns on its own; its result/exception is discarded
+  and, being a daemon, it never blocks interpreter exit.
 - `HermesStrategist` is not wired into `RecoveryEngine`; wiring + threading
   `StrategistRunMeta` into `AI_PROPOSAL` audit rows is a later task.
+- `parse_proposal` validation is structural only (exact key set, types,
+  enum, range, blank-message). Content rules (no URL / currency / provider
+  id in `message_intent`) remain the engine's `_validate_proposal`
+  responsibility, unchanged.
 - If Hermes-Agent is still wanted, its Windows install needs
   `git config --global core.longpaths true` (+ OS long-path support) or a
   pre-clone-then-`pip install ./dir` flow; revisit only if the library's
@@ -160,8 +246,8 @@ requirements in `PROJECT_BRIEF.md`.
 
 ### Exact next action
 
-1. User: `pip install ".[gemini]"`, set `GEMINI_API_KEY`, run
-   `python scripts/hermes_smoke.py`, paste output into the block above.
+1. User: run the smoke script (instructions above), paste output into the
+   block above.
 2. Codex: review this iteration (diff `feat/case-3-adaptation..feat/hermes-runtime-spike`)
    and the smoke output; decide whether the fallback Gemini adapter is
    sufficient for the demo or a Hermes-Agent retry is warranted.

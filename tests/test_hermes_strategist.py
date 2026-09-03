@@ -2,12 +2,13 @@
 
 Zero network, zero API key: every test injects a stub transport. The real
 Gemini round-trip is exercised only by ``scripts/hermes_smoke.py``, run by the
-human user. Nothing here imports ``google.genai``.
+human user. Nothing here imports ``google.genai`` on the tested path, and the
+suite passes whether or not the optional ``google-genai`` SDK is installed.
 """
 
 from __future__ import annotations
 
-import importlib.util
+import builtins
 import json
 import pathlib
 import time
@@ -18,6 +19,7 @@ from hermes.hermes_strategist import (
     DEFAULT_MODEL,
     ISOLATION_PROFILE,
     PROMPT_VERSION,
+    REQUIRED_KEYS,
     HermesStrategist,
     parse_proposal,
 )
@@ -28,8 +30,9 @@ from hermes.types import (
     StrategySnapshot,
 )
 
-VALID_JSON = json.dumps(
-    {
+
+def _valid_obj(**over) -> dict:
+    obj = {
         "action": "CREATE_RECOVERY_LINK",
         "diagnosis": "insufficient funds, one provider retry already failed",
         "rationale": "wait is spent; offer an alternate collection path",
@@ -37,7 +40,11 @@ VALID_JSON = json.dumps(
         "proposed_wait_hours": 0,
         "message_intent": "Your recent payment did not go through - a secure way to complete it is ready.",
     }
-)
+    obj.update(over)
+    return obj
+
+
+VALID_JSON = json.dumps(_valid_obj())
 
 
 def snapshot(**over) -> StrategySnapshot:
@@ -65,8 +72,8 @@ def snapshot(**over) -> StrategySnapshot:
 
 
 class StubTransport:
-    """Scripted transport. Each entry is either a response string or a callable
-    (invoked for side effects like sleeping, then its return used)."""
+    """Scripted transport. Each entry is a response string, a ``BaseException``
+    to raise, or a zero-arg callable whose return value is used."""
 
     def __init__(self, *responses, sleep_s: float = 0.0):
         self._responses = list(responses)
@@ -78,6 +85,8 @@ class StubTransport:
         if self._sleep_s:
             time.sleep(self._sleep_s)
         item = self._responses.pop(0)
+        if isinstance(item, BaseException):
+            raise item
         raw = item() if callable(item) else item
         return raw, {"prompt_tokens": 10, "output_tokens": 20, "total_tokens": 30}
 
@@ -87,7 +96,7 @@ def strategist(*responses, sleep_s=0.0, **kw):
     return HermesStrategist(transport_factory=lambda: stub, **kw), stub
 
 
-# --- schema validation ------------------------------------------------------
+# --- schema validation: exactly six keys ---------------------------------
 
 
 def test_valid_json_becomes_typed_proposal():
@@ -105,21 +114,70 @@ def test_valid_json_becomes_typed_proposal():
     assert meta.latency_ms >= 0.0
 
 
+def test_required_keys_are_the_documented_six():
+    assert set(REQUIRED_KEYS) == {
+        "action", "diagnosis", "rationale", "confidence",
+        "proposed_wait_hours", "message_intent",
+    }
+
+
+@pytest.mark.parametrize("drop", list(REQUIRED_KEYS))
+def test_missing_any_required_key_is_rejected(drop):
+    obj = _valid_obj()
+    obj.pop(drop)
+    with pytest.raises(InvalidProposal, match="missing keys"):
+        parse_proposal(json.dumps(obj))
+
+
+@pytest.mark.parametrize("extra", ["surprise", "priority", "action_v2"])
+def test_unknown_extra_key_is_rejected(extra):
+    obj = _valid_obj()
+    obj[extra] = "nope"
+    with pytest.raises(InvalidProposal, match="unexpected keys"):
+        parse_proposal(json.dumps(obj))
+
+
 @pytest.mark.parametrize(
-    "bad",
+    "raw",
     [
         "not json at all",
-        json.dumps({"action": "CREATE_RECOVERY_LINK"}),  # missing required keys
-        json.dumps({"action": "NOPE", "diagnosis": "d", "rationale": "r", "confidence": 0.5}),
-        json.dumps({"action": "STOP", "diagnosis": "d", "rationale": "r", "confidence": 2}),
-        json.dumps({"action": "STOP", "diagnosis": "d", "rationale": "r", "confidence": 0.5,
-                    "proposed_wait_hours": -1}),
         json.dumps(["a", "list"]),
+        json.dumps("a string"),
     ],
 )
-def test_parse_proposal_rejects_structurally_invalid(bad):
+def test_non_object_json_is_rejected(raw):
     with pytest.raises(InvalidProposal):
-        parse_proposal(bad)
+        parse_proposal(raw)
+
+
+@pytest.mark.parametrize(
+    "obj",
+    [
+        _valid_obj(action="NOT_A_REAL_ACTION"),
+        _valid_obj(confidence=2),
+        _valid_obj(confidence="high"),
+        _valid_obj(confidence=True),
+        _valid_obj(proposed_wait_hours=-1),
+        _valid_obj(proposed_wait_hours="soon"),
+        _valid_obj(proposed_wait_hours=True),
+        _valid_obj(diagnosis="   "),
+        _valid_obj(rationale=""),
+        _valid_obj(message_intent=42),
+    ],
+)
+def test_type_enum_and_range_faults_still_rejected(obj):
+    # full six-key payloads, exactly one field wrong -> the type/enum/range
+    # checks (not the key-set check) are what fires.
+    with pytest.raises(InvalidProposal):
+        parse_proposal(json.dumps(obj))
+
+
+def test_blank_message_intent_is_normalised_to_none():
+    assert parse_proposal(json.dumps(_valid_obj(message_intent="   "))).message_intent is None
+    assert parse_proposal(json.dumps(_valid_obj(message_intent=None))).message_intent is None
+
+
+# --- repair behaviour ---------------------------------------------------
 
 
 def test_malformed_then_unfixed_raises_after_exactly_one_repair():
@@ -127,7 +185,7 @@ def test_malformed_then_unfixed_raises_after_exactly_one_repair():
     with pytest.raises(InvalidProposal):
         s.propose(snapshot())
     assert len(stub.calls) == 2  # first + exactly one repair
-    assert "rejected" in stub.calls[1]["user"].lower()  # repair prompt carries the error
+    assert "rejected" in stub.calls[1]["user"].lower()
     meta = s.last_run_meta
     assert meta.repair_used is True and meta.validation_result.startswith("invalid:")
 
@@ -149,24 +207,94 @@ def test_zero_repair_budget_raises_on_first_invalid():
     assert s.last_run_meta.repair_used is False
 
 
-def test_blank_message_intent_is_normalised_to_none():
-    raw = json.dumps(
-        {"action": "WAIT_FOR_PROVIDER_RETRY", "diagnosis": "d", "rationale": "r",
-         "confidence": 0.5, "proposed_wait_hours": 24, "message_intent": "   "}
-    )
-    assert parse_proposal(raw).message_intent is None
+@pytest.mark.parametrize("configured", [2, 5, 99])
+def test_repair_budget_cannot_exceed_one(configured):
+    # even asking for many repairs, an always-invalid model gets exactly one.
+    s, stub = strategist("bad", "bad", "bad", "bad", max_repair_attempts=configured)
+    with pytest.raises(InvalidProposal):
+        s.propose(snapshot())
+    assert len(stub.calls) == 2  # first + one repair, never more
 
 
-# --- timeout --------------------------------------------------------------
+# --- real wall-clock timeout ------------------------------------------
 
 
 def test_call_exceeding_budget_raises_timeouterror():
-    s, stub = strategist(VALID_JSON, sleep_s=0.30, timeout_s=0.05)
+    s, _ = strategist(VALID_JSON, sleep_s=0.30, timeout_s=0.05)
     with pytest.raises(TimeoutError):
         s.propose(snapshot())
 
 
-# --- isolation contract -------------------------------------------------
+def test_propose_returns_near_timeout_not_transport_completion():
+    slow_s, budget_s = 1.5, 0.05
+    s, _ = strategist(VALID_JSON, sleep_s=slow_s, timeout_s=budget_s)
+    start = time.monotonic()
+    with pytest.raises(TimeoutError):
+        s.propose(snapshot())
+    elapsed = time.monotonic() - start
+    # tolerant: anything well under the transport's own duration proves we did
+    # not wait for it to finish (expected ~budget_s; generous ceiling for CI).
+    assert elapsed < 0.6, f"propose() waited {elapsed:.3f}s, near the {slow_s}s transport"
+
+
+# --- failure metadata -------------------------------------------------
+
+
+def test_initial_call_timeout_records_safe_metadata():
+    s, _ = strategist(VALID_JSON, sleep_s=0.30, timeout_s=0.05)
+    with pytest.raises(TimeoutError):
+        s.propose(snapshot())
+    meta = s.last_run_meta
+    assert meta is not None
+    assert meta.validation_result == "timeout"
+    assert meta.repair_used is False
+    assert meta.raw_response == "" and meta.usage is None
+    assert meta.model == DEFAULT_MODEL and meta.prompt_version == PROMPT_VERSION
+    assert meta.latency_ms >= 0.0
+
+
+def test_initial_transport_failure_records_safe_metadata():
+    # a synthetic marker standing in for anything sensitive an SDK/auth error
+    # message might carry; it must not reach the recorded metadata.
+    sensitive_marker = "boom-DO-NOT-LEAK-marker"
+    s, stub = strategist(RuntimeError(sensitive_marker))
+    with pytest.raises(RuntimeError):
+        s.propose(snapshot())
+    meta = s.last_run_meta
+    assert meta.validation_result == "transport_error:RuntimeError"
+    assert sensitive_marker not in meta.validation_result  # only the type name is kept
+    assert sensitive_marker not in (meta.raw_response or "")
+    assert meta.repair_used is False
+    assert meta.raw_response == "" and meta.usage is None
+    assert len(stub.calls) == 1
+
+
+def test_repair_call_failure_records_metadata_with_first_reply_evidence():
+    s, stub = strategist("garbage first reply", ConnectionError("network down"))
+    with pytest.raises(ConnectionError):
+        s.propose(snapshot())
+    meta = s.last_run_meta
+    assert meta.validation_result == "transport_error:ConnectionError"
+    assert meta.repair_used is True  # repair had started
+    assert meta.raw_response == "garbage first reply"  # available evidence retained
+    assert meta.usage == {"prompt_tokens": 10, "output_tokens": 20, "total_tokens": 30}
+    assert len(stub.calls) == 2
+
+
+def test_repair_call_timeout_records_metadata():
+    def slow():
+        time.sleep(0.30)
+        return VALID_JSON
+
+    s, stub = strategist("garbage", slow, timeout_s=0.05)
+    with pytest.raises(TimeoutError):
+        s.propose(snapshot())
+    meta = s.last_run_meta
+    assert meta.validation_result == "timeout" and meta.repair_used is True
+    assert meta.raw_response == "garbage"  # first reply kept as evidence
+
+
+# --- isolation contract ---------------------------------------------
 
 
 def test_isolation_profile_is_declared():
@@ -180,7 +308,7 @@ def test_isolation_profile_is_declared():
     assert p["max_iterations"] == 3
 
 
-# --- context minimisation ---------------------------------------------
+# --- context minimisation -----------------------------------------
 
 
 def test_prompt_context_excludes_identifiers_and_amounts():
@@ -193,21 +321,30 @@ def test_prompt_context_excludes_identifiers_and_amounts():
     assert "insufficient_funds" in sent  # decision-relevant fact is present
 
 
-# --- guardrails ------------------------------------------------------
+# --- SDK independence / lazy import ------------------------------
 
 
-def _genai_importable() -> bool:
-    try:
-        return importlib.util.find_spec("google.genai") is not None
-    except ModuleNotFoundError:
-        return False
+def test_real_google_import_never_happens_on_the_stub_path(monkeypatch):
+    real_import = builtins.__import__
 
+    def guard(name, *args, **kwargs):
+        if name == "google" or name.startswith("google."):
+            raise AssertionError(f"lazy-import contract broken: imported {name!r}")
+        return real_import(name, *args, **kwargs)
 
-def test_offline_path_needs_no_genai_sdk():
-    # The project interpreter has no google.genai; the module + stub path work anyway.
-    assert _genai_importable() is False
+    monkeypatch.setattr(builtins, "__import__", guard)
     s, _ = strategist(VALID_JSON)
     assert s.propose(snapshot()).action is ProposalAction.CREATE_RECOVERY_LINK
+
+
+def test_real_transport_build_requires_key(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    s = HermesStrategist()  # no transport_factory -> real path
+    with pytest.raises(RuntimeError, match="GEMINI_API_KEY"):
+        s.propose(snapshot())
+
+
+# --- guardrail ----------------------------------------------
 
 
 def test_not_wired_into_default_engine():
@@ -216,10 +353,3 @@ def test_not_wired_into_default_engine():
     ).read_text()
     assert "HermesStrategist" not in engine_src
     assert "hermes_strategist" not in engine_src
-
-
-def test_real_transport_build_requires_key(monkeypatch):
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    s = HermesStrategist()  # no transport_factory -> real path
-    with pytest.raises(RuntimeError, match="GEMINI_API_KEY"):
-        s.propose(snapshot())

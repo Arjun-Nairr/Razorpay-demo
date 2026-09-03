@@ -20,7 +20,7 @@ dev = ["pytest>=8"]
 #   hermes-agent @ git+https://github.com/NousResearch/hermes-agent@29112bef099274229cadff79cdff7bf7b99c4b77
 # and note that `pip install` of it fails on Windows without
 # `git config --global core.longpaths true` (MAX_PATH in the repo's docs tree).
-gemini = ["google-genai>=1,<3"]
+gemini = ["google-genai==2.22.0"]  # exact version the spike transport was written and probed against
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hermes"]
