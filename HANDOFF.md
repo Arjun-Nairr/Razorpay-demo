@@ -52,8 +52,12 @@ requirements in `PROJECT_BRIEF.md`.
   including transport-*construction* failures (raising factory, lazy SDK
   import, `Client(...)` init, missing key) - record safe redacted metadata
   instead of escaping with `last_run_meta=None`. 101 tests pass; Case 1/3
-  untouched. Next: the user runs `scripts/hermes_smoke.py` with a real key,
-  then Codex reviews, then slice 3 (FastAPI signed simulated ingress).
+  untouched. The user-run Gemini smoke test reached the live model and returned
+  schema-valid JSON, proving the fallback transport, model name, parsing, and
+  metadata path. However, the live proposal repeated
+  `WAIT_FOR_PROVIDER_RETRY` even though the snapshot said the prior retry had
+  already failed. Before slice 3, add a narrow contextual-invalid repair plus
+  a deterministic policy guard against a repeated failed-retry wait.
 
 ## Iteration 06 — Runtime spike: isolated Gemini strategist (fallback path)
 
@@ -239,13 +243,44 @@ Files changed: `src/hermes/hermes_strategist.py`,
   no `scripts/`, no Case 1/3 tests. No real key or secret literal (the only
   `sk-`/marker-shaped string is a synthetic value inside a test asserting it
   is NOT leaked into metadata).
-- Real Gemini round-trip: **NOT run here** (no key in this environment, by
-  design; the corrections pass did not add one). Pending: user runs the
-  smoke script and pastes output below.
+- Real Gemini round-trip: **run successfully by the user**. No key was written
+  to the repository. The key used for this test was later exposed in chat, so
+  the user was instructed to revoke it and create a replacement; never reuse
+  or request that disclosed credential.
 
+  ```json
+  {
+    "outcome": "ok",
+    "run_meta": {
+      "model": "gemini-3.7-flash",
+      "prompt_version": "hermes-strategist/2026-09-03.1",
+      "latency_ms": 6562.0,
+      "repair_used": false,
+      "validation_result": "valid",
+      "usage": {
+        "prompt_tokens": 358,
+        "output_tokens": 92,
+        "total_tokens": 819
+      },
+      "cost_usd": null
+    },
+    "proposal": {
+      "action": "WAIT_FOR_PROVIDER_RETRY",
+      "diagnosis": "Temporary failure due to insufficient funds with active provider retry eligibility",
+      "rationale": "Provider retry is eligible and supported by evidence, allowing automated recovery without unnecessary customer friction",
+      "confidence": 0.85,
+      "proposed_wait_hours": 24,
+      "message_intent": null
+    }
+  }
   ```
-  (paste hermes_smoke.py output here)
-  ```
+
+  Result: live connectivity and structural validation **PASS**. Case 3 semantic
+  adaptation **FAILS** for this sample: `retry_outcome_recorded=true` and
+  `prior_action=WAIT_FOR_PROVIDER_RETRY`, so another wait is not acceptable.
+  The current partial `authorize` policy would also allow that repeated wait;
+  this must be closed before runtime wiring. The SDK printed a non-fatal AFC
+  recommendation before the JSON; no tool call or side effect occurred.
 
   Smoke-test instructions:
   1. `python -m pip install ".[gemini]"`  (installs `google-genai==2.22.0`)
@@ -259,11 +294,9 @@ Files changed: `src/hermes/hermes_strategist.py`,
 
 ### Remaining limitations
 
-- The one real model call is still unproven until the user runs the smoke
-  script; the real-transport shape (`client.models.generate_content`,
-  `resp.text`, `resp.usage_metadata`) was verified against
-  `google-genai 2.22.0` by signature probe in an isolated venv but not
-  exercised end to end.
+- One real model call succeeded end to end. It proved the transport and strict
+  output path, but exposed a semantic adaptation gap: the strategist repeated
+  a provider wait after the snapshot said that retry had already failed.
 - On timeout the daemon worker thread keeps running in the background until
   the transport call returns on its own; its result/exception is discarded
   and, being a daemon, it never blocks interpreter exit.
@@ -280,11 +313,12 @@ Files changed: `src/hermes/hermes_strategist.py`,
 
 ### Exact next action
 
-1. User: run the smoke script (instructions above), paste output into the
-   block above.
-2. Codex: review this iteration (diff `feat/case-3-adaptation..feat/hermes-runtime-spike`)
-   and the smoke output; decide whether the fallback Gemini adapter is
-   sufficient for the demo or a Hermes-Agent retry is warranted.
+1. Add one narrow correction: a repeated wait after
+   `retry_outcome_recorded=true` is contextually invalid, receives at most the
+   existing one repair attempt, and is blocked deterministically if it still
+   reaches policy.
+2. Re-run offline tests; a second live smoke is optional, not required for the
+   transport proof.
 3. Then: slice 3 - FastAPI signed simulated ingress (locally signed
    Razorpay-shaped fixtures, raw-body verification, dedup, engine
    projections / demo controls).
