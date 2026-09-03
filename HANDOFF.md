@@ -136,7 +136,7 @@ changed; `types.py` / `engine.py` / `adapters.py` / `protocols.py` /
 6. **Reproducible SDK version.** `[gemini]` extra pinned exactly to
    `google-genai==2.22.0` (still optional; not in default or `dev`).
 
-### Corrections pass 2 — 2026-09-03 (commit `__CORR2_SHA__`)
+### Corrections pass 2 — 2026-09-03 (implementation commit `51868f4`)
 
 Single fix to `HermesStrategist.propose`: transport construction (a
 raising `transport_factory`, the lazy SDK import, `genai.Client(...)`
