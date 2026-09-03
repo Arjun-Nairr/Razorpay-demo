@@ -38,6 +38,32 @@ demo instead of delaying the whole project.
   flow. Their payment must be correlated to Hermes, but must not be described
   as automatically settling the original subscription invoice. [Payment Link API](https://razorpay.com/docs/api/payments/payment-links/create-standard/)
 
+## Retry-state vocabulary (clarification, no policy change)
+
+The in-memory slice carries two separate retry facts. They are not the same
+thing and neither one is a remaining-retry count:
+
+- **`provider_retry_eligible`** - whether *another* Razorpay-managed retry is
+  **currently** eligible for this obligation (a live provider fact). Fail-closed:
+  absent evidence resolves to `False`.
+- **`retry_outcome_recorded`** - whether **at least one** prior retry outcome
+  already exists for this obligation. It records that history happened; it does
+  **not** mean provider retries are exhausted.
+- A prior failed retry and current eligibility **can both be true** at once: the
+  documented card-retry schedule (T+1 / T+2 / T+3) can still hold a further
+  eligible attempt after an earlier one failed. So a repeated
+  `WAIT_FOR_PROVIDER_RETRY` proposal, on its own, is not evidence of a bug.
+- A real provider integration must distinguish three things using **retrievable
+  provider evidence**, not inference: (a) current eligibility, (b) prior attempt
+  count / outcomes, (c) the next scheduled retry time. Do **not** synthesise a
+  "retries remaining" number - Razorpay's subscription-retry API does not expose
+  one, and Hermes must not invent it.
+- Bounded waiting stays governed by the existing deterministic caps (max
+  proposed wait 72 logical hours; provider eligibility must be an explicit fact
+  with evidence). Whether a *further* wait is allowed after N recorded failures
+  is a policy question to settle before runtime integration - it is deliberately
+  left unchanged in this slice.
+
 ## Corrections to the imported handoff
 
 1. Embedded `AIAgent` does not document a provider-enforced response-schema

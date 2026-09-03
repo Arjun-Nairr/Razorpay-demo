@@ -40,7 +40,15 @@ requirements in `PROJECT_BRIEF.md`.
   expected-state capture guard is closed, the wait -> failed-retry -> changed-
   strategy -> recovery-link -> `hermes_assisted` path is proven end to end
   through `receive`/`run`/`inspect`, and Case 1's 36-test suite remains green.
-- Status: Runtime spike (`IMPLEMENTATION_SPEC.md` slice 2) complete on
+- Status: **Slice 3 (FastAPI signed simulated Razorpay ingress) complete** on
+  `feat/fastapi-simulated-ingress` - see Iteration 07. Delivery adapter only
+  (raw-body HMAC-SHA256 verify, event-id dedup, normalization -> `SIMULATED`,
+  `RecoveryEngine.receive`); `/health`, `/webhooks/razorpay`, `/demo/run`,
+  `/cases/{id}`; new optional `[api]` extra; 133 tests pass; engine/types/
+  Case 1/3 untouched. `feat/hermes-runtime-spike` (`7ada2bb`, incl. the two
+  authorized sanitized commits) is on `origin`. Next: Codex review, then Neon
+  persistence (slice 4).
+- Prior: Runtime spike (`IMPLEMENTATION_SPEC.md` slice 2) complete on
   `feat/hermes-runtime-spike`, plus two corrections passes. **Fallback path
   shipped**: a direct google-genai (Gemini 3.7 Flash) `HermesStrategist`
   behind the existing `Strategist` protocol, offline-tested; the Hermes-Agent
@@ -395,9 +403,115 @@ until then.
 3. A second live smoke is optional; the transport, parsing, and metadata path
    are already proven. If re-run, the user uses their replacement key in the
    local `.env`.
-4. Then: slice 3 - FastAPI signed simulated ingress (locally signed
-   Razorpay-shaped fixtures, raw-body verification, dedup, engine
-   projections / demo controls).
+4. Then: slice 3 - FastAPI signed simulated ingress (**done - see Iteration
+   07 below**).
+
+## Iteration 07 — FastAPI signed simulated Razorpay ingress (slice 3)
+
+- Branch: `feat/fastapi-simulated-ingress` off `feat/hermes-runtime-spike`
+  HEAD `7ada2bb` (which is now on `origin`, together with `5bf44e6`, pushed
+  in this session with explicit user authorization via the existing Git
+  Credential Manager - `gh` CLI itself remained logged out and was not
+  needed).
+- Delivery adapter only. `RecoveryEngine.receive` / `run` / `inspect` stay the
+  sole recovery-domain surface; no engine/types/adapters/protocols/strategist
+  change; Case 1 & 3 tests untouched; no Case 1/3 business-outcome change.
+- No real Razorpay / Gemini / Neon / SQLite / Streamlit / Docker / messaging /
+  deployment. The webhook secret is injected, never file-stored, never a
+  module global.
+
+### Changed files
+
+- `src/hermes/api.py` - **new**. `create_app(*, engine, config)` factory;
+  `ApiConfig(webhook_secret, evidence_mode="SIMULATED")` (frozen, injected).
+  `normalize_event()` turns a supported Razorpay-shaped failure/capture
+  envelope into a typed `RazorpayWebhook`, stamping `evidence_mode="SIMULATED"`;
+  unsupported event types or shapes raise `_UnsupportedEvent` -> HTTP 422.
+  `_signature_ok()` does raw-bytes HMAC-SHA256 + `hmac.compare_digest`. No
+  logging anywhere; error details are generic (no body/signature/secret/
+  payment-id echoed). `fastapi` is imported at module top - the module is
+  only importable with the `[api]` extra.
+- `tests/test_api.py` - **new**, offline, `pytest.importorskip("fastapi")` /
+  `("httpx")`, in-memory engine, locally signed fixtures, no network/creds.
+- `tests/test_hermes_smoke.py` - the `fake_dotenv` stub now sets values via
+  `monkeypatch.setenv` instead of mutating `os.environ` directly (the minor
+  leak called out in the prompt).
+- `pyproject.toml` - new optional `[api]` extra: `fastapi==0.117.1`,
+  `httpx==0.28.1` (verified this iteration; full suite also green in an
+  isolated venv against `fastapi==0.141.1`). Default `dependencies` and `dev`
+  unchanged.
+- `HERMES_RAZORPAY_RESEARCH.md` - new "Retry-state vocabulary" subsection
+  (clarification only, no policy change) - see "Retry semantics" below.
+
+### Endpoint contract
+
+| Method + path | Behaviour |
+|---|---|
+| `GET /health` | `200 {"status":"ok","evidence_mode":"SIMULATED"}` |
+| `POST /webhooks/razorpay` | Reads exact raw bytes. **Verifies `X-Razorpay-Signature` (HMAC-SHA256, constant-time) before any JSON decode** - bad/absent -> `401`, no data processed. Requires non-empty `X-Razorpay-Event-Id` -> else `400`. Malformed JSON (valid sig) -> `400`. Unsupported event type / shape -> `422`. Otherwise normalizes (stamping `SIMULATED`) and calls `engine.receive` once - **no recovery loop here**. `200 {"accepted","duplicate","case_id","event_id","evidence_mode"}`; a duplicate `event_id` returns `duplicate:true` with no new case/work/recovered value. |
+| `POST /demo/run` | Body `{"until": <int logical hour>}`. Non-int / bool / float -> `400`. Backward time -> `409`. Else runs the engine loop and returns the `RunReport` fields. This is the **only** route that runs recovery. |
+| `GET /cases/{case_id}` | `engine.inspect(CaseQuery(case_id=...))` as JSON (`dataclasses.asdict` of `CaseProjection`, `action_intents` included). Unknown id -> `404`. |
+
+### Retry semantics (documentation only - no recovery-policy change)
+
+Recorded in `HERMES_RAZORPAY_RESEARCH.md` -> "Retry-state vocabulary":
+`provider_retry_eligible` = another provider-managed retry is *currently*
+eligible; `retry_outcome_recorded` = at least one prior retry outcome exists
+(not exhaustion); both can be true at once; a future provider integration must
+distinguish current eligibility, prior attempt count, and next scheduled retry
+from *retrievable provider evidence*, and must not invent a remaining-retry
+count Razorpay does not expose. Whether a further wait is allowed after N
+recorded failures stays an open policy question, unchanged here.
+
+### Verification
+
+- `python -m pytest -q` -> **133 passed** (107 unchanged: 36 Case 1 + 21
+  Case 3 + 44 spike + 6 smoke; + 26 new API tests). Case 1/3 suites
+  byte-for-byte untouched.
+- Same suite in a fresh venv with the pinned `[api]` + `[gemini]` extras
+  installed -> **133 passed, 1 warning** (an `anyio`/`starlette` internal
+  `DeprecationWarning` from `starlette/testclient.py`; not our code; the
+  module-level `filterwarnings` in `test_api.py` suppresses in-test warnings
+  but not this import-time one).
+- `python -m compileall -q src tests scripts` -> clean.
+- `git diff --check` -> clean.
+- Secret scan of the staged diff: only the test literal `whsec_simulated_test_only`
+  and the identifier `webhook_secret`; no real key, token, or PEM.
+- `.env` remains gitignored (`.gitignore:20`) and untracked; not opened,
+  printed, modified, or committed by this task.
+
+### Decisions
+
+- One optional extra per concern (`[gemini]`, `[api]`); neither in default or
+  `dev`. API tests skip cleanly without `[api]`.
+- Merchant facts (`customer_notify`/`consent`/`reachable_channel`) are **not**
+  read from the Razorpay payload - they are not Razorpay data. Normalization
+  uses the `RazorpayWebhook` defaults; a merchant-context ingress is a later
+  slice (matches the existing `types.py` docstring note).
+- The obligation id is `payload.subscription.entity.id`; a fixture without it
+  is `422` (unsupported shape) rather than a guessed fallback.
+- `evidence_mode` is an `ApiConfig` field defaulting to `"SIMULATED"`; this
+  slice never produces `REAL_TEST_MODE` (that is slice 5).
+
+### Limitations
+
+- Only `payment.failed` / `payment.captured` envelopes are normalized;
+  everything else is `422` by design.
+- No FastAPI dependency in the base install; `pip install ".[api]"` is
+  required to run the app or its tests.
+- The real Gemini strategist is **not** wired into the app (still
+  `ScriptedStrategist` behind the engine); that is a later step.
+- No persistence: the engine (and its logical clock) is per-process and
+  in-memory. Neon is next.
+
+### Exact next action
+
+1. Codex review of Iteration 07 (diff
+   `feat/hermes-runtime-spike..feat/fastapi-simulated-ingress`).
+2. Then slice 4 - **Neon persistence**: implement the `Ledger` contract
+   against Neon (webhook inbox, cases, due work, proposals, policy decisions,
+   action intents/outcomes, audit, attribution, persisted logical clock),
+   SQLite only if Neon blocks the deadline.
 
 ## Architecture reconciliation — 2026-09-03
 

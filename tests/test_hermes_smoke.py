@@ -57,7 +57,7 @@ def fake_dotenv(monkeypatch):
             key, _, value = line.partition("=")
             key, value = key.strip(), value.strip()
             if override or key not in os.environ:
-                os.environ[key] = value
+                monkeypatch.setenv(key, value)  # auto-restored after the test
                 loaded = True
         return loaded
 

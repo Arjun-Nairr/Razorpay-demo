@@ -24,6 +24,15 @@ gemini = [
   "google-genai==2.22.0",  # exact version the spike transport was written and probed against
   "python-dotenv==1.0.1",  # scripts/hermes_smoke.py loads a local .env; verified on py3.12
 ]
+# Slice 3: FastAPI signed simulated Razorpay ingress. NOT a default dependency;
+# the API tests (tests/test_api.py) pytest.importorskip and skip without this
+# extra. Versions verified this iteration on Python 3.12: the full suite is
+# green against fastapi 0.117.1 (project env) and, in an isolated venv, against
+# fastapi 0.141.1 - the pin below is the one the recorded run used.
+api = [
+  "fastapi==0.117.1",
+  "httpx==0.28.1",  # required by fastapi.testclient.TestClient
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hermes"]
