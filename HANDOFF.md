@@ -51,13 +51,24 @@ requirements in `PROJECT_BRIEF.md`.
   clamped the repair budget to at most one, and made every failure path -
   including transport-*construction* failures (raising factory, lazy SDK
   import, `Client(...)` init, missing key) - record safe redacted metadata
-  instead of escaping with `last_run_meta=None`. 101 tests pass; Case 1/3
-  untouched. The user-run Gemini smoke test reached the live model and returned
-  schema-valid JSON, proving the fallback transport, model name, parsing, and
-  metadata path. However, the live proposal repeated
-  `WAIT_FOR_PROVIDER_RETRY` even though the snapshot said the prior retry had
-  already failed. Before slice 3, add a narrow contextual-invalid repair plus
-  a deterministic policy guard against a repeated failed-retry wait.
+  instead of escaping with `last_run_meta=None`. A later local-only task added
+  `.env` support for the smoke script (`python-dotenv` in the `[gemini]` extra;
+  loader merges a gitignored project-root `.env` without overriding the
+  environment; redacted failure output). 107 tests pass; Case 1/3 untouched. The user-run Gemini smoke test reached the live model and returned
+  schema-valid JSON, **proving live connectivity, the fallback transport, the
+  model name, strict parsing, and the metadata path**. The live proposal was
+  `WAIT_FOR_PROVIDER_RETRY` again; this is **not** a proven semantic failure -
+  the smoke fixture still sets `provider_retry_eligible=True` and only
+  `retry_outcome_recorded=True` (one prior retry failed). A failed retry is not
+  retry exhaustion: Razorpay's card-retry schedule (T+1/T+2/T+3) can still hold
+  a further eligible attempt. The earlier "semantic adaptation FAILS" verdict
+  was too strong and there is no recovery-rule change to make here. Before
+  runtime integration, the context contract should distinguish *current* retry
+  eligibility from *prior* failure count and define what bounded further
+  waiting is allowed - as a spec clarification, not code, in the next task.
+  For the smoke script the user now keeps a **replacement** `GEMINI_API_KEY` in
+  a local gitignored `.env` (the previously used key was disclosed in chat and
+  must stay revoked); the key is never requested in or pasted into chat.
 
 ## Iteration 06 — Runtime spike: isolated Gemini strategist (fallback path)
 
@@ -172,6 +183,46 @@ strict-schema, and lazy-import tests are unchanged and green.
 Files changed: `src/hermes/hermes_strategist.py`,
 `tests/test_hermes_strategist.py`, `HANDOFF.md`.
 
+### `.env` support for the smoke script — 2026-09-03 (local commit on `feat/hermes-runtime-spike`, not pushed)
+
+Local-config convenience so the user can keep the (revoked-and-replaced)
+Gemini key out of the shell history. Strategist / engine / ledger / Case 1
+& 3 tests untouched.
+
+- `pyproject.toml` - `[gemini]` extra gains `python-dotenv==1.0.1` (verified
+  on Python 3.12; `load_dotenv` defaults to `override=False`). Default
+  `dependencies` and `dev` unchanged.
+- `scripts/hermes_smoke.py` - new `_load_project_env(dotenv_path=None)` merges
+  `<project root>/.env` into `os.environ` **without overriding** anything
+  already set; missing file or missing `python-dotenv` is a silent no-op.
+  `main()` calls it before the key check. On failure the script now prints
+  only `error_type` + the already-redacted `run_meta` - the `str(exc)` field
+  is removed (an SDK/auth message can carry a key fragment). Not loaded inside
+  `HermesStrategist` or at module import.
+- `.env` - a blank `GEMINI_API_KEY=` file was created at the project root
+  **only because none existed**; it is gitignored (`.gitignore:20`), untracked,
+  and never read/printed/overwritten by this task. `.env.example` stays the
+  committed blank template.
+- `tests/test_hermes_smoke.py` - **new**, 6 offline tests, loaded via
+  `importlib` (no `scripts/__init__.py`), using a recording `dotenv` stub +
+  temp files + synthetic values: explicit-path load sets the var and requests
+  `override=False`; an existing env var wins over the file; a missing file and
+  a missing `python-dotenv` are both silent no-ops; `main()` returns 2 with no
+  key (loader monkeypatched off so the real `.env` is never read); a failing
+  strategist's output contains `error_type`/`run_meta` but not the raw
+  exception message and has no `error` field. No test reads a real key or
+  calls Gemini.
+
+Verification: `python -m pytest -q` -> **107 passed** (101 unchanged + 6 new);
+same in a fresh venv with `google-genai==2.22.0` **and** `python-dotenv==1.0.1`
+installed -> 107 passed. `python -m compileall -q src tests scripts` clean.
+`git diff --check` clean. Diff limited to `pyproject.toml`,
+`scripts/hermes_smoke.py`, `tests/test_hermes_smoke.py`, `HANDOFF.md`
+(`.env` is untracked). Committed locally; **not pushed** - the earlier
+`docs: record live Gemini smoke result` commit (sanitized live-test metadata)
+still awaits explicit user authorization to upload, and nothing is pushed
+until then.
+
 ### Changed files (exactly these + this handoff)
 
 > The list below is the *original* Iteration 06 state. Where it and the
@@ -229,12 +280,14 @@ Files changed: `src/hermes/hermes_strategist.py`,
 
 ### Verification
 
-- `python -m pytest -q` -> **101 passed** (57 unchanged: 36 Case 1 + 21
-  Case 3, both suites byte-for-byte untouched; + 44 offline spike tests
-  after corrections passes 1 and 2).
-- Same suite run in a fresh venv with `google-genai==2.22.0` installed ->
-  **101 passed** (environment independence proven; offline path needs no SDK,
-  and installing the SDK does not change any result).
+- `python -m pytest -q` -> **107 passed** (57 unchanged: 36 Case 1 + 21
+  Case 3, both suites byte-for-byte untouched; + 44 offline spike tests after
+  corrections passes 1 and 2; + 6 offline `.env`/smoke tests - see the
+  "`.env` support for the smoke script" subsection above).
+- Same suite run in a fresh venv with `google-genai==2.22.0` (and, after the
+  `.env` task, `python-dotenv==1.0.1`) installed -> **107 passed**
+  (environment independence proven; offline path needs no SDK, and installing
+  the SDK / dotenv does not change any result).
 - `python -m compileall -q src tests scripts` -> clean.
 - `git diff --check` -> clean (only CRLF-on-checkout warnings).
 - Staged diff after corrections: exactly `pyproject.toml`,
@@ -246,7 +299,11 @@ Files changed: `src/hermes/hermes_strategist.py`,
 - Real Gemini round-trip: **run successfully by the user**. No key was written
   to the repository. The key used for this test was later exposed in chat, so
   the user was instructed to revoke it and create a replacement; never reuse
-  or request that disclosed credential.
+  or request that disclosed credential. The replacement key lives only in a
+  local gitignored `.env` at the project root (`GEMINI_API_KEY=...`), loaded by
+  `scripts/hermes_smoke.py` before it checks the environment; an already-set
+  `GEMINI_API_KEY` env var still wins. The key is entered by the user locally
+  and is never requested in chat.
 
   ```json
   {
@@ -275,28 +332,40 @@ Files changed: `src/hermes/hermes_strategist.py`,
   }
   ```
 
-  Result: live connectivity and structural validation **PASS**. Case 3 semantic
-  adaptation **FAILS** for this sample: `retry_outcome_recorded=true` and
-  `prior_action=WAIT_FOR_PROVIDER_RETRY`, so another wait is not acceptable.
-  The current partial `authorize` policy would also allow that repeated wait;
-  this must be closed before runtime wiring. The SDK printed a non-fatal AFC
-  recommendation before the JSON; no tool call or side effect occurred.
+  Result: **live connectivity and structural validation PASS**. This does
+  *not* establish a Case 3 semantic failure. The fixture sets
+  `provider_retry_eligible=True` and `retry_outcome_recorded=True` (one prior
+  retry failed) - a failed retry is not retry exhaustion, and a further
+  provider-eligible wait can be a legitimate choice. The prior verdict that
+  "another wait is not acceptable" and that policy must be changed to forbid it
+  is withdrawn; no recovery-rule change is made in this task. What the next
+  spec step must do: make the context contract distinguish *current* retry
+  eligibility (a live provider fact) from *prior* failure count, and state what
+  bounded additional waiting is permitted, before runtime integration. The SDK
+  printed a non-fatal AFC recommendation before the JSON; no tool call or side
+  effect occurred.
 
   Smoke-test instructions:
-  1. `python -m pip install ".[gemini]"`  (installs `google-genai==2.22.0`)
-  2. set the key - PowerShell: `$env:GEMINI_API_KEY = "..."` ; bash:
-     `export GEMINI_API_KEY=...`
+  1. `python -m pip install ".[gemini]"`  (installs `google-genai==2.22.0`
+     and `python-dotenv==1.0.1`)
+  2. put the key in `<project root>/.env` as `GEMINI_API_KEY=...` (a blank
+     `.env` with just that line is created for you; it is gitignored) - or
+     export `GEMINI_API_KEY` in the shell, which takes precedence
   3. `python scripts/hermes_smoke.py`  -> prints one JSON object with
      `run_meta` (model, prompt_version, latency, usage, validation_result,
      repair_used, bounded raw) and the parsed `proposal`. The key is never
-     printed. Exit 0 = validated proposal, 1 = failure (type shown), 2 = no key.
+     printed. On failure only `error_type` + `run_meta` are printed - never the
+     raw exception message. Exit 0 = validated proposal, 1 = failure, 2 = no key.
   4. paste the JSON into the block above.
 
 ### Remaining limitations
 
-- One real model call succeeded end to end. It proved the transport and strict
-  output path, but exposed a semantic adaptation gap: the strategist repeated
-  a provider wait after the snapshot said that retry had already failed.
+- One real model call succeeded end to end, proving the transport and strict
+  output path. The strategist chose `WAIT_FOR_PROVIDER_RETRY` again; with the
+  fixture still asserting `provider_retry_eligible=True` this is a defensible
+  choice, not a demonstrated bug. Open item is a *spec* clarification (current
+  eligibility vs prior failure count; bounded further waiting), not a code
+  fix - see "Exact next action".
 - On timeout the daemon worker thread keeps running in the background until
   the transport call returns on its own; its result/exception is discarded
   and, being a daemon, it never blocks interpreter exit.
@@ -313,13 +382,20 @@ Files changed: `src/hermes/hermes_strategist.py`,
 
 ### Exact next action
 
-1. Add one narrow correction: a repeated wait after
-   `retry_outcome_recorded=true` is contextually invalid, receives at most the
-   existing one repair attempt, and is blocked deterministically if it still
-   reaches policy.
-2. Re-run offline tests; a second live smoke is optional, not required for the
-   transport proof.
-3. Then: slice 3 - FastAPI signed simulated ingress (locally signed
+1. **Spec clarification only (no code):** in the context contract, separate
+   *current retry eligibility* (a live provider fact - is another
+   Razorpay-managed retry still scheduled/eligible now?) from *prior failed
+   retries* (a count of what already happened). Define what bounded additional
+   waiting Hermes may propose given each combination, and how many total waits
+   a case may accumulate. Do **not** add a rule that forbids waiting after any
+   failed retry - the fixture that produced the smoke result still legitimately
+   has `provider_retry_eligible=True`.
+2. Only after that clarification, decide whether any `authorize` / strategist
+   change is warranted, and specify it as its own task.
+3. A second live smoke is optional; the transport, parsing, and metadata path
+   are already proven. If re-run, the user uses their replacement key in the
+   local `.env`.
+4. Then: slice 3 - FastAPI signed simulated ingress (locally signed
    Razorpay-shaped fixtures, raw-body verification, dedup, engine
    projections / demo controls).
 
