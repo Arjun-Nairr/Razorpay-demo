@@ -3,13 +3,13 @@
 The batch contains three common payment failures and two payment-history
 outliers. All five use the same workflow, action types, and policy engine.
 
-| Case | Type | Evidence | Expected strategy | Final outcome |
-|---|---|---|---|---|
-| 1. Temporary bank failure | Common | Temporary provider/bank error; normal payment history | Wait for the next eligible Razorpay retry; do not message immediately | Retry succeeds; recovered |
-| 2. Expired payment method | Common | Expired-card failure; otherwise ordinary account | Request payment-method update; suppress pointless same-card retries | Customer updates method; recovered |
-| 3. Insufficient funds with adaptation | Common | Insufficient-funds failure; one permitted retry | Wait once; if the retry fails, change strategy and send a recovery reminder/link | Second strategy succeeds; recovered |
-| 4. Normally always on time | Outlier | Long perfect payment history; first anomalous failure; no risk signals | Prefer no immediate contact; allow a short grace window and one retry | Retry succeeds; recovered with zero unnecessary contact |
-| 5. Never on time | Outlier | Consistent late-payment history; repeated prior failures/recoveries; current attempts near limit | Avoid an endless retry loop; make one bounded recovery attempt, then stop/exhaust and recommend prepaid or shorter billing | Recovery fails; exhausted with structural recommendation |
+| Case | Type | Evidence | Expected strategy | Evidence mode | Final outcome / attribution |
+|---|---|---|---|---|---|
+| 1. Temporary bank failure | Common plumbing proof | Temporary card/provider error; retry explicitly eligible; normal payment history | Wait for the provider-owned retry; do not message immediately | Real/hybrid candidate; real calendar retry is not accelerated | Recovered / `provider_self_recovered` |
+| 2. Expired payment method | Common | Expired-card failure; otherwise ordinary account | Request the approved payment-method-update flow; suppress pointless same-card retries | Deterministic Razorpay-shaped replay | Customer updates method; recovered with attribution based on the actual payment path |
+| 3. Insufficient funds with adaptation | Common hero intelligence case | Card insufficient-funds failure; one eligible retry; merchant owns communication | Wait once; after a simulated failed outcome, change strategy to reminder plus uniquely correlated recovery link | Deterministic replay; every event labelled `SIMULATED` | Alternate payment captured / `hermes_assisted` |
+| 4. Normally always on time | Outlier | Long perfect payment history; first anomalous failure; no risk signals | Prefer no immediate contact; allow a short grace window and one retry | Deterministic replay | Recovered / `provider_self_recovered`, zero unnecessary contact |
+| 5. Never on time | Outlier | Consistent late-payment history; repeated prior failures/recoveries; current attempts near limit | Make one bounded attempt, then stop/exhaust and recommend a named prepaid/shorter-cycle option | Deterministic replay | `exhausted` / `unrecovered`, structural recommendation only |
 
 ## Why these cases
 
@@ -23,8 +23,12 @@ outliers. All five use the same workflow, action types, and policy engine.
 ## Shared constraints
 
 - Decision-driving payment history comes from Razorpay or is derived from it.
+- Every provider fact includes `payment_method`; card retry behavior is not
+  generalized to unsupported methods.
+- Events are labelled `REAL TEST MODE` or `SIMULATED`.
+- A recovery-link payment is separately correlated and is not described as
+  settling the original subscription invoice.
 - Optional merchant facts cannot be required for a decision.
 - Only verified captured payments increase test-mode recovered value.
 - Every case uses the same allowed actions and deterministic policies.
 - Scenario fixtures define expected outcomes for repeatable evaluation.
-

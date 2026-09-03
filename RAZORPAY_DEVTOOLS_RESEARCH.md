@@ -1,6 +1,6 @@
 # Razorpay Developer Tools Finding
 
-Research date: 2026-09-02
+Research date: 2026-09-02; integration facts refreshed 2026-09-03
 
 ## Verified facts
 
@@ -24,6 +24,20 @@ Research date: 2026-09-02
   webhook surface required by Hermes.
 - The CLI may be used later for manual setup/debugging, but it cannot solve the
   PAN onboarding issue.
+
+## Integration facts
+
+- Card-subscription retries are provider-owned calendar-time behavior on
+  T+1/T+2/T+3; Hermes logical time cannot accelerate them. [Payment retries](https://razorpay.com/docs/payments/subscriptions/payment-retries/)
+- `customer_notify=true` assigns subscription communication to Razorpay;
+  `false` assigns it to the merchant. Hermes must suppress duplicate merchant
+  contact when Razorpay owns communication. [Create Subscription API](https://razorpay.com/docs/api/payments/subscriptions/create-subscription/)
+- Payment Links use a separately correlated collection flow. A captured link
+  payment can prove alternate recovery, but it must not be claimed to settle or
+  reactivate the original subscription without separate evidence. [Payment Link API](https://razorpay.com/docs/api/payments/payment-links/create-standard/)
+- The real webhook boundary must verify HMAC over the unchanged raw body,
+  deduplicate with `x-razorpay-event-id`, and tolerate out-of-order delivery.
+  [Webhook validation](https://razorpay.com/docs/webhooks/validate-test/)
 
 ## Required next Razorpay action
 

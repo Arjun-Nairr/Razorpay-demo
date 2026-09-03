@@ -21,6 +21,9 @@ and an audit trail.
 
 ## Product direction
 
+- Position Hermes as a merchant-side recovery operator layered above
+  Razorpay—not as a replacement for Razorpay's provider-owned retries,
+  notifications, or payment truth.
 - Target a fictional SaaS related to Razorpay's domain; exact product identity
   can be selected during product shaping.
 - Focus on SaaS subscription-payment recovery. Do not include B2B receivables
@@ -34,6 +37,8 @@ and an audit trail.
 - Demonstrate multi-step adaptation when an initial recovery strategy fails.
 - Start with one end-to-end case, then expand to at most five deliberately
   designed customer scenarios that exercise different reasoning patterns.
+- Keep all five as deterministic golden scenarios, but require only one real or
+  hybrid Razorpay Test Mode path before recording.
 - Use an accelerated logical clock so multi-step retries, cooldowns, and
   adaptation can be demonstrated without waiting through real-world delays.
 
@@ -105,13 +110,14 @@ changes, reconciliation, and webhook validation.
 - Do not code or finalize architecture until the product shape, risks,
   real-vs-synthetic boundary, AI-vs-deterministic boundary, and exclusions have
   been discussed with the user
-- There is no repository yet. Establish the product and technical foundation
-  before deciding repository structure.
+- The repository and in-memory Case 1 foundation now exist. Preserve the public
+  `RecoveryEngine.receive/run/inspect` seam while adding integrations in narrow
+  tracer-bullet slices.
 - Razorpay test mode still needs to be set up.
 - Available model resources include ChatGPT Plus, an OpenCode Go subscription,
   and up to USD 22 of Gemini API credits if justified.
-- Messaging is deferred until the core recovery pipeline is well defined;
-  Telegram or email are possible later integrations.
+- The first demo records messaging as an auditable action intent. A real
+  Telegram or email provider remains optional and should not block recording.
 - Prefer real payment/customer data exposed by Razorpay test APIs. Use synthetic
   customer history only for context that Razorpay does not provide.
 - Synthetic enrichment must represent data a real payment/SaaS company could
@@ -122,6 +128,9 @@ changes, reconciliation, and webhook validation.
 - Run the core demo locally. If deployment is useful, deploy only the dashboard;
   the local agent may communicate with a hosted database such as Neon, subject
   to research and architecture approval.
+- Separate attribution into provider self-recovery, Hermes-assisted recovery,
+  merchant-manual recovery, and unrecovered outcomes. Do not claim a normal
+  Razorpay retry as Hermes-caused revenue.
 
 ## Requested research scope (after discovery questions are answered)
 

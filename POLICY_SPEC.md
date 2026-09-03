@@ -33,7 +33,11 @@ terms, account access, or recovered-money accounting.
 11. As an operator, I want disputed or inconsistent cases escalated, so that
     automation fails safely.
 12. As a demo presenter, I want logical time to advance deterministically, so
-    that multi-step cases complete inside five minutes.
+   that multi-step cases complete inside five minutes.
+13. As a finance reviewer, I want recovery attribution separated by provider,
+   Hermes, and merchant action, so that the demo does not overclaim AI impact.
+14. As a customer, I want merchant contact suppressed when Razorpay owns
+   communication, so that I do not receive duplicate recovery messages.
 
 ## AI proposal contract
 
@@ -126,6 +130,10 @@ Require contact consent, a reachable channel, an unpaid obligation, an expired
 cooldown, and unused message capacity. Message text cannot promise a discount,
 threaten suspension, or claim payment success.
 
+Block merchant messaging when provider facts say Razorpay owns customer
+communication (`customer_notify=true`). Merchant-owned reminder scenarios must
+prove `customer_notify=false` or equivalent merchant ownership.
+
 ### Request payment-method update
 
 Allow for expired/invalid credential or authentication-related failures when an
@@ -202,6 +210,21 @@ an AI prediction contributes zero.
 A case completes as `recovered`, `stopped`, `escalated`, or `exhausted`. On
 completion, cancel pending actions and retain the append-only audit history.
 
+## Recovery attribution
+
+Every terminal or recovered case records exactly one attribution category:
+
+- `provider_self_recovered`: provider-owned retry recovered the payment without
+  a Hermes-owned intervention;
+- `hermes_assisted`: a uniquely correlated, policy-authorized Hermes action
+  preceded the verified alternate collection;
+- `merchant_manual`: a merchant action outside Hermes recovered the payment;
+- `unrecovered`: no unique linked captured payment exists at termination.
+
+Attribution never changes payment truth. Payment Link capture is an alternate
+collection and must not be represented as automatically settling the original
+subscription invoice.
+
 ## Acceptance tests through `RecoveryEngine`
 
 Tests use only `receive`, `run`, and `inspect` with fake Razorpay, scripted
@@ -219,6 +242,9 @@ Required behaviors:
 - Gemini failure produces no unsafe action;
 - each of the five scenarios reaches its expected state;
 - batch recovered value equals unique verified captured payments;
+- provider-owned retries are not attributed to Hermes;
+- simulated and Test Mode events remain distinguishable;
+- merchant reminders are blocked when Razorpay owns communication;
 - the normally-on-time case has zero unnecessary messages;
 - the chronically-late case stops at its bounded limit.
 
@@ -231,4 +257,3 @@ Required behaviors:
 - Production compliance or legal-policy claims
 - Credit scoring, bank-balance inference, psychographics, or churn prediction
 - General payment-provider abstraction
-

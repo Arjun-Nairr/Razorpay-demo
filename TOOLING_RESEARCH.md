@@ -7,8 +7,10 @@ Research date: 2026-09-02
 The smallest credible stack is:
 
 - **Payments:** Razorpay test-mode card subscriptions and signed webhooks
-- **Agent:** local Python with the official Google GenAI SDK and Pydantic
-- **Model:** Gemini 3.7 Flash initially, configured so the model can be swapped
+- **Agent:** Hermes Agent embedded behind the existing `Strategist` protocol,
+  pinned to a tested repository commit
+- **Model:** Gemini 3.7 Flash through Hermes's native Gemini provider, with
+  strict local Pydantic validation and fail-closed bounded repair
 - **API/webhooks:** FastAPI and Uvicorn, running locally
 - **State and audit:** Neon Postgres Free
 - **Scheduling:** database-backed accelerated logical clock; no job-queue product
@@ -34,8 +36,8 @@ claims.
 | Area | Recommended tool | Verified free/cost boundary | Run mode | Needed by Sept 4? | Why it fits |
 |---|---|---|---|---|---|
 | Payment integration | Razorpay test mode | **Fact:** test mode uses mock payments rather than real money. Test mode permits up to 30 Payment Links per business. [Test checkout](https://razorpay.com/docs/payments/payment-gateway/web-integration/standard/integration-steps/) · [Payment Link limit](https://razorpay.com/docs/api/payments/payment-links/create-standard/) | Hosted provider, local client | Yes | Produces real Razorpay entities, failure states, test charges, and webhook events without moving money. |
-| LLM runtime | Gemini API, begin with `gemini-3.7-flash` | **Fact:** free-tier input/output is available; paid pricing through Dec 31, 2026 is $0.75/M input tokens and $3.75/M output tokens. Paid prompts are not used to improve Google's products; free-tier content may be. Limits vary by model/tier and the active values are shown in AI Studio. [Pricing](https://ai.google.dev/gemini-api/docs/pricing) · [Rate limits](https://ai.google.dev/gemini-api/docs/rate-limits) | Hosted API called from local agent | Yes | Current programmatic API, structured outputs, ample quality, and the available $22 budget is far beyond five-case demo needs. |
-| Agent code | Plain Python, `google-genai`, Pydantic | **Fact:** Google recommends its `google-genai` Python SDK and Gemini supports schema-constrained structured output, including Pydantic schemas. Schema validity does not replace application-level semantic checks. [Libraries](https://ai.google.dev/gemini-api/docs/libraries) · [Structured output](https://ai.google.dev/gemini-api/docs/structured-output) | Local virtual environment; no Docker initially | Yes | Keeps the AI surface narrow: the model proposes a typed strategy and deterministic code authorizes actions. |
+| LLM runtime | Gemini API, begin with `gemini-3.7-flash` | **Fact:** Gemini 3.7 Flash is a current stable model and supports structured output and function calling. Limits and pricing depend on the active tier. [Models](https://ai.google.dev/gemini-api/docs/models) · [Pricing](https://ai.google.dev/gemini-api/docs/pricing) · [Rate limits](https://ai.google.dev/gemini-api/docs/rate-limits) | Hosted API called from local Hermes | Yes | Strong decision quality; the available $22 budget is ample for five demo cases. |
+| Agent harness | Hermes Agent + local Pydantic validation | **Fact:** Hermes supports a native Gemini provider and programmatic `AIAgent`, but its normal embedded agent surface does not document a response-schema parameter. It is installed from its repository and should be pinned. [Gemini provider](https://hermes-agent.nousresearch.com/docs/guides/google-gemini) · [Python library](https://hermes-agent.nousresearch.com/docs/guides/python-library) | Local isolated profile; no Docker initially | Yes, after a timeboxed spike | Keeps the requested Hermes harness while deterministic code validates JSON and retains authority. |
 | API/webhooks | FastAPI + Uvicorn | **Fact:** FastAPI can receive request bodies and run locally through an ASGI server. [Request bodies](https://fastapi.tiangolo.com/tutorial/body/) · [Running FastAPI](https://fastapi.tiangolo.com/deployment/manually/) | Local | Yes | Small Python-native webhook/API boundary. |
 | Database/state | Neon Postgres Free | **Fact:** Free currently provides 100 projects, 100 CU-hours/month per project, 0.5 GB storage/project, compute up to 2 CU/8 GB RAM, 5 GB transfer, and scale-to-zero after inactivity. [Pricing](https://neon.com/pricing) | Hosted | Yes, given the chosen shared-state shape | Hermes and a local or hosted dashboard can share one credible ledger without operating Postgres locally. |
 | Scheduler | Persisted `demo_now` plus `due_at` actions | **Fact:** Python time/scheduling can be abstracted; no external quota applies to ordinary application logic. [Python `sched`](https://docs.python.org/3/library/sched.html) | Local logic + Neon state | Yes | One “advance time” operation can automatically claim every due action across the batch, making multi-day behavior deterministic in a five-minute video. |
@@ -57,13 +59,25 @@ claims.
   it is designed primarily for OpenCode and similar coding-agent traffic, and
   its model list may change. [OpenCode Go](https://dev.opencode.ai/docs/go/)
 - **Decision:** keep ChatGPT Plus for planning/review and OpenCode Go for Claude
-  implementation work. Use Gemini's API for the product runtime so a
-  coding-agent subscription is not a fragile production dependency.
+  implementation work. Use Gemini's API through Hermes for the product runtime
+  so a coding-agent subscription is not a fragile production dependency.
 
 At the currently documented Gemini 3.7 Flash paid price, an intentionally large
 illustrative test of 100 decisions using 10,000 input and 1,000 output tokens
 each would cost roughly $1.13. The real five-case demo should be smaller, so the
 $22 credit budget is not a material constraint.
+
+## Hermes runtime boundary
+
+- Create a fresh `AIAgent` per decision; do not share it across concurrent
+  tasks.
+- Use a dedicated profile/home, skip memory and project context, disable
+  curator/self-improvement behavior, and expose no tools for v1.
+- Ask for strict JSON, parse and validate locally, and execute nothing on
+  invalid output. Permit at most one repair attempt.
+- Do not run a second direct `google-genai` agent loop after the Hermes spike
+  passes. Preserve the `Strategist` abstraction as the fallback boundary.
+- See `HERMES_RAZORPAY_RESEARCH.md` for citations and unsupported assumptions.
 
 ## Razorpay: what is real
 
@@ -83,11 +97,11 @@ tokens can be used for subsequent debits only within three days, so account
 setup should not be left until the recording day. [Test
 subscriptions](https://razorpay.com/docs/payments/subscriptions/test/)
 
-For ordinary subscriptions, Razorpay controls native retries on T+1, T+2, and
-T+3. The demo's accelerated logical clock must therefore accelerate **our
-agent's decisions and actions**; it must not falsely claim to accelerate
-Razorpay's production retry clock. Immediate Razorpay test charges can supply
-the demonstration events. [Subscription
+For card subscriptions, Razorpay controls native retries on T+1, T+2, and T+3.
+The demo's accelerated logical clock therefore accelerates **Hermes decisions,
+cooldowns, and simulated scenario outcomes only**; it cannot accelerate
+Razorpay's retry clock. Immediate Test Mode events can anchor the demonstration.
+[Subscription
 retries](https://razorpay.com/docs/payments/subscriptions/payment-retries/)
 
 ## Recovery accounting rule
@@ -111,6 +125,12 @@ events](https://razorpay.com/docs/webhooks/payments/)
 
 Display the metric as **test-mode recovered value**, with gross captured value
 and (if refunds are demonstrated) net value after refunds.
+
+Track recovery attribution separately as `provider_self_recovered`,
+`hermes_assisted`, `merchant_manual`, or `unrecovered`. A normal Razorpay retry
+is not Hermes-assisted. A Payment Link payment is a separately correlated
+alternate collection and must not be presented as automatically settling the
+original subscription invoice.
 
 ## Synthetic enrichment boundary
 
@@ -193,4 +213,3 @@ This is sequencing guidance, not authorization to implement yet:
 5. Add the local Streamlit views.
 6. Turn the first case into five golden scenarios and aggregate metrics.
 7. Add Telegram only if all core gates pass and recording rehearsal is stable.
-

@@ -17,12 +17,17 @@ Codex, and Claude Code.
   rules, and acceptance tests.
 - `RAZORPAY_DEVTOOLS_RESEARCH.md` — why the CLI/MCP page does not bypass
   Dashboard onboarding or replace the direct API integration.
+- `HERMES_RAZORPAY_RESEARCH.md` — verified Hermes/Gemini/Razorpay runtime facts,
+  unsupported assumptions, and the approved isolation configuration.
+- `IMPLEMENTATION_SPEC.md` — reconciled two-day architecture, acceptance
+  criteria, and ordered tracer-bullet implementation sequence.
 - `CLAUDE.md` — standing implementation, context, handoff, and Git rules for
   Claude Code.
 
 ## Coordination rule
 
-Before starting work, read `PROJECT_BRIEF.md` and `HANDOFF.md`. After material
-work, update `HANDOFF.md` with decisions, changed files, verification evidence,
-and the next action. Never place credentials, API keys, webhook secrets, or
-private tokens in these files.
+Before starting work, read `HANDOFF.md`, then only the specification/research
+files it points to for the current slice. After material work, update
+`HANDOFF.md` with decisions, changed files, verification evidence, and the next
+action. Never place credentials, API keys, webhook secrets, or private tokens
+in these files.

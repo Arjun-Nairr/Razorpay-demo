@@ -1,6 +1,6 @@
 # Cross-Agent Handoff
 
-Last updated: 2026-09-02 (Asia/Dubai)
+Last updated: 2026-09-03 (Asia/Dubai)
 
 ## Goal and scope
 
@@ -9,12 +9,11 @@ requirements in `PROJECT_BRIEF.md`.
 
 ## Current state
 
-- Shared workspace initialized.
+- Shared workspace and GitHub repository initialized.
 - Original brief and official challenge image normalized into
   `PROJECT_BRIEF.md`.
-- No tool research, architecture, dependencies, repository scaffolding, or
-  implementation has begun.
-- No repository exists yet.
+- Case 1 in-memory foundation is implemented, tested, committed, and pushed on
+  `feat/case-1-recovery-slice`.
 - Current primary-source tooling research is saved in
   `TOOLING_RESEARCH.md`.
 - Foundation architecture is saved in `FOUNDATION_ARCHITECTURE.md`.
@@ -34,9 +33,69 @@ requirements in `PROJECT_BRIEF.md`.
   stored as a project file.
 - Graphify was evaluated and deferred until a meaningful codebase exists; it
   maps code structure but does not replace product-decision handoffs.
-- Status: Iteration 04 (corrective) complete. Exclusive one-item work leases,
-  atomic webhook intake, atomic version-guarded capture finalization; see the
-  iteration records below.
+- The imported 2026-09-03 architecture discussion has been reconciled into
+  `IMPLEMENTATION_SPEC.md` and `HERMES_RAZORPAY_RESEARCH.md`.
+- Status: architecture reconciliation complete; implementation must now proceed
+  in narrow tracer-bullet slices without discarding Case 1.
+
+## Architecture reconciliation — 2026-09-03
+
+### Adopted
+
+- Position Hermes as the merchant-side recovery operator above Razorpay, not a
+  replacement for provider retries, notifications, or payment truth.
+- Keep Case 1 as plumbing proof and make Case 3 insufficient-funds adaptation
+  the next intelligence slice.
+- Keep all five golden scenarios; require only one real/hybrid Test Mode path.
+- Use Hermes Agent behind the existing `Strategist` protocol with Gemini 3.7
+  Flash, a fresh isolated agent per decision, no tools for v1, strict local
+  schema validation, and deterministic policy authority.
+- Separate `provider_self_recovered`, `hermes_assisted`, `merchant_manual`, and
+  `unrecovered` attribution.
+- FastAPI owns raw-body signature verification; Streamlit reads stable API
+  projections; Neon is the target shared ledger with SQLite as deadline
+  fallback.
+- Treat Payment Links as separately correlated alternate collections, not as
+  automatic subscription-invoice settlement.
+
+### Corrections to the imported handoff
+
+- Embedded Hermes `AIAgent` does not document provider-enforced output schemas;
+  parse/validate JSON locally and fail closed with at most one repair attempt.
+- `skip_memory=True` alone is insufficient isolation; use a dedicated profile,
+  no tools/context/skills/curator behavior, and a pinned tested Hermes commit.
+- Real Razorpay card retries occur over calendar days and cannot be accelerated;
+  accelerated outcomes are explicitly simulated.
+- Do not replace the completed Case 1 slice or reduce the five agreed scenarios.
+- Do not mechanically edit every repository file; only affected contracts,
+  implementation, tests, and documentation should change.
+
+### Updated documents
+
+- `PROJECT_BRIEF.md`
+- `FOUNDATION_ARCHITECTURE.md`
+- `POLICY_SPEC.md`
+- `SCENARIO_MATRIX.md`
+- `TOOLING_RESEARCH.md`
+- `RAZORPAY_DEVTOOLS_RESEARCH.md`
+- `HERMES_RAZORPAY_RESEARCH.md` (new)
+- `IMPLEMENTATION_SPEC.md` (new)
+- `README.md`
+- `CLAUDE.md`
+- `HANDOFF.md`
+
+No source code, tests, or dependencies were changed during architecture
+reconciliation. Claude Code remains the sole implementation agent.
+
+### Exact next action
+
+Codex issues the first reconciled Claude prompt: implement the Case 3
+adaptation-and-attribution slice through the existing `receive` / `run` /
+`inspect` public seam, including action intents/outcomes, communication
+ownership, policy limits, attribution, the outstanding expected-state capture
+guard, and golden tests. The Hermes runtime
+spike follows as the next isolated slice so dependency risk cannot destabilize
+the domain foundation.
 
 ## Iteration 04 — Corrective: exclusive leases + atomic intake/capture
 
@@ -401,14 +460,16 @@ same `receive` / `run` / `inspect` surface.
 
 - AI proposes recovery strategies; deterministic code enforces permissions and
   safety constraints.
-- Optimize for deep behavior across 5–8 designed scenarios, not batch scale.
-- Treat the 5–8 rich scenarios as an evaluation batch and show aggregate money
+- Optimize for deep behavior across exactly five designed scenarios, not batch
+  scale.
+- Treat the five rich scenarios as an evaluation batch and show aggregate money
   recovered, satisfying the official judging bar.
 - Razorpay test mode is the intended payment integration.
 - Use free or meaningfully usable free-tier tooling where feasible.
 - Keep the build selection-demo sized; avoid production overengineering.
-- Do not treat any candidate action or technology as approved until discovery
-  and research are complete.
+- Hermes Agent, Gemini 3.7 Flash, FastAPI, Neon, Streamlit, zrok, pytest, and the
+  provider-neutral action outbox are approved targets subject to the timeboxed
+  runtime/integration gates in `IMPLEMENTATION_SPEC.md`.
 - Internal delivery target is September 4 evening (Asia/Dubai assumed until
   confirmed); official September 5 cutoff time is unknown.
 - The expected submission artifact includes a five-minute recorded demo.
@@ -418,22 +479,21 @@ same `receive` / `run` / `inspect` surface.
   programmatic API access; research must verify usable runtime options.
 - Synthetic customer history is allowed only where Razorpay does not expose the
   required context.
-- Messaging is deferred until the core pipeline is defined; Telegram and email
-  are candidates, not approved requirements.
+- Messaging is represented by an auditable action intent in the core demo;
+  Telegram and email remain optional provider integrations.
 - First-demo wedge: SaaS subscription-payment recovery, not B2B receivables.
 - Product identity should be fictional but preferably adjacent to Razorpay's
   payment/SaaS domain.
 - Start with one end-to-end case, then expand to at most five variable cases.
-- Use an accelerated logical clock; do not make the demo wait through real
-  recovery intervals.
+- Use an accelerated logical clock only for Hermes waits, cooldowns, and
+  simulated outcomes; never claim to accelerate Razorpay's calendar retries.
 - Recovery should be fully automated on normal paths. Policy-triggered stopping
   or human escalation must still exist because compliant escalation is part of
   the official judging bar.
 - Synthetic enrichment is limited to useful data that a real SaaS/payment
   company could possess; no impossible or decorative omniscient fields.
-- Core demo runs locally. A dashboard alone may be deployed and may communicate
-  through a hosted database such as Neon, but Neon is not approved until
-  research compares it against alternatives.
+- Core demo runs locally. Neon is the target shared ledger; SQLite is the
+  deadline fallback. Public dashboard deployment is optional.
 
 ## Collaboration contract
 
@@ -452,20 +512,20 @@ same `receive` / `run` / `inspect` surface.
 - Exact official deadline time; September 5, 2026 is assumed from current
   context but should be confirmed if the organizer publishes a year/time
 - Judging rubric and selection criteria
-- Whether outbound messaging is real or simulated
 - Exact fictional SaaS identity and UI style
 
-## Research recommendation (not yet an approved architecture)
+## Approved implementation stack
 
-- Local Python/FastAPI with the official Google GenAI SDK and Pydantic
-- Gemini 3.7 Flash as the initial configurable runtime model
+- Local Python/FastAPI with Hermes Agent behind `Strategist`
+- Gemini 3.7 Flash through Hermes's native provider; local Pydantic validation
 - Neon Postgres as shared state and business audit ledger
 - Persisted accelerated logical clock; no external scheduler/job queue
 - Streamlit locally for the dashboard
 - zrok solely to expose the Razorpay webhook endpoint
 - pytest and five hand-authored golden cases
 - Provider-neutral message outbox; Telegram only as a stretch adapter
-- See `TOOLING_RESEARCH.md` for facts, citations, limits, and rejected tools
+- See `TOOLING_RESEARCH.md` and `HERMES_RAZORPAY_RESEARCH.md` for verified
+  facts, limits, and rejected assumptions
 
 ## Architecture foundation
 
@@ -493,9 +553,9 @@ only a redacted `.env.example` when implementation begins.
 
 ## Exact next action
 
-Codex reviews commit `95fe631cdd1fcaa4db857e1b9d1ce6d639407d1d` on `feat/case-1-recovery-slice`
-(diff `main..feat/case-1-recovery-slice`; run `python -m pytest -q` to
-reproduce the 36 passing behaviours), then issues Prompt 05 as described in
-"Iteration 04 -> Exact recommended next action" above. Remote `origin`
-(github.com/Arjun-Nairr/Razorpay-demo) is configured; `main` and
-`feat/case-1-recovery-slice` are pushed with upstream set.
+Issue the Case 3 adaptation-and-attribution Claude prompt defined by
+`IMPLEMENTATION_SPEC.md`. Preserve the 36-test Case 1 foundation, add the hero
+insufficient-funds path and expected-state capture guard through the same public
+seam, update this handoff, and
+commit/push only after verification. Then run the separate, timeboxed Hermes +
+Gemini integration spike using `HERMES_RAZORPAY_RESEARCH.md`.
