@@ -35,8 +35,15 @@ requirements in `PROJECT_BRIEF.md`.
   maps code structure but does not replace product-decision handoffs.
 - The imported 2026-09-03 architecture discussion has been reconciled into
   `IMPLEMENTATION_SPEC.md` and `HERMES_RAZORPAY_RESEARCH.md`.
-- Status: architecture reconciliation complete; implementation must now proceed
-  in narrow tracer-bullet slices without discarding Case 1.
+- Case 3 (insufficient-funds adaptation and attribution) in-memory slice is
+  implemented, tested, committed, and pushed on `feat/case-3-adaptation`: the
+  expected-state capture guard is closed, the wait -> failed-retry -> changed-
+  strategy -> recovery-link -> `hermes_assisted` path is proven end to end
+  through `receive`/`run`/`inspect`, and Case 1's 36-test suite remains green.
+- Status: Case 3 adaptation-and-attribution slice complete; the Hermes/Gemini
+  runtime spike (`IMPLEMENTATION_SPEC.md` slice 2) is the next isolated piece
+  of work, timeboxed so dependency risk cannot destabilize the domain
+  foundation.
 
 ## Architecture reconciliation — 2026-09-03
 
@@ -96,6 +103,197 @@ ownership, policy limits, attribution, the outstanding expected-state capture
 guard, and golden tests. The Hermes runtime
 spike follows as the next isolated slice so dependency risk cannot destabilize
 the domain foundation.
+
+## Iteration 05 — Case 3: adaptation and attribution slice
+
+- Branch: `feat/case-3-adaptation` (new, off `feat/case-1-recovery-slice`
+  HEAD `d546f7e`).
+- Docs commit: `d9ae884` (`docs: reconcile Hermes recovery architecture` -
+  the working-tree documentation reconciliation already present when this
+  iteration started; reviewed, preserved verbatim, committed first).
+- Implementation commit: `807b3a1`
+  (`feat(engine): Case 3 insufficient-funds adaptation and attribution slice`).
+- `origin` unchanged; branch pushed with upstream set
+  (`git push -u origin feat/case-3-adaptation`).
+- No dependencies added. `RULES.md`/schema/dashboard/FastAPI/Neon/Hermes/
+  Gemini untouched - purely the in-memory domain module and its tests.
+
+### Changed files
+
+- `src/hermes/types.py` - `Attribution` StrEnum (`provider_self_recovered`,
+  `hermes_assisted`, `merchant_manual`, `unrecovered`); `RazorpayWebhook`
+  gains `customer_notify`/`consent`/`reachable_channel`/`evidence_mode`
+  (all defaulted, Case 1 call sites unaffected); `StrategyProposal` gains
+  `message_intent`; `StrategySnapshot` gains retry-outcome, communication,
+  limit-remaining, and prior-proposal/-policy evidence fields;
+  `PolicyDecision` gains `message_authorized`; `Case`/`CaseSnapshot` gain
+  communication ownership/consent/channel, `retry_outcome_recorded`,
+  message/link/action counters, `last_contact_time`, `link_references`,
+  `attribution`, and last-proposal/-policy evidence; new `ActionIntent`
+  ledger record and `ActionIntentOutcomeCommand`; `IntakeCommand` gains the
+  merchant-fact and `evidence_mode` fields; `CaptureCommand` gains
+  `expected_state` enforcement wiring (`apply_capture` now uses it - see
+  below) and `evidence_mode`; `ApplyResult` gains action-intent/idempotency/
+  execute/message fields; new `ActionIntentProjection`; `CaseProjection`
+  extended with strategy/action state, communication ownership, attribution,
+  per-case recovered amount, and action intents.
+- `src/hermes/protocols.py` - `PaymentProvider.create_recovery_link`;
+  `Ledger.apply_action_outcome`.
+- `src/hermes/adapters.py` - `FakeRazorpayAdapter.create_recovery_link`
+  (deterministic, idempotency-key-keyed simulated Payment Link reference);
+  `ScriptedStrategist`'s script re-keyed to `(reason, retry_outcome_recorded)`
+  so the SAME reason code produces a DIFFERENT proposal once a failed retry
+  is recorded (`insufficient_funds` -> `WAIT_FOR_PROVIDER_RETRY` then
+  `CREATE_RECOVERY_LINK`); `InMemoryLedger.apply_intake` now wakes a
+  `waiting` case immediately on a distinct subsequent failed event (records
+  `RETRY_OUTCOME_RECORDED`, cancels the stale pending re-evaluation,
+  enqueues exactly one due-now item - never a second case, never doubled
+  pending work) and seeds merchant facts only at case creation;
+  `apply_evaluation` now also authorizes `CREATE_RECOVERY_LINK` (persists a
+  durable, idempotency-keyed `ActionIntent` with status `pending` BEFORE any
+  effect runs; a replayed idempotency key returns the existing intent and
+  signals no re-execution) and preserves `last_proposal_action`/
+  `last_policy_outcome` on every cycle; new `apply_action_outcome`
+  (idempotent - an already-`executed` intent replayed is a no-op) records the
+  fake executor's reference, adds it to the case's `link_references`, and
+  updates message counters/cooldown only when policy actually authorized the
+  message; `apply_capture` **now compares `expected_state` in addition to
+  `expected_version`**, rejecting `stale_case_state` before any money is
+  counted (the gap `IMPLEMENTATION_SPEC.md` named), and computes
+  `Attribution` deterministically (`payment_id` correlated to the case's
+  `link_references` -> `hermes_assisted`; otherwise ->
+  `provider_self_recovered`); `apply_strategist_failure`'s terminal
+  escalation now also records `Attribution.UNRECOVERED`.
+- `src/hermes/engine.py` - `MAX_ACTIONS_PER_CASE=3`,
+  `MAX_MESSAGES_PER_CASE=2`, `MESSAGE_COOLDOWN_HOURS=24`,
+  `MAX_LINKS_PER_CASE=1` (POLICY_SPEC.md defaults, configuration not prompt
+  text); `_validate_proposal` rejects a blank `message_intent` or one
+  containing a URL/currency symbol before policy ever sees it;
+  `authorize()` gains `_authorize_recovery_link` (retry-outcome
+  precondition, one-link/action-count limits) and `_suppress_message_reason`
+  (communication ownership, consent, reachable channel, message-count,
+  cooldown - independent of the link's own authorization, so a suppressed
+  message never blocks the link); `receive()` threads the new webhook
+  fields into `IntakeCommand`/`CaptureCommand`; `run()` executes the fake
+  recovery-link effect and records its outcome ONLY when
+  `ApplyResult.should_execute` is true (a duplicate/idempotent evaluation
+  never re-executes); `_snapshot()` carries all new context-contract fields
+  through to the strategist.
+- `tests/test_case3.py` - new, 21 tests, all through `receive`/`run`/
+  `inspect` plus direct `InMemoryLedger`/`authorize()` calls (both public,
+  non-underscore seams already used the same way in `test_case1.py`, e.g.
+  `ledger.claim_due_work`) - never a private `engine.` attribute.
+
+### Behavior demonstrated (each has an automated test)
+
+1. **Capture guard closes the expected-state gap** -
+   `test_expected_state_mismatch_rejects_capture_before_counting`: a
+   `CaptureCommand` with a correct `expected_version` but a stale
+   `expected_state` is rejected (`stale_case_state`) before any money is
+   counted.
+2. **Case 3 initial decision** -
+   `test_insufficient_funds_first_failure_permits_one_wait`: an
+   insufficient-funds failure with one eligible provider retry proposes and
+   authorizes exactly one bounded `WAIT_FOR_PROVIDER_RETRY`.
+3. **Failed retry wakes the case and changes strategy** -
+   `test_failed_retry_wakes_same_case_and_changes_strategy`,
+   `test_repeated_retry_failure_event_does_not_duplicate_case_or_work`: a
+   distinct subsequent failed event for the same obligation, while
+   `waiting`, is recorded atomically, wakes the case (one case, one pending
+   work item), and the next proposal is `CREATE_RECOVERY_LINK` - the prior
+   `WAIT_FOR_PROVIDER_RETRY` proposal remains in the same case's audit
+   trail as preserved evidence.
+4. **Recovery-link strategy + durable action intent** -
+   `test_action_intent_is_persisted_before_the_fake_effect_and_link_created`
+   (audit shows `ACTION_INTENT` strictly before `ACTION_OUTCOME`),
+   `test_message_intent_authorized_when_merchant_owns_communication`,
+   `test_razorpay_owned_communication_suppresses_merchant_contact` (link
+   still created; message suppressed), `test_duplicate_run_does_not_
+   duplicate_link_or_message`, plus direct `authorize()` tests for the
+   retry-outcome precondition, link/action-count limits, and message
+   consent/channel/count/cooldown suppression - all independent of link
+   authorization.
+5. **Attribution** -
+   `test_provider_owned_retry_capture_is_provider_self_recovered`,
+   `test_correlated_alternate_capture_is_hermes_assisted` (payment_id equal
+   to the executed intent's own reference), `test_recovered_money_remains_
+   exact_once_on_the_case_3_path` (duplicate event id + a second event id
+   carrying the same payment id both stay a no-op).
+6. **Invalid model output executes nothing** -
+   `test_invalid_message_intent_with_url_executes_no_action`: a
+   URL-carrying `message_intent` is treated as invalid strategist output,
+   identically to a raised/malformed proposal - no link, no intent, no
+   `AI_PROPOSAL` audit entry.
+
+### Design decisions worth flagging for review
+
+- `actions_taken` counts only merchant-authorized interventions
+  (`CREATE_RECOVERY_LINK`); `WAIT_FOR_PROVIDER_RETRY` does not spend the
+  3-action budget, since it is provider-side and already separately bounded
+  by retry eligibility and the 72-hour wait cap. Revisit if a future case
+  needs WAIT to count.
+- Merchant facts (`customer_notify`/`consent`/`reachable_channel`) travel on
+  `RazorpayWebhook` itself rather than a separate ingress, since this slice
+  has no other intake path yet (FastAPI/merchant-context ingestion is a
+  later tracer-bullet slice per `IMPLEMENTATION_SPEC.md`). Revisit once
+  that slice exists.
+- A recovery link's alternate-collection payment is correlated to the case
+  by `payment_id == ActionIntent.reference` (the fake executor's own
+  deterministic id) - a real Razorpay Payment Link's captured-payment
+  webhook would need the equivalent real correlation field wired the same
+  way behind the `PaymentProvider` protocol.
+- `SEND_REMINDER` as a standalone top-level proposal was deliberately NOT
+  implemented; only `CREATE_RECOVERY_LINK`'s bundled optional
+  `message_intent` exercises the message-authorization path, per this
+  prompt's exact scope ("Recovery-link strategy... with an optional
+  reminder/message intent").
+- `message_intent` validation is a substring check (URL/currency-symbol),
+  not a schema/NLP classifier - sufficient for a scripted strategist;
+  revisit once a real Hermes/Gemini strategist can produce more varied
+  invalid output.
+
+### Verification
+
+- `cd C:\Users\dwish\Documents\Codex\2026-09-02\fors\outputs\ai-revenue-recovery`
+- `python -m pytest -q` -> `57 passed in ~0.35s` (36 Case 1 + 21 Case 3;
+  Case 1 suite unmodified and green).
+- `python -m compileall -q src tests` -> clean.
+- No lint/type tooling is configured in `pyproject.toml`; none run
+  (consistent with every prior iteration).
+- `git diff --check` -> clean, no whitespace errors.
+- `git diff --cached --stat` reviewed: exactly
+  `src/hermes/{types,protocols,adapters,engine}.py` and
+  `tests/test_case3.py`; no doc, pyproject, schema, or unrelated file
+  changed; no secrets (`grep`-scanned for API-key/secret/password/token
+  patterns - none found beyond internal `claim_token`/`event_id`/
+  `payment_id` identifiers, which are not credentials).
+
+### Remaining limitations (in scope for later prompts)
+
+- `SEND_REMINDER` and `REQUEST_PAYMENT_METHOD_UPDATE` remain unimplemented
+  standalone proposals (`action_not_supported_in_slice`); Cases 2/4/5 need
+  them.
+- `STOP`/`ESCALATE`/`RECOMMEND_STRUCTURAL_CHANGE`/`TAKE_NO_ACTION` are not
+  yet authorizable actions; `merchant_manual` attribution has no reachable
+  path in this slice (the constant exists; nothing sets it yet).
+- No dispute handling, commercial-safety replacement, or access-hold
+  recommendation (policy-evaluation-order steps 5 and 9 partially
+  implemented, matching Case 1's existing `ponytail:` note).
+- Concurrency, lease, and transaction-boundary limitations are unchanged
+  from Iteration 04 (single-process cooperative; documented there).
+- No HMAC / real Razorpay / Gemini / Neon / FastAPI / Streamlit / real
+  messaging - all explicitly out of scope for this milestone.
+- Payment-history classification (normally-on-time / chronically-late) is
+  not implemented; Cases 4/5 need it.
+
+### Exact recommended next action
+
+Codex reviews this iteration's commit (diff `main..feat/case-3-adaptation`),
+then issues the timeboxed Hermes runtime spike prompt: pin one Hermes
+commit, prove isolated Gemini invocation behind the existing `Strategist`
+protocol, strict local schema validation, and timeout/repair behavior,
+using `HERMES_RAZORPAY_RESEARCH.md`'s verified constraints - before
+building the FastAPI ingress or Neon persistence slices.
 
 ## Iteration 04 — Corrective: exclusive leases + atomic intake/capture
 
@@ -553,9 +751,11 @@ only a redacted `.env.example` when implementation begins.
 
 ## Exact next action
 
-Issue the Case 3 adaptation-and-attribution Claude prompt defined by
-`IMPLEMENTATION_SPEC.md`. Preserve the 36-test Case 1 foundation, add the hero
-insufficient-funds path and expected-state capture guard through the same public
-seam, update this handoff, and
-commit/push only after verification. Then run the separate, timeboxed Hermes +
-Gemini integration spike using `HERMES_RAZORPAY_RESEARCH.md`.
+Case 3 is done (see Iteration 05 below). Codex reviews commit `807b3a1` on
+`feat/case-3-adaptation` (diff `main..feat/case-3-adaptation`), then issues
+the timeboxed Hermes runtime spike prompt (`IMPLEMENTATION_SPEC.md` slice 2):
+pin one Hermes commit, prove an isolated Gemini invocation behind the
+existing `Strategist` protocol, strict local schema validation, and
+timeout/repair behavior, using `HERMES_RAZORPAY_RESEARCH.md`'s verified
+constraints. Do not let a Hermes/Gemini setup problem destabilize the
+in-memory domain foundation this and the Case 1 slice already proved.

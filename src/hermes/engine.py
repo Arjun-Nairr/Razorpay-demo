@@ -19,6 +19,7 @@ from .protocols import Ledger, PaymentProvider, Strategist
 from .types import (
     AUDIT_INPUT_EVENT,
     AUDIT_POLICY_DECISION,
+    ActionIntentOutcomeCommand,
     AuditQuery,
     BatchQuery,
     CaptureCommand,
@@ -50,6 +51,15 @@ from .types import (
 WORK_LOOP_LIMIT = 50  # steps per run() call
 MAX_WAIT_HOURS = 72
 
+# POLICY_SPEC.md default deterministic limits (configuration, not prompt text).
+MAX_ACTIONS_PER_CASE = 3
+MAX_MESSAGES_PER_CASE = 2
+MESSAGE_COOLDOWN_HOURS = 24
+MAX_LINKS_PER_CASE = 1
+# Substrings a strategist must never put in message_intent - it may propose
+# reminder copy, never a URL, amount, provider id, discount, or commercial term.
+_MESSAGE_INTENT_FORBIDDEN = ("http://", "https://", "₹", "$")
+
 
 def _validate_proposal(obj: object) -> StrategyProposal:
     """Reject strategist output that is not a usable typed proposal."""
@@ -61,6 +71,15 @@ def _validate_proposal(obj: object) -> StrategyProposal:
         raise InvalidProposal(f"confidence out of range: {obj.confidence}")
     if obj.proposed_wait_hours < 0:
         raise InvalidProposal(f"negative wait: {obj.proposed_wait_hours}")
+    if obj.message_intent is not None:
+        if not obj.message_intent.strip():
+            raise InvalidProposal("blank message_intent")
+        lowered = obj.message_intent.lower()
+        if any(bad in lowered for bad in _MESSAGE_INTENT_FORBIDDEN):
+            raise InvalidProposal(
+                "message_intent must not contain a URL, amount, or provider "
+                f"identifier: {obj.message_intent!r}"
+            )
     return obj
 
 
@@ -70,15 +89,19 @@ def authorize(
     now: int,
     retry_fact: ProviderRetryFact,
 ) -> PolicyDecision:
-    """Deterministic policy for the Case 1 path.
+    """Deterministic policy for the Case 1 + Case 3 paths.
 
-    Provider-truth (a captured payment) is handled in ``receive``. Here we cover
-    terminal-state protection and WAIT_FOR_PROVIDER_RETRY authorization, which
-    is fail-closed: it needs an explicit provider-derived eligible fact *with*
-    evidence. The AI proposal cannot set or override that fact.
+    Provider-truth (a captured payment) is handled in ``receive``. Here we
+    cover terminal-state protection, WAIT_FOR_PROVIDER_RETRY authorization
+    (fail-closed: needs an explicit provider-derived eligible fact *with*
+    evidence - the AI proposal cannot set or override that fact), and
+    CREATE_RECOVERY_LINK authorization (retry-outcome precondition, one-link/
+    action-count limits, and an independent gate on any bundled message
+    intent - communication ownership, consent, reachable channel, message
+    count, and cooldown).
 
-    ponytail: partial policy. The full 10-step order (cooldowns, attempt/message
-    limits, consent, commercial safety, reconciliation) arrives with cases 2-5.
+    ponytail: partial policy. The full 10-step order (dispute, commercial
+    safety, reconciliation) arrives with cases 2/4/5.
     """
     if case.state in TERMINAL_STATES:
         return PolicyDecision(PolicyOutcome.BLOCK, "terminal_case")
@@ -89,7 +112,58 @@ def authorize(
         return PolicyDecision(
             PolicyOutcome.ALLOW, "provider_retry_permitted", scheduled_time=now + wait
         )
+    if proposal.action is ProposalAction.CREATE_RECOVERY_LINK:
+        return _authorize_recovery_link(proposal, case, now)
     return PolicyDecision(PolicyOutcome.BLOCK, "action_not_supported_in_slice")
+
+
+def _authorize_recovery_link(
+    proposal: StrategyProposal, case: CaseSnapshot, now: int
+) -> PolicyDecision:
+    """POLICY_SPEC.md "Create recovery link": allow at most once, only after a
+    recorded failed retry outcome, within the action-count limit. The
+    optional bundled message intent is authorized independently - consent,
+    reachable channel, communication ownership, message-count, and cooldown -
+    so a suppressed message never blocks the link itself.
+    """
+    if not case.retry_outcome_recorded:
+        return PolicyDecision(PolicyOutcome.BLOCK, "retry_outcome_not_recorded")
+    if case.links_created >= MAX_LINKS_PER_CASE:
+        return PolicyDecision(PolicyOutcome.BLOCK, "recovery_link_limit_reached")
+    if case.actions_taken >= MAX_ACTIONS_PER_CASE:
+        return PolicyDecision(PolicyOutcome.BLOCK, "action_limit_reached")
+
+    if not proposal.message_intent:
+        return PolicyDecision(PolicyOutcome.ALLOW, "recovery_link_authorized")
+
+    suppress_reason = _suppress_message_reason(case, now)
+    if suppress_reason is None:
+        return PolicyDecision(
+            PolicyOutcome.ALLOW, "recovery_link_authorized_message_authorized",
+            message_authorized=True,
+        )
+    return PolicyDecision(
+        PolicyOutcome.ALLOW, f"recovery_link_authorized_message_suppressed_{suppress_reason}",
+        message_authorized=False,
+    )
+
+
+def _suppress_message_reason(case: CaseSnapshot, now: int) -> str | None:
+    """The reason a bundled/standalone message must be suppressed, or ``None``
+    when every precondition clears. Order matches POLICY_SPEC.md's dispute-
+    and-consent-before-attempt-limits-before-cooldown evaluation order.
+    """
+    if case.communication_owner != "merchant":
+        return "provider_owned"
+    if not case.consent:
+        return "no_consent"
+    if not case.reachable_channel:
+        return "unreachable_channel"
+    if case.messages_sent >= MAX_MESSAGES_PER_CASE:
+        return "message_limit"
+    if case.last_contact_time is not None and now - case.last_contact_time < MESSAGE_COOLDOWN_HOURS:
+        return "cooldown"
+    return None
 
 
 class RecoveryEngine:
@@ -121,6 +195,10 @@ class RecoveryEngine:
                     currency=webhook.currency,
                     reason_code=webhook.reason_code,
                     now=self._clock,
+                    customer_notify=webhook.customer_notify,
+                    consent=webhook.consent,
+                    reachable_channel=webhook.reachable_channel,
+                    evidence_mode=webhook.evidence_mode,
                 )
             )
             return ReceiveResult(True, result.duplicate, result.case_id)
@@ -210,6 +288,7 @@ class RecoveryEngine:
                 now=self._clock,
                 expected_version=snap.version,
                 expected_state=snap.state,
+                evidence_mode=webhook.evidence_mode,
             )
         )
         return ReceiveResult(True, result.reason == "duplicate_event", case_id)
@@ -278,6 +357,25 @@ class RecoveryEngine:
             scheduled += int(result.scheduled)
             blocked += int(result.blocked)
 
+            # A freshly persisted, durable action intent (never a duplicate
+            # replay) is executed only now, OUTSIDE the transaction that
+            # created it - the strategist never creates or runs the effect
+            # itself; the fake executor is deterministic and idempotent, so
+            # a lost/duplicated outcome write can never re-run it.
+            if result.should_execute and result.action_intent_id is not None:
+                reference = self._razorpay.create_recovery_link(
+                    claim.case_id, result.idempotency_key or ""
+                )
+                led.apply_action_outcome(
+                    ActionIntentOutcomeCommand(
+                        intent_id=result.action_intent_id,
+                        case_id=claim.case_id,
+                        now=self._clock,
+                        reference=reference,
+                        message_sent=result.message_authorized,
+                    )
+                )
+
         return RunReport(
             logical_time=self._clock,
             steps=steps,
@@ -317,6 +415,19 @@ class RecoveryEngine:
             state=snap.state,
             provider_retry_eligible=retry_fact.retry_eligible,
             provider_retry_evidence=retry_fact.evidence,
+            retry_outcome_recorded=snap.retry_outcome_recorded,
+            communication_owner=snap.communication_owner,
+            consent=snap.consent,
+            reachable_channel=snap.reachable_channel,
+            messages_sent=snap.messages_sent,
+            links_created=snap.links_created,
+            actions_taken=snap.actions_taken,
+            last_contact_time=snap.last_contact_time,
+            messages_remaining=max(0, MAX_MESSAGES_PER_CASE - snap.messages_sent),
+            links_remaining=max(0, MAX_LINKS_PER_CASE - snap.links_created),
+            actions_remaining=max(0, MAX_ACTIONS_PER_CASE - snap.actions_taken),
+            prior_action=snap.prior_action,
+            prior_policy_outcome=snap.prior_policy_outcome,
         )
 
     def _discard_cmd(self, claim: WorkClaim, reason: str) -> DiscardWorkCommand:

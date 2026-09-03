@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Protocol, Sequence
 
 from .types import (
+    ActionIntentOutcomeCommand,
     ApplyResult,
     AuditProjection,
     BatchProjection,
@@ -43,6 +44,10 @@ class PaymentProvider(Protocol):
 
     def verify_capture(self, obligation_id: str) -> CaptureInfo | None: ...
 
+    def create_recovery_link(self, case_id: str, idempotency_key: str) -> str: ...
+    # Deterministic fake executor: the SAME idempotency_key always returns the
+    # SAME simulated, uniquely correlated reference - never a real Razorpay call.
+
 
 class Ledger(Protocol):
     # -- reads --------------------------------------------------------------
@@ -69,6 +74,9 @@ class Ledger(Protocol):
     def apply_strategist_failure(self, cmd: StrategistFailureCommand) -> ApplyResult: ...
 
     def apply_capture(self, cmd: CaptureCommand) -> ApplyResult: ...
+
+    def apply_action_outcome(self, cmd: ActionIntentOutcomeCommand) -> ApplyResult: ...
+    # Idempotent: replaying an already-``executed`` intent_id is a no-op.
 
     def discard_work(self, cmd: DiscardWorkCommand) -> ApplyResult: ...
 

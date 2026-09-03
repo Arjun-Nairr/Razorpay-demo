@@ -25,7 +25,17 @@ class WebhookType(StrEnum):
 
 @dataclass(frozen=True)
 class RazorpayWebhook:
-    """A trusted, already-verified provider event."""
+    """A trusted, already-verified provider event.
+
+    ``customer_notify``/``consent``/``reachable_channel`` are merchant/account
+    facts established at case creation (the first ``payment.failed`` event for
+    an obligation) - a real integration would source them from the merchant's
+    own system, not the Razorpay payload itself; they travel alongside the
+    webhook only because this slice has no separate merchant-context ingress
+    yet (out of scope - see IMPLEMENTATION_SPEC.md's FastAPI slice).
+    ``evidence_mode`` labels every event ``SIMULATED`` or ``REAL_TEST_MODE`` so
+    the two can never be conflated in audit output or metrics.
+    """
 
     event_id: str  # provider event id; processed at most once
     type: WebhookType
@@ -34,6 +44,10 @@ class RazorpayWebhook:
     currency: str = "INR"
     reason_code: str | None = None  # failure class, e.g. "bank_temporary_error"
     payment_id: str | None = None  # set on captured events
+    customer_notify: bool = False  # True: Razorpay owns customer communication
+    consent: bool = True  # merchant-recorded contact consent
+    reachable_channel: bool = True  # merchant has a reachable contact channel
+    evidence_mode: str = "SIMULATED"  # "SIMULATED" | "REAL_TEST_MODE"
 
 
 @dataclass(frozen=True)
@@ -79,7 +93,13 @@ class ProposalAction(StrEnum):
 
 @dataclass(frozen=True)
 class StrategySnapshot:
-    """Immutable, source-labelled case view handed to the strategist."""
+    """Immutable, source-labelled case view handed to the strategist.
+
+    Case 3 additions carry forward prior proposal/policy/outcome evidence and
+    remaining communication/action capacity, per IMPLEMENTATION_SPEC.md's
+    context contract - never amounts, identifiers, or URLs the strategist
+    could echo back.
+    """
 
     case_id: str
     obligation_id: str
@@ -89,6 +109,19 @@ class StrategySnapshot:
     state: str
     provider_retry_eligible: bool
     provider_retry_evidence: str | None
+    retry_outcome_recorded: bool = False
+    communication_owner: str = "merchant"  # "merchant" | "razorpay"
+    consent: bool = True
+    reachable_channel: bool = True
+    messages_sent: int = 0
+    links_created: int = 0
+    actions_taken: int = 0
+    last_contact_time: int | None = None
+    messages_remaining: int = 0
+    links_remaining: int = 0
+    actions_remaining: int = 0
+    prior_action: str | None = None  # last proposal's action, across cycles
+    prior_policy_outcome: str | None = None  # last policy decision's outcome
 
 
 @dataclass(frozen=True)
@@ -96,7 +129,9 @@ class StrategyProposal:
     """One typed strategy proposal from the AI strategist.
 
     The strategist may not supply amounts, identifiers, URLs, limits, or
-    provider retry eligibility.
+    provider retry eligibility. ``message_intent`` is optional short reminder
+    copy only - never a URL, amount, provider identifier, discount, or
+    commercial term; policy validates and may still suppress it.
     """
 
     action: ProposalAction
@@ -104,6 +139,7 @@ class StrategyProposal:
     rationale: str
     confidence: float
     proposed_wait_hours: int = 0  # relative, only meaningful for WAIT_FOR_PROVIDER_RETRY
+    message_intent: str | None = None  # optional reminder copy, CREATE_RECOVERY_LINK/SEND_REMINDER only
 
 
 class InvalidProposal(Exception):
@@ -127,6 +163,22 @@ class PolicyDecision:
     outcome: PolicyOutcome
     reason_code: str
     scheduled_time: int | None = None  # logical hour to re-evaluate, when ALLOW
+    message_authorized: bool = False  # the bundled message_intent specifically cleared policy
+
+
+# --- Recovery attribution ----------------------------------------------------
+
+
+class Attribution(StrEnum):
+    """Exactly the four outcomes POLICY_SPEC.md defines. Attribution never
+    changes payment truth - it only records *why* a case recovered (or did
+    not), computed deterministically, never by the strategist.
+    """
+
+    PROVIDER_SELF_RECOVERED = "provider_self_recovered"
+    HERMES_ASSISTED = "hermes_assisted"
+    MERCHANT_MANUAL = "merchant_manual"
+    UNRECOVERED = "unrecovered"
 
 
 # --- Case states -----------------------------------------------------------
@@ -160,6 +212,20 @@ class Case:
     linked_payment_id: str | None = None
     failure_reason: str | None = None
     version: int = 0
+    # --- Case 3: adaptation and attribution -----------------------------
+    communication_owner: str = "merchant"  # "merchant" | "razorpay"; set at creation
+    consent: bool = True
+    reachable_channel: bool = True
+    evidence_mode: str = "SIMULATED"
+    retry_outcome_recorded: bool = False  # a distinct failed retry outcome arrived
+    messages_sent: int = 0
+    links_created: int = 0
+    actions_taken: int = 0
+    last_contact_time: int | None = None  # logical hour of the last authorized message
+    link_references: frozenset[str] = field(default_factory=frozenset)
+    attribution: str | None = None  # one Attribution value, set at termination
+    last_proposal_action: str | None = None  # prior-cycle evidence for the next snapshot
+    last_policy_outcome: str | None = None
 
 
 @dataclass
@@ -185,6 +251,24 @@ class AuditEvent:
     detail: dict = field(default_factory=dict)
 
 
+@dataclass
+class ActionIntent:
+    """A durable, idempotent record of one authorized effect. Persisted with
+    status ``pending`` BEFORE the fake executor runs; ``execute()`` results
+    are recorded back onto this same record so a duplicate attempt can never
+    create or run the effect twice - see ``idempotency_key``.
+    """
+
+    intent_id: str
+    case_id: str
+    action: str  # ProposalAction value, e.g. "CREATE_RECOVERY_LINK"
+    idempotency_key: str
+    created_time: int
+    status: str = "pending"  # "pending" | "executed"
+    reference: str | None = None  # the fake executor's simulated correlation id
+    message_sent: bool = False
+
+
 # Audit event kinds (append-only trail).
 AUDIT_INPUT_EVENT = "INPUT_EVENT"
 AUDIT_AI_PROPOSAL = "AI_PROPOSAL"
@@ -194,6 +278,9 @@ AUDIT_SCHEDULED_ACTION = "SCHEDULED_ACTION"
 AUDIT_PAYMENT_CONFIRMATION = "PAYMENT_CONFIRMATION"
 AUDIT_PENDING_WORK_CANCELLED = "PENDING_WORK_CANCELLED"
 AUDIT_TERMINAL_TRANSITION = "TERMINAL_TRANSITION"
+AUDIT_RETRY_OUTCOME = "RETRY_OUTCOME_RECORDED"  # a failed provider-retry outcome woke the case
+AUDIT_ACTION_INTENT = "ACTION_INTENT"  # a durable action intent was persisted, pre-effect
+AUDIT_ACTION_OUTCOME = "ACTION_OUTCOME"  # the fake effect executed; intent marked complete
 
 
 # --- ledger reads: frozen snapshots ---------------------------------------
@@ -208,6 +295,17 @@ class CaseSnapshot:
     state: str
     failure_reason: str | None
     version: int
+    communication_owner: str = "merchant"
+    consent: bool = True
+    reachable_channel: bool = True
+    retry_outcome_recorded: bool = False
+    messages_sent: int = 0
+    links_created: int = 0
+    actions_taken: int = 0
+    last_contact_time: int | None = None
+    attribution: str | None = None
+    prior_action: str | None = None
+    prior_policy_outcome: str | None = None
 
 
 @dataclass(frozen=True)
@@ -232,6 +330,10 @@ class ApplyResult:
     scheduled: bool = False  # a follow-up work item was created
     blocked: bool = False  # the policy blocked the proposal
     terminal: bool = False  # the case reached a terminal state
+    action_intent_id: str | None = None  # set when an intent was created or already existed
+    idempotency_key: str | None = None
+    should_execute: bool = False  # a FRESH pending intent needs its fake effect run
+    message_authorized: bool = False  # the bundled message_intent specifically cleared policy
 
 
 # --- ledger writes: immutable commands ----------------------------------
@@ -242,6 +344,14 @@ class IntakeCommand:
     """Everything a ``payment.failed`` webhook needs to be admitted atomically:
     dedup, one-case-per-obligation, event recording, audit, and initial-work
     enqueue happen inside a single ledger transaction.
+
+    ``customer_notify``/``consent``/``reachable_channel`` seed the case ONLY
+    when this call creates it; a later delivery for an existing case does not
+    revise them (merchant facts are established once, at intake).
+
+    A distinct event for a case already ``waiting`` on a provider retry IS
+    that retry's failed outcome: the transaction records it and wakes the
+    case immediately - see ``Ledger.apply_intake``.
     """
 
     event_id: str
@@ -250,6 +360,10 @@ class IntakeCommand:
     currency: str
     reason_code: str | None
     now: int
+    customer_notify: bool = False
+    consent: bool = True
+    reachable_channel: bool = True
+    evidence_mode: str = "SIMULATED"
 
 
 @dataclass(frozen=True)
@@ -257,7 +371,7 @@ class IntakeResult:
     case_id: str | None
     duplicate: bool  # the same provider event id was already admitted
     created: bool  # a new case + initial work item was opened by this call
-    outcome: str
+    outcome: str  # "case_opened" | "existing_case" | "retry_outcome_recorded" | "duplicate_event"
 
 
 @dataclass(frozen=True)
@@ -309,6 +423,22 @@ class CaptureCommand:
     now: int
     expected_version: int  # case version observed before provider verification
     expected_state: str  # case state observed before provider verification
+    evidence_mode: str = "SIMULATED"  # "SIMULATED" | "REAL_TEST_MODE"
+
+
+@dataclass(frozen=True)
+class ActionIntentOutcomeCommand:
+    """Records the fake executor's result for an already-persisted, pending
+    action intent. Idempotent: replaying the same ``intent_id`` after it is
+    already ``executed`` is a no-op - the effect and its counters never
+    apply twice.
+    """
+
+    intent_id: str
+    case_id: str
+    now: int
+    reference: str  # the fake executor's deterministic, uniquely correlated id
+    message_sent: bool
 
 
 # --- engine results ------------------------------------------------------
@@ -355,6 +485,15 @@ RecoveryQuery = CaseQuery | BatchQuery | AuditQuery
 
 
 @dataclass(frozen=True)
+class ActionIntentProjection:
+    intent_id: str
+    action: str
+    status: str  # "pending" | "executed"
+    reference: str | None
+    message_sent: bool
+
+
+@dataclass(frozen=True)
 class CaseProjection:
     case_id: str
     obligation_id: str
@@ -365,6 +504,15 @@ class CaseProjection:
     linked_payment_id: str | None
     pending_work: int
     version: int
+    # --- Case 3: strategy/action state, communication, attribution -----
+    retry_outcome_recorded: bool = False
+    communication_owner: str = "merchant"
+    messages_sent: int = 0
+    links_created: int = 0
+    actions_taken: int = 0
+    attribution: str | None = None
+    recovered_minor: int = 0  # this case's own contribution; amount_minor iff counted
+    action_intents: tuple[ActionIntentProjection, ...] = ()
 
 
 @dataclass(frozen=True)

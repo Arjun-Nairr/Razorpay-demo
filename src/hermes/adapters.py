@@ -11,15 +11,22 @@ No method here performs an external network call.
 from __future__ import annotations
 
 from .types import (
+    AUDIT_ACTION_INTENT,
+    AUDIT_ACTION_OUTCOME,
     AUDIT_AI_PROPOSAL,
     AUDIT_INPUT_EVENT,
     AUDIT_PAYMENT_CONFIRMATION,
     AUDIT_PENDING_WORK_CANCELLED,
     AUDIT_POLICY_DECISION,
+    AUDIT_RETRY_OUTCOME,
     AUDIT_SCHEDULED_ACTION,
     AUDIT_STRATEGIST_FAILURE,
     AUDIT_TERMINAL_TRANSITION,
+    ActionIntent,
+    ActionIntentOutcomeCommand,
+    ActionIntentProjection,
     ApplyResult,
+    Attribution,
     AuditEvent,
     AuditProjection,
     AuditRecord,
@@ -68,6 +75,7 @@ class FakeRazorpayAdapter:
     def __init__(self) -> None:
         self._captures: dict[str, CaptureInfo] = {}
         self._retry_signal: dict[str, bool] = {}
+        self._links: dict[str, str] = {}  # idempotency_key -> reference
 
     def set_retry_eligibility(self, obligation_id: str, eligible: bool) -> None:
         """Record an explicit provider signal for this obligation."""
@@ -92,15 +100,32 @@ class FakeRazorpayAdapter:
     def verify_capture(self, obligation_id: str) -> CaptureInfo | None:
         return self._captures.get(obligation_id)
 
+    def create_recovery_link(self, case_id: str, idempotency_key: str) -> str:
+        """Simulated Razorpay Payment Link. Deterministic and idempotent: the
+        SAME ``idempotency_key`` always returns the SAME reference, so a
+        replayed execution attempt can never mint a second link - a real
+        adapter would achieve the same guarantee via Razorpay's own
+        idempotency-key support.
+        """
+        return self._links.setdefault(idempotency_key, f"rlnk_{idempotency_key}")
+
 
 # --- AI strategist ---------------------------------------------------
 
 
 class ScriptedStrategist:
-    """Returns a canned typed proposal keyed by failure reason code."""
+    """Returns a canned typed proposal keyed by ``(failure_reason,
+    retry_outcome_recorded)``. The second key element is what lets the SAME
+    reason code produce a DIFFERENT proposal once a failed retry outcome has
+    been recorded - a deterministic stand-in for Hermes changing strategy
+    after an unsuccessful wait (Case 3's adaptation step). The message intent
+    on the recovery-link proposal is offered unconditionally; whether it is
+    actually authorized is a POLICY decision (communication ownership,
+    consent, cooldown, limits), never the strategist's own call.
+    """
 
-    _DEFAULT_SCRIPT: dict[str, StrategyProposal] = {
-        "bank_temporary_error": StrategyProposal(
+    _DEFAULT_SCRIPT: dict[tuple[str, bool], StrategyProposal] = {
+        ("bank_temporary_error", False): StrategyProposal(
             action=ProposalAction.WAIT_FOR_PROVIDER_RETRY,
             diagnosis="Temporary bank-side decline; provider retry is eligible.",
             rationale="Normal payment history and a transient error: wait for the "
@@ -108,17 +133,36 @@ class ScriptedStrategist:
             confidence=0.82,
             proposed_wait_hours=24,
         ),
+        ("insufficient_funds", False): StrategyProposal(
+            action=ProposalAction.WAIT_FOR_PROVIDER_RETRY,
+            diagnosis="Card declined for insufficient funds; one provider retry "
+            "is eligible.",
+            rationale="A single provider-owned retry may still clear once funds "
+            "land; wait for it before any customer contact.",
+            confidence=0.78,
+            proposed_wait_hours=24,
+        ),
+        ("insufficient_funds", True): StrategyProposal(
+            action=ProposalAction.CREATE_RECOVERY_LINK,
+            diagnosis="The provider-owned retry also failed for insufficient funds.",
+            rationale="The eligible provider retry is exhausted; create one "
+            "uniquely correlated recovery link as an alternate collection path "
+            "and let policy decide whether a reminder may accompany it.",
+            confidence=0.74,
+            message_intent="Your last payment attempt did not go through. "
+            "Please use the secure link we sent to complete it.",
+        ),
     }
 
-    def __init__(self, script: dict[str, StrategyProposal] | None = None) -> None:
+    def __init__(self, script: dict[tuple[str, bool], StrategyProposal] | None = None) -> None:
         self.script = script or dict(self._DEFAULT_SCRIPT)
 
     def propose(self, snapshot: StrategySnapshot) -> StrategyProposal:
-        reason = snapshot.failure_reason or ""
+        key = (snapshot.failure_reason or "", snapshot.retry_outcome_recorded)
         try:
-            return self.script[reason]
+            return self.script[key]
         except KeyError:
-            raise KeyError(f"ScriptedStrategist has no proposal for reason {reason!r}")
+            raise KeyError(f"ScriptedStrategist has no proposal for {key!r}")
 
 
 # --- Recovery ledger ------------------------------------------------
@@ -137,6 +181,8 @@ class InMemoryLedger:
         self._seen_events: set[str] = set()
         self._recovered_payment_ids: set[str] = set()
         self._recovered_minor: int = 0
+        self._action_intents: dict[str, ActionIntent] = {}
+        self._intents_by_key: dict[tuple[str, str], str] = {}  # (case_id, key) -> intent_id
         self._seq = 0
         self._id_seq = 0
 
@@ -153,6 +199,17 @@ class InMemoryLedger:
         return CaseSnapshot(
             c.case_id, c.obligation_id, c.amount_minor, c.currency, c.state.value,
             c.failure_reason, c.version,
+            communication_owner=c.communication_owner,
+            consent=c.consent,
+            reachable_channel=c.reachable_channel,
+            retry_outcome_recorded=c.retry_outcome_recorded,
+            messages_sent=c.messages_sent,
+            links_created=c.links_created,
+            actions_taken=c.actions_taken,
+            last_contact_time=c.last_contact_time,
+            attribution=c.attribution,
+            prior_action=c.last_proposal_action,
+            prior_policy_outcome=c.last_policy_outcome,
         )
 
     def claim_due_work(self, now: int) -> list[WorkClaim]:
@@ -207,6 +264,21 @@ class InMemoryLedger:
             linked_payment_id=c.linked_payment_id,
             pending_work=len(self._pending_work(c.case_id)),
             version=c.version,
+            retry_outcome_recorded=c.retry_outcome_recorded,
+            communication_owner=c.communication_owner,
+            messages_sent=c.messages_sent,
+            links_created=c.links_created,
+            actions_taken=c.actions_taken,
+            attribution=c.attribution,
+            recovered_minor=c.amount_minor if c.counted else 0,
+            action_intents=tuple(
+                ActionIntentProjection(
+                    intent_id=i.intent_id, action=i.action, status=i.status,
+                    reference=i.reference, message_sent=i.message_sent,
+                )
+                for i in self._action_intents.values()
+                if i.case_id == c.case_id
+            ),
         )
 
     def batch_projection(self) -> BatchProjection:
@@ -242,6 +314,12 @@ class InMemoryLedger:
         """One transaction for a ``payment.failed`` webhook: deduplicate the
         provider event, enforce one case per obligation, record the input event
         and audit, and enqueue the initial re-evaluation work item.
+
+        A distinct event for a case already ``waiting`` on a provider retry IS
+        that retry's failed outcome (Case 3): recorded atomically here, the
+        case is woken immediately by cancelling its pending future
+        re-evaluation and enqueuing exactly one due-now item - never a second
+        case, never a second pending work item.
         """
         if cmd.event_id in self._seen_events:
             existing = self._by_obligation.get(cmd.obligation_id)
@@ -251,6 +329,33 @@ class InMemoryLedger:
 
         existing = self._by_obligation.get(cmd.obligation_id)
         if existing is not None:
+            case = self._cases[existing]
+            if case.state is CaseState.WAITING:
+                case.retry_outcome_recorded = True
+                case.state = CaseState.ACTIVE
+                case.version += 1
+                self._append(
+                    cmd.now,
+                    existing,
+                    AUDIT_RETRY_OUTCOME,
+                    {
+                        "event_id": cmd.event_id,
+                        "reason_code": cmd.reason_code,
+                        "evidence_mode": cmd.evidence_mode,
+                    },
+                )
+                cancelled = self._pending_work(existing)
+                for w in cancelled:
+                    w.cancelled = True
+                if cancelled:
+                    self._append(
+                        cmd.now, existing, AUDIT_PENDING_WORK_CANCELLED,
+                        {"count": len(cancelled), "reason": "retry_outcome_recorded"},
+                    )
+                wid = self._next_id("work")
+                self._work[wid] = ScheduledWork(work_id=wid, case_id=existing, due_time=cmd.now)
+                return IntakeResult(existing, duplicate=False, created=False,
+                                    outcome="retry_outcome_recorded")
             self._append(
                 cmd.now,
                 existing,
@@ -259,7 +364,7 @@ class InMemoryLedger:
                     "event_id": cmd.event_id,
                     "type": "payment.failed",
                     "note": "existing case; no transition",
-                    "case_state": self._cases[existing].state.value,
+                    "case_state": case.state.value,
                 },
             )
             return IntakeResult(existing, duplicate=False, created=False,
@@ -272,6 +377,10 @@ class InMemoryLedger:
             currency=cmd.currency,
             created_time=cmd.now,
             failure_reason=cmd.reason_code,
+            communication_owner="razorpay" if cmd.customer_notify else "merchant",
+            consent=cmd.consent,
+            reachable_channel=cmd.reachable_channel,
+            evidence_mode=cmd.evidence_mode,
         )
         self._cases[case.case_id] = case
         self._by_obligation[case.obligation_id] = case.case_id
@@ -285,6 +394,7 @@ class InMemoryLedger:
                 "obligation_id": cmd.obligation_id,
                 "amount_minor": cmd.amount_minor,
                 "reason_code": cmd.reason_code,
+                "evidence_mode": cmd.evidence_mode,
             },
         )
         wid = self._next_id("work")
@@ -332,8 +442,14 @@ class InMemoryLedger:
                 "outcome": decision.outcome.value,
                 "reason_code": decision.reason_code,
                 "scheduled_time": decision.scheduled_time,
+                "message_authorized": decision.message_authorized,
             },
         )
+        # Preserve this cycle's proposal/policy evidence for the NEXT snapshot,
+        # regardless of outcome - Case 3's adaptation step reads this.
+        case.last_proposal_action = proposal.action.value
+        case.last_policy_outcome = decision.outcome.value
+
         if (
             decision.outcome is PolicyOutcome.ALLOW
             and proposal.action is ProposalAction.WAIT_FOR_PROVIDER_RETRY
@@ -352,7 +468,56 @@ class InMemoryLedger:
                 {"kind": "evaluate", "due_time": due},
             )
             return ApplyResult(ok=True, scheduled=True)
+
+        if (
+            decision.outcome is PolicyOutcome.ALLOW
+            and proposal.action is ProposalAction.CREATE_RECOVERY_LINK
+        ):
+            return self._apply_recovery_link_intent(case, proposal, decision, cmd.now)
+
         return ApplyResult(ok=True, blocked=decision.outcome is PolicyOutcome.BLOCK)
+
+    def _apply_recovery_link_intent(
+        self, case: Case, proposal: StrategyProposal, decision, now: int
+    ) -> ApplyResult:
+        """Persist the durable, idempotent action intent for an authorized
+        CREATE_RECOVERY_LINK - BEFORE any fake effect runs (see
+        ``ActionIntentOutcomeCommand`` / ``apply_action_outcome``). A replay
+        with the same idempotency key returns the EXISTING intent and signals
+        ``should_execute=False``, so the caller never re-runs the effect.
+        """
+        idempotency_key = f"{case.case_id}:CREATE_RECOVERY_LINK"
+        existing_id = self._intents_by_key.get((case.case_id, idempotency_key))
+        if existing_id is not None:
+            existing = self._action_intents[existing_id]
+            return ApplyResult(
+                ok=True, action_intent_id=existing.intent_id,
+                idempotency_key=idempotency_key, should_execute=False,
+            )
+        intent_id = self._next_id("intent")
+        self._action_intents[intent_id] = ActionIntent(
+            intent_id=intent_id, case_id=case.case_id,
+            action=proposal.action.value, idempotency_key=idempotency_key,
+            created_time=now,
+        )
+        self._intents_by_key[(case.case_id, idempotency_key)] = intent_id
+        case.links_created += 1
+        case.actions_taken += 1
+        case.version += 1
+        self._append(
+            now, case.case_id, AUDIT_ACTION_INTENT,
+            {
+                "action": proposal.action.value,
+                "intent_id": intent_id,
+                "idempotency_key": idempotency_key,
+                "message_authorized": decision.message_authorized,
+                "status": "pending",
+            },
+        )
+        return ApplyResult(
+            ok=True, action_intent_id=intent_id, idempotency_key=idempotency_key,
+            should_execute=True, message_authorized=decision.message_authorized,
+        )
 
     def apply_strategist_failure(self, cmd: StrategistFailureCommand) -> ApplyResult:
         work = self._live_claim(cmd.work_id, cmd.claim_token, cmd.claim_version)
@@ -395,6 +560,7 @@ class InMemoryLedger:
         # retry budget exhausted -> deterministic terminal escalation
         case = self._cases[cmd.case_id]
         case.state = CaseState.ESCALATED
+        case.attribution = Attribution.UNRECOVERED.value
         case.version += 1
         self._append(
             cmd.now,
@@ -421,11 +587,16 @@ class InMemoryLedger:
                 "type": "payment.captured",
                 "payment_id": cmd.payment_id,
                 "amount_minor": cmd.amount_minor,
+                "evidence_mode": cmd.evidence_mode,
             },
         )
         # Atomically reject a case that moved on or went terminal since the
         # engine observed it, BEFORE any recovery is counted. Version first: a
-        # racing captured event that already finalized bumped it.
+        # racing captured event that already finalized bumped it. State is
+        # checked independently, not merely inferred from the version match -
+        # the known guard gap this closes: a stale expected_state must reject
+        # finalization on its own, even if some future code path ever bumped
+        # version without changing state (or vice versa).
         if case.version != cmd.expected_version:
             self._append(
                 cmd.now,
@@ -437,6 +608,17 @@ class InMemoryLedger:
                  "actual_version": case.version},
             )
             return ApplyResult(ok=False, reason="stale_case_version")
+        if case.state.value != cmd.expected_state:
+            self._append(
+                cmd.now,
+                case.case_id,
+                AUDIT_POLICY_DECISION,
+                {"outcome": PolicyOutcome.BLOCK.value,
+                 "reason_code": "stale_case_state",
+                 "expected_state": cmd.expected_state,
+                 "actual_state": case.state.value},
+            )
+            return ApplyResult(ok=False, reason="stale_case_state")
         if case.state.value in TERMINAL_STATES:
             self._append(
                 cmd.now,
@@ -490,6 +672,18 @@ class InMemoryLedger:
         if not case.counted:
             self._recovered_minor += cmd.amount_minor
             case.counted = True
+        # Attribution is a deterministic fact about THIS payment, never a
+        # strategist opinion: uniquely correlated to an authorized recovery
+        # link -> hermes_assisted; otherwise a normal provider-owned capture
+        # (retry or original attempt) -> provider_self_recovered. Never
+        # implies the link settled or reactivated the original subscription -
+        # both remain the SAME case/obligation; only the collection path differs.
+        attribution = (
+            Attribution.HERMES_ASSISTED.value
+            if cmd.payment_id in case.link_references
+            else Attribution.PROVIDER_SELF_RECOVERED.value
+        )
+        case.attribution = attribution
         case.state = CaseState.RECOVERED
         case.linked_payment_id = cmd.payment_id
         case.version += 1
@@ -497,9 +691,44 @@ class InMemoryLedger:
             cmd.now,
             case.case_id,
             AUDIT_TERMINAL_TRANSITION,
-            {"state": CaseState.RECOVERED.value, "recovered_minor": cmd.amount_minor},
+            {
+                "state": CaseState.RECOVERED.value,
+                "recovered_minor": cmd.amount_minor,
+                "attribution": attribution,
+            },
         )
         return ApplyResult(ok=True, scheduled=False, terminal=True)
+
+    def apply_action_outcome(self, cmd: ActionIntentOutcomeCommand) -> ApplyResult:
+        """Record the fake executor's result for an already-pending intent.
+        Idempotent: an ``executed`` intent replayed with the same
+        ``intent_id`` is a silent no-op - the reference, link correlation,
+        and message counters are never applied twice.
+        """
+        intent = self._action_intents.get(cmd.intent_id)
+        if intent is None or intent.case_id != cmd.case_id:
+            return ApplyResult(ok=False, reason="unknown_intent")
+        if intent.status == "executed":
+            return ApplyResult(ok=True, reason="already_executed")
+        intent.status = "executed"
+        intent.reference = cmd.reference
+        intent.message_sent = cmd.message_sent
+        case = self._cases[intent.case_id]
+        case.link_references = case.link_references | {cmd.reference}
+        if cmd.message_sent:
+            case.messages_sent += 1
+            case.last_contact_time = cmd.now
+        case.version += 1
+        self._append(
+            cmd.now, case.case_id, AUDIT_ACTION_OUTCOME,
+            {
+                "intent_id": intent.intent_id,
+                "action": intent.action,
+                "reference": cmd.reference,
+                "message_sent": cmd.message_sent,
+            },
+        )
+        return ApplyResult(ok=True, terminal=False)
 
     # -- internals -------------------------------------------------
 
