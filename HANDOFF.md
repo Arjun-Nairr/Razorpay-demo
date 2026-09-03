@@ -111,8 +111,9 @@ the domain foundation.
 - Docs commit: `d9ae884` (`docs: reconcile Hermes recovery architecture` -
   the working-tree documentation reconciliation already present when this
   iteration started; reviewed, preserved verbatim, committed first).
-- Implementation commit: `807b3a1`
-  (`feat(engine): Case 3 insufficient-funds adaptation and attribution slice`).
+- Implementation commit: `adc69ff`
+  (`feat(engine): Case 3 insufficient-funds adaptation and attribution slice`,
+  includes this handoff). Handoff commit: `this commit`.
 - `origin` unchanged; branch pushed with upstream set
   (`git push -u origin feat/case-3-adaptation`).
 - No dependencies added. `RULES.md`/schema/dashboard/FastAPI/Neon/Hermes/
@@ -751,7 +752,7 @@ only a redacted `.env.example` when implementation begins.
 
 ## Exact next action
 
-Case 3 is done (see Iteration 05 below). Codex reviews commit `807b3a1` on
+Case 3 is done (see Iteration 05 below). Codex reviews commit `adc69ff` on
 `feat/case-3-adaptation` (diff `main..feat/case-3-adaptation`), then issues
 the timeboxed Hermes runtime spike prompt (`IMPLEMENTATION_SPEC.md` slice 2):
 pin one Hermes commit, prove an isolated Gemini invocation behind the
