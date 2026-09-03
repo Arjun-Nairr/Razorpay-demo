@@ -40,10 +40,134 @@ requirements in `PROJECT_BRIEF.md`.
   expected-state capture guard is closed, the wait -> failed-retry -> changed-
   strategy -> recovery-link -> `hermes_assisted` path is proven end to end
   through `receive`/`run`/`inspect`, and Case 1's 36-test suite remains green.
-- Status: Case 3 adaptation-and-attribution slice complete; the Hermes/Gemini
-  runtime spike (`IMPLEMENTATION_SPEC.md` slice 2) is the next isolated piece
-  of work, timeboxed so dependency risk cannot destabilize the domain
-  foundation.
+- Status: Runtime spike (`IMPLEMENTATION_SPEC.md` slice 2) complete on
+  `feat/hermes-runtime-spike`. **Fallback path shipped**: a direct
+  google-genai (Gemini 3.7 Flash) `HermesStrategist` behind the existing
+  `Strategist` protocol, offline-tested; the Hermes-Agent library path was
+  not taken (Windows `pip`/`git` long-path failure on the pinned commit).
+  Next: the user runs `scripts/hermes_smoke.py` with a real key, then Codex
+  reviews, then slice 3 (FastAPI signed simulated ingress).
+
+## Iteration 06 — Runtime spike: isolated Gemini strategist (fallback path)
+
+- Branch: `feat/hermes-runtime-spike` off `feat/case-3-adaptation` HEAD
+  `c6a4f23`. Pushed with upstream set. Never force-pushed.
+- **Path shipped: FALLBACK (direct google-genai).** The primary Hermes-Agent
+  path was triggered out within its ~55-min budget (~15 min in):
+  `pip install "hermes-agent @ git+https://github.com/NousResearch/hermes-agent@<SHA>"`
+  fails on this Windows machine - pip's internal `git clone` cannot pass
+  `core.longpaths=true`, and the repo's `website/i18n/...` docs tree exceeds
+  `MAX_PATH` (checkout aborts with "Filename too long"). A command-scoped
+  `git -c core.longpaths=true clone --depth 1 --branch v2026.8.31` *does*
+  work, but a plain `pip install` (what the pinned-URL contract needs) does
+  not, and forcing it needs a persistent global `git config` change plus
+  OS-level long-path support. Per the slice-2 prompt's sanctioned fallback,
+  shipped the smallest direct google-genai adapter instead, inheriting the
+  full contract (schema validation, timeout, <=1 repair, same raised types).
+- Pinned SHA recorded for a future Hermes-Agent retry: tag `v2026.8.31`
+  **commit** `29112bef099274229cadff79cdff7bf7b99c4b77` (the annotated-tag
+  object is `6e8f8418e6378eb2617e4de074e13dedd091b8af`, which is *not* a
+  commit - do not put that in a `git+...@` URL). `hermes-agent` version at
+  that tag is `0.21.0`, `requires-python >=3.11,<3.14`.
+- No dependency added to default/`dev`. New optional extra `[gemini]`
+  (`google-genai>=1,<3`) - named `gemini`, not `hermes`, since the Hermes
+  path did not ship; deviation from deliverable 1's `hermes` key, recorded
+  here.
+
+### Changed files (exactly these + this handoff)
+
+- `pyproject.toml` - new `[project.optional-dependencies] gemini` extra;
+  comment block records the Hermes-Agent pin + Windows caveat for a retry.
+- `src/hermes/hermes_strategist.py` - **new**, additive. `HermesStrategist`
+  implements `Strategist.propose`. `google.genai` is imported lazily inside
+  `_build_real_transport`, so offline tests need no SDK. `parse_proposal`
+  does strict *structural* JSON validation (shape/keys/types/enum/range);
+  content rules (URL/currency/provider-id) stay with the engine's
+  `_validate_proposal`. `_call` runs each model call in a one-worker
+  `ThreadPoolExecutor` under `timeout_s` (default 60, configurable) and
+  raises `TimeoutError`. Invalid first reply -> exactly one repair call
+  (carrying the validation error) -> still invalid -> `InvalidProposal`.
+  `StrategistRunMeta` (contained; not wired to the ledger) holds model,
+  `prompt_version`, `latency_ms`, `repair_used`, `validation_result`,
+  bounded `raw_response`, `usage`; `cost_usd` is `None` (Gemini API returns
+  no per-call cost). `ISOLATION_PROFILE` records the switch settings a
+  real-Hermes swap must reproduce. Model default `gemini-3.7-flash`.
+- `tests/test_hermes_strategist.py` - **new**, 17 offline tests, stub
+  transport, zero network / zero key: valid JSON -> typed proposal;
+  6 structural-invalid inputs rejected; malformed -> exactly one repair
+  then `InvalidProposal`; repair-succeeds -> typed proposal; zero repair
+  budget -> raises on first; blank `message_intent` -> `None`; over-budget
+  call -> `TimeoutError`; `ISOLATION_PROFILE` asserted; prompt excludes
+  case/obligation id + amount; offline path needs no SDK; not wired into
+  `engine.py`; real transport with no `GEMINI_API_KEY` -> `RuntimeError`.
+- `scripts/hermes_smoke.py` - **new**. Builds a Case 3 insufficient-funds
+  snapshot, runs one real `HermesStrategist` decision, prints run metadata
+  + proposal as JSON. Reads `GEMINI_API_KEY` from env, never prints it.
+  Exit 0 valid / 1 failed (type printed) / 2 no key.
+- `.env.example` - **new**. Redacted `GEMINI_API_KEY=` only.
+- `.gitignore` - adds `.hermes_profile/`, `.hermes_home/`.
+
+### Deviations from `HERMES_RAZORPAY_RESEARCH.md` / the prompt
+
+- **Library not used.** Direct google-genai instead of the Hermes `AIAgent`
+  harness (environment blocker above). The research doc explicitly sanctions
+  this: "If the spike fails within its timebox, retain the `Strategist` seam
+  and use the smallest verified Gemini adapter necessary."
+- **Validation is stdlib, not Pydantic.** Kept the offline suite installable
+  with zero packages in any environment and consistent with the engine's
+  hand-rolled `_validate_proposal`. Structural coverage is equivalent.
+- **Isolation is a declared contract, not live config.** There is no
+  `AIAgent` to pass `skip_memory` / `enabled_toolsets` to; a bare
+  google-genai client has none of those capabilities. `ISOLATION_PROFILE`
+  + its test is the checklist a real-Hermes swap must honour.
+- **Metadata contained.** `StrategistRunMeta` is exposed on the strategist,
+  not written into `AI_PROPOSAL` audit rows - `types.py` / `engine.py` /
+  `adapters.py` / the ledger are untouched, as required.
+- Optional-extra key is `gemini`, not `hermes` (see above).
+
+### Verification
+
+- `python -m pytest -q` -> **74 passed** (57 unchanged: 36 Case 1 + 21
+  Case 3, both suites byte-for-byte untouched; + 17 new offline spike tests).
+- `python -m compileall -q src tests scripts` -> clean.
+- `git diff --check` -> clean (only CRLF-on-checkout warnings).
+- Staged diff scanned: exactly the six files above + `HANDOFF.md`; no
+  `types/engine/adapters/protocols.py`, no doc except this file; no secret
+  literals (`grep` for `AIza…` / key / secret / PEM patterns - none).
+- Real Gemini round-trip: **NOT run here** (no key in this environment, by
+  design). Pending: user runs `pip install ".[gemini]"`, sets
+  `GEMINI_API_KEY`, runs `python scripts/hermes_smoke.py`, pastes the JSON
+  output below.
+
+  ```
+  (paste hermes_smoke.py output here)
+  ```
+
+### Remaining limitations
+
+- The one real model call is unproven until the user runs the smoke script;
+  the real-transport shape (`client.models.generate_content`, `resp.text`,
+  `resp.usage_metadata`) was verified against `google-genai 2.22.0` in an
+  isolated venv but not exercised end to end.
+- The timeout worker thread cannot be force-killed; on timeout it finishes
+  in the background and its result is discarded (fine for one short call).
+- `HermesStrategist` is not wired into `RecoveryEngine`; wiring + threading
+  `StrategistRunMeta` into `AI_PROPOSAL` audit rows is a later task.
+- If Hermes-Agent is still wanted, its Windows install needs
+  `git config --global core.longpaths true` (+ OS long-path support) or a
+  pre-clone-then-`pip install ./dir` flow; revisit only if the library's
+  skills/curator features are actually needed for the demo.
+
+### Exact next action
+
+1. User: `pip install ".[gemini]"`, set `GEMINI_API_KEY`, run
+   `python scripts/hermes_smoke.py`, paste output into the block above.
+2. Codex: review this iteration (diff `feat/case-3-adaptation..feat/hermes-runtime-spike`)
+   and the smoke output; decide whether the fallback Gemini adapter is
+   sufficient for the demo or a Hermes-Agent retry is warranted.
+3. Then: slice 3 - FastAPI signed simulated ingress (locally signed
+   Razorpay-shaped fixtures, raw-body verification, dedup, engine
+   projections / demo controls).
 
 ## Architecture reconciliation — 2026-09-03
 

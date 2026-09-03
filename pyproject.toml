@@ -11,6 +11,16 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+# Runtime-spike (slice 2) extra. NOT a default dependency: the 57-test suite
+# plus the offline Hermes-strategist tests install nothing from here.
+#
+# Shipped path is direct google-genai (Gemini 3.7 Flash) - the Hermes-Agent
+# library path was not taken; see HANDOFF.md Iteration 06. If Hermes-Agent is
+# retried later, pin the tag v2026.8.31 *commit* (not the annotated-tag object):
+#   hermes-agent @ git+https://github.com/NousResearch/hermes-agent@29112bef099274229cadff79cdff7bf7b99c4b77
+# and note that `pip install` of it fails on Windows without
+# `git config --global core.longpaths true` (MAX_PATH in the repo's docs tree).
+gemini = ["google-genai>=1,<3"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hermes"]

@@ -21,6 +21,10 @@ htmlcov/
 .env.*
 !.env.example
 
+# Hermes runtime-spike: isolated agent profile/home (never committed)
+.hermes_profile/
+.hermes_home/
+
 # Editors / OS
 .vscode/
 .idea/
