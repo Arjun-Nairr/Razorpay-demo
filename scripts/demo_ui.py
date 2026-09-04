@@ -117,17 +117,23 @@ if ss.case_id:
             hc3.metric("Decision time (ms)", h.get("duration_ms") or "-")
             band = h.get("confidence_band") or "-"
             st.caption(f"Model confidence estimate: **{band}** "
-                       f"({h.get('model_confidence')}) — an explicitly *uncalibrated* "
-                       "model self-estimate, not a probability of correctness; it never "
-                       "grants a permission.")
+                       f"({h.get('model_confidence')}) — "
+                       + (h.get("confidence_basis")
+                          or "an explicitly uncalibrated model self-estimate; not a "
+                             "probability of correctness; never grants a permission."))
             if h.get("evidence_requests"):
-                st.write("**Evidence the model requested**")
+                st.write("**Evidence the model requested (with reason)**")
                 st.table(h["evidence_requests"])
             if h.get("evidence_returned"):
                 st.write("**Evidence returned (source / coverage)**")
                 st.table(h["evidence_returned"])
-            st.write(f"**Unresolved uncertainty:** {h.get('unresolved_uncertainty') or 'none stated'}")
-            st.write(f"**Stop reason:** {h.get('stop_reason') or '-'}  ·  "
+            st.write(f"**Decision action:** {h.get('decision_action') or '-'}  ·  "
+                     f"**validation:** {h.get('validation_result') or '-'}  ·  "
+                     f"**failure:** {h.get('failure_category') or 'none'}")
+            st.write(f"**Model iterations:** {h.get('model_iterations_used')}"
+                     f"/{h.get('model_iterations_budget')}  ·  "
+                     f"**tool calls:** {h.get('tool_calls_used')}"
+                     f"/{h.get('tool_calls_budget')}  ·  "
                      f"**tokens:** {h.get('tokens') or 'n/a'}")
 
         if proposals:

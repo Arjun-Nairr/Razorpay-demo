@@ -9,6 +9,16 @@ This file must not import anything from the ``hermes`` project package - only
 the standard library and the Hermes runtime (``run_agent`` / ``tools`` /
 ``toolsets``), which is only importable under the Hermes interpreter.
 
+Contract with the parent:
+  * exit 0  + ``ok:true``  -> a validated proposal
+  * exit 1  + ``ok:false`` -> a bounded, categorised failure (still safe to read)
+  * any other exit code    -> abnormal; the parent rejects it even if stdout
+    happens to contain a success payload.
+
+Output is bounded and allowlisted: fixed failure CATEGORIES only, never a raw
+exception message, stderr slice, or transcript. A synthetic secret in the
+model output or an exception can never reach the audit or the console.
+
 Isolation applied here (state, not an OS sandbox):
   * HERMES_HOME is a project-local throwaway dir (set by the parent).
   * skip_context_files / skip_memory / skip_background_review.
@@ -23,7 +33,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 import threading
 import time
@@ -32,11 +41,29 @@ RESULT_SENTINEL = "HERMES_CHILD_RESULT "
 TOOL_NAMES = ("get_payment_retry_facts", "get_payment_history", "get_recovery_actions")
 REQUIRED_KEYS = ("action", "diagnosis", "rationale", "confidence",
                  "proposed_wait_hours", "message_intent")
-_VALID_ACTIONS = {
+_ALL_ACTIONS = {
     "WAIT_FOR_PROVIDER_RETRY", "SEND_REMINDER", "REQUEST_PAYMENT_METHOD_UPDATE",
     "CREATE_RECOVERY_LINK", "RECOMMEND_STRUCTURAL_CHANGE", "TAKE_NO_ACTION",
     "STOP", "ESCALATE",
 }
+# Only the actions deterministic policy can actually authorize/execute today.
+# STOP is deliberately NOT offered as executable (policy would only BLOCK it).
+_SUPPORTED_ACTIONS = {
+    "WAIT_FOR_PROVIDER_RETRY", "CREATE_RECOVERY_LINK", "SEND_REMINDER", "ESCALATE",
+}
+MODEL_ITERATION_BUDGET = 8   # shared across the initial reasoning AND the one repair
+TOOL_CALL_BUDGET = 6         # shared across the initial reasoning AND the one repair
+
+# Fixed, allowlisted failure categories (no free-form strings ever leave here).
+_FAIL_TOOL_EXPOSURE = "tool_exposure_mismatch"
+_FAIL_SCHEMA = "schema_invalid_after_repair"
+_FAIL_ITER_BUDGET = "model_iteration_budget_exhausted"
+_FAIL_CHILD_EXCEPTION = "child_exception"
+
+# Bounded validation reason slugs surfaced via ``validation_result`` (never a
+# raw message): not_json, not_object, keys_mismatch, unknown_action,
+# unsupported_action, confidence_type, confidence_range, wait_type,
+# wait_nonpositive, text_field, message_not_approved, message_type.
 
 
 def _emit(payload: dict) -> None:
@@ -60,30 +87,31 @@ class _Evidence:
     """Case-bound tool backend over an immutable bundle prepared by the parent.
 
     Accepts no case id, SQL, URL, path, or executable input. ``get_payment_history``
-    takes only 6 or 12 months, needs a short uncertainty reason, allows at most
-    two expanded-history requests, and rejects duplicate / no-progress repeats.
+    is a SINGLE optional expansion straight to twelve months, needs a short
+    uncertainty reason, and is allowed at most once per decision (including
+    during repair). Unavailable / partial history reports its ACTUAL coverage.
     """
 
     def __init__(self, bundle: dict):
         self._retry = bundle["retry_facts"]
-        self._actions = bundle["recovery_actions"]
-        self._hist12 = bundle["history_12m"]  # {"available": bool, "source", "rows":[...12 oldest->newest]}
+        self._prior_activity = bundle.get("prior_case_activity", [])
+        self._allowed_actions = bundle.get("allowed_actions", [])
+        self._hist = bundle["history_12m"]  # {"available", "source", "rows":[...], "coverage_months"}
         self.tool_calls = 0
         self.history_requests: list[dict] = []
         self.evidence_returned: list[dict] = []
 
-    # -- dispatch guard ------------------------------------------------------
     def call(self, name: str, args: dict) -> str:
         self.tool_calls += 1
-        if self.tool_calls > 6:
-            return json.dumps({"error": "tool call budget (6) exhausted"})
+        if self.tool_calls > TOOL_CALL_BUDGET:
+            return json.dumps({"error": "tool_call_budget_exhausted"})
         if name == "get_payment_retry_facts":
             return self._facts()
         if name == "get_recovery_actions":
             return self._recovery_actions()
         if name == "get_payment_history":
             return self._history(args if isinstance(args, dict) else {})
-        return json.dumps({"error": f"unknown tool {name!r}"})
+        return json.dumps({"error": "unknown_tool"})
 
     def _mark(self, tool: str, source: str, coverage: str) -> None:
         self.evidence_returned.append({"tool": tool, "source": source, "coverage": coverage})
@@ -96,94 +124,133 @@ class _Evidence:
         return json.dumps(out)
 
     def _recovery_actions(self) -> str:
-        out = dict(self._actions)
-        out.setdefault("source", "DETERMINISTIC_POLICY_CATALOG")
-        out.setdefault("coverage", "current case")
-        self._mark("get_recovery_actions", out["source"], out["coverage"])
-        return json.dumps(out)
+        # ACTUAL prior actions / policy decisions / outcomes for THIS case,
+        # plus a SEPARATELY labelled catalog of only-policy-supported actions.
+        self._mark("get_recovery_actions", "ENGINE_AUDIT_PROJECTION", "this case, chronological")
+        return json.dumps({
+            "prior_case_activity": {
+                "source": "ENGINE_AUDIT_PROJECTION",
+                "coverage": "this case, chronological (bounded)",
+                "events": self._prior_activity,
+            },
+            "allowed_actions_catalog": {
+                "source": "DETERMINISTIC_POLICY",
+                "note": "only actions deterministic policy can authorize+execute; "
+                        "each still faces final policy validation; confidence never "
+                        "grants permission",
+                "actions": self._allowed_actions,
+            },
+        })
 
     def _history(self, args: dict) -> str:
-        months = args.get("months")
         reason = args.get("reason")
-        if months not in (6, 12):
-            return json.dumps({"error": "months must be exactly 6 or 12"})
-        if not isinstance(reason, str) or not (3 <= len(reason.strip()) <= 200):
-            return json.dumps({"error": "reason must be a short (3-200 char) explanation "
-                                        "of the uncertainty being investigated"})
-        reason = reason.strip()
-        if len(self.history_requests) >= 2:
-            return json.dumps({"error": "at most two expanded-history requests per decision"})
-        for prev in self.history_requests:
-            if prev["months"] == months:
-                return json.dumps({"error": f"already returned {months}-month history; "
-                                            "no-progress / duplicate request rejected"})
-        self.history_requests.append({"months": months, "reason": reason})
-        if not self._hist12.get("available", False):
-            self._mark("get_payment_history", self._hist12.get("source", "SYNTHETIC_MERCHANT_RECORDS"),
-                       f"{months}m requested / UNAVAILABLE")
-            return json.dumps({"available": False, "months_requested": months,
-                               "source": self._hist12.get("source", "SYNTHETIC_MERCHANT_RECORDS"),
-                               "note": "merchant holds no records for this window; not invented"})
-        rows = list(self._hist12.get("rows", []))
-        subset = rows[-months:] if months <= len(rows) else rows
-        self._mark("get_payment_history", self._hist12["source"], f"{months} months (synthetic)")
+        if not isinstance(reason, str) or not (8 <= len(reason.strip()) <= 200):
+            return json.dumps({"error": "reason_required",
+                               "note": "give a short (8-200 char) explanation of the "
+                                       "uncertainty this 12-month lookup could resolve"})
+        if self.history_requests:
+            return json.dumps({"error": "single_expansion_only",
+                               "note": "the twelve-month history was already returned; "
+                                       "no second expansion (including during repair)"})
+        self.history_requests.append({"months": 12, "reason": reason.strip()})
+        avail = bool(self._hist.get("available"))
+        rows = list(self._hist.get("rows", []))
+        actual_months = int(self._hist.get("coverage_months", len(rows)))
+        if not avail or not rows:
+            self._mark("get_payment_history", self._hist.get("source", "SYNTHETIC_MERCHANT_RECORDS"),
+                       "requested 12m / UNAVAILABLE")
+            return json.dumps({
+                "available": False, "requested_months": 12, "actual_coverage_months": 0,
+                "source": self._hist.get("source", "SYNTHETIC_MERCHANT_RECORDS"),
+                "note": "no merchant-held records for this customer/window; not invented",
+            })
+        partial = actual_months < 12
+        self._mark("get_payment_history", self._hist["source"],
+                   f"{actual_months} months{' (PARTIAL)' if partial else ''} (synthetic)")
         return json.dumps({
-            "available": True, "source": self._hist12["source"], "label": "SYNTHETIC",
-            "coverage_months": months, "records": subset,
+            "available": True, "source": self._hist["source"], "label": "SYNTHETIC",
+            "requested_months": 12, "actual_coverage_months": actual_months,
+            "partial": partial, "records": rows,
             "note": "synthetic merchant-held records (due/paid dates, outcomes) for the "
-                    "same demo customer; does not override current provider facts or consent",
+                    "same demo customer; does NOT override current provider facts or consent",
         })
 
 
-def _extract_json_object(text: str):
-    """Return the first top-level JSON object in ``text`` or None."""
-    if not text:
-        return None
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if not m:
-        return None
+def _parse_strict_json_object(text: str):
+    """The final assistant message, stripped, MUST be exactly one JSON object.
+
+    No scanning for a ``{...}`` substring inside prose - a valid-looking blob
+    embedded in an otherwise invalid response is rejected, per contract.
+    """
+    s = (text or "").strip()
+    if not s or s[0] != "{" or s[-1] != "}":
+        return None, "not_json"
     try:
-        obj = json.loads(m.group(0))
-        return obj if isinstance(obj, dict) else None
+        obj = json.loads(s)
     except ValueError:
-        return None
+        return None, "not_json"
+    return (obj, "ok") if isinstance(obj, dict) else (None, "not_object")
 
 
-def _validate(obj) -> tuple[dict | None, str]:
+def _validate(obj, approved_messages: set):
+    """Strict structural validation inside the one-repair boundary. The engine's
+    ``_validate_proposal`` remains the FINAL authority. No silent coercion."""
     if not isinstance(obj, dict):
-        return None, "not an object"
+        return None, "not_object"
     if set(obj) != set(REQUIRED_KEYS):
-        return None, f"keys must be exactly {sorted(REQUIRED_KEYS)}"
-    if obj["action"] not in _VALID_ACTIONS:
-        return None, f"action not recognised: {obj['action']!r}"
-    if not isinstance(obj["confidence"], (int, float)) or not (0.0 <= obj["confidence"] <= 1.0):
-        return None, "confidence must be a number in [0,1]"
-    if not isinstance(obj["proposed_wait_hours"], int) or isinstance(obj["proposed_wait_hours"], bool):
-        return None, "proposed_wait_hours must be an integer"
-    if obj["proposed_wait_hours"] < 0:
-        return None, "proposed_wait_hours must be >= 0"
+        return None, "keys_mismatch"
+    if obj["action"] not in _ALL_ACTIONS:
+        return None, "unknown_action"
+    if obj["action"] not in _SUPPORTED_ACTIONS:
+        return None, "unsupported_action"
+    conf = obj["confidence"]
+    if isinstance(conf, bool) or not isinstance(conf, (int, float)):
+        return None, "confidence_type"
+    if not (0.0 <= float(conf) <= 1.0):
+        return None, "confidence_range"
+    wait = obj["proposed_wait_hours"]
+    if isinstance(wait, bool) or not isinstance(wait, int):
+        return None, "wait_type"
+    if obj["action"] == "WAIT_FOR_PROVIDER_RETRY" and wait < 1:
+        return None, "wait_nonpositive"
+    if wait < 0:
+        return None, "wait_nonpositive"
     for k in ("diagnosis", "rationale"):
         if not isinstance(obj[k], str) or not obj[k].strip():
-            return None, f"{k} must be a non-empty string"
-    if obj["message_intent"] is not None and not isinstance(obj["message_intent"], str):
-        return None, "message_intent must be a string or null"
+            return None, "text_field"
+    mi = obj["message_intent"]
+    if mi is not None and not isinstance(mi, str):
+        return None, "message_type"
+    if mi is not None and mi not in approved_messages:
+        return None, "message_not_approved"
     return obj, "valid"
 
 
-def _system_prompt(skill_text: str, ctx: dict) -> str:
+def _system_prompt(skill_text: str, ctx: dict, approved_messages: list) -> str:
     return (
         skill_text.strip()
-        + "\n\n--- THIS CASE (initial context; limited on purpose) ---\n"
+        + "\n\n--- THIS CASE (initial context; deliberately limited) ---\n"
         + json.dumps(ctx, indent=2)
-        + "\n\nYou may call get_payment_retry_facts, get_recovery_actions, and "
-          "(at most twice) get_payment_history to gather more evidence before "
-          "deciding. Current provider retry facts and consent always win over "
-          "history. When evidence is inadequate, return the STOP or ESCALATE "
-          "action rather than guessing.\n"
-          "Reply with ONE JSON object and nothing else, with EXACTLY these keys: "
+        + "\n\nTools you may call (only when the answer would change your proposal):\n"
+          "  get_payment_retry_facts()  - authoritative current provider retry state\n"
+          "  get_recovery_actions()     - this case's prior activity + the actions "
+          "policy can actually execute\n"
+          "  get_payment_history(reason) - ONE optional expansion straight to twelve "
+          "months of synthetic history; 'reason' explains the uncertainty it resolves; "
+          "callable at most once (including during any correction).\n"
+          "Deciding from the initial context with no lookups is fine.\n\n"
+          "Approved message_intent values (use one VERBATIM or null - no other text):\n"
+        + "\n".join(f"  - {json.dumps(m)}" for m in approved_messages)
+        + "\n\nReturn EXACTLY one JSON object, no prose, keys exactly: "
         + ", ".join(REQUIRED_KEYS)
-        + ". 'confidence' is your own uncalibrated estimate in [0,1]; it never "
-          "grants permission. Put any remaining doubt in 'rationale'."
+        + ".\n- action must be one of: " + ", ".join(sorted(_SUPPORTED_ACTIONS))
+        + " (return ESCALATE when evidence is inadequate or no supported action "
+          "applies - do NOT guess).\n"
+          "- proposed_wait_hours: integer; >= 1 for WAIT_FOR_PROVIDER_RETRY, else 0.\n"
+          "- confidence: your own UNCALIBRATED estimate in [0,1], justified by "
+          "completeness, freshness/reliability, consistency and relevance of the "
+          "evidence - not record count. It never grants a permission.\n"
+          "- rationale: your reasoning, including any doubt that remains."
     )
 
 
@@ -191,22 +258,49 @@ def main() -> int:
     started = time.monotonic()
     job = json.loads(sys.stdin.read())
     revision = os.environ.get("HERMES_EXPECTED_REVISION", "")
-    audit: dict = {
+    approved_messages = list(job.get("approved_messages", []))
+    approved_set = set(approved_messages)
+
+    audit = {
         "runtime_revision": revision,
-        "model": None, "provider": None,
-        "duration_ms": None, "iterations_used": None, "tool_calls_used": 0,
-        "tokens": None, "evidence_requests": [], "evidence_returned": [],
+        "provider": None, "provider_model": None,
+        "duration_ms": None,
+        "model_iterations_used": None, "model_iterations_budget": MODEL_ITERATION_BUDGET,
+        "tool_calls_used": 0, "tool_calls_budget": TOOL_CALL_BUDGET,
+        "tokens": None,
+        "evidence_requests": [], "evidence_returned": [],
         "model_confidence": None, "confidence_band": None,
-        "unresolved_uncertainty": None, "stop_reason": "error",
-        "repair_used": False, "validation_result": "not_reached",
+        "confidence_basis": "uncalibrated model self-estimate; not a probability of "
+                            "correctness; never grants a permission",
+        "decision_action": None,
+        "repair_used": False,
+        "validation_result": "not_reached",
+        "failure_category": None, "failure_stage": None,
     }
 
-    # hard self-deadline in case the parent's SIGTERM is slow on Windows
-    threading.Timer(
-        max(5.0, float(job.get("deadline_s", 90)) - 4.0),
-        lambda: os._exit(9),
-    ).start()
+    def _fail(category: str, stage: str, code: int = 1) -> int:
+        audit["failure_category"] = category
+        audit["failure_stage"] = stage
+        if audit["duration_ms"] is None:
+            audit["duration_ms"] = round((time.monotonic() - started) * 1000)
+        _emit({"ok": False, "audit": audit})
+        return code
 
+    # Hard self-deadline: daemon so a clean exit never waits on it; cancelled in
+    # `finally` on every normal path. The parent's subprocess timeout + reap is
+    # the real deadline; this only covers a wedged run on a slow SIGTERM host.
+    watchdog = threading.Timer(
+        max(5.0, float(job.get("deadline_s", 90)) - 4.0), lambda: os._exit(9)
+    )
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        return _run(job, audit, approved_messages, approved_set, started, _fail)
+    finally:
+        watchdog.cancel()
+
+
+def _run(job, audit, approved_messages, approved_set, started, _fail) -> int:
     ev = _Evidence(job["evidence_bundle"])
     calls: list[dict] = []
 
@@ -224,27 +318,28 @@ def main() -> int:
                            "required": list(props), "additionalProperties": False}}}
 
     def _h(tool):
-        # Hermes calls handlers as handler(parsed_args_dict, task_id=..., **ctx);
-        # bind only the args dict, ignore runtime kwargs.
         def _handler(args=None, **_ctx):
             return ev.call(tool, args if isinstance(args, dict) else {})
         return _handler
 
     registry.register("get_payment_retry_facts", "revenue_recovery",
                       _schema("get_payment_retry_facts",
-                              "Current provider retry eligibility and evidence for THIS case. No arguments."),
+                              "Authoritative current provider retry eligibility + evidence "
+                              "for THIS case. No arguments."),
                       _h("get_payment_retry_facts"), override=True)
     registry.register("get_recovery_actions", "revenue_recovery",
                       _schema("get_recovery_actions",
-                              "The deterministic catalog of recovery actions permitted for THIS case. No arguments."),
+                              "THIS case's actual prior actions, policy decisions and "
+                              "outcomes, plus the separately-labelled catalog of actions "
+                              "deterministic policy can execute. No arguments."),
                       _h("get_recovery_actions"), override=True)
     registry.register("get_payment_history", "revenue_recovery",
                       _schema("get_payment_history",
-                              "Expanded synthetic merchant payment history for the same customer. "
-                              "months must be 6 or 12; reason is a short note on the uncertainty "
-                              "you are investigating. At most two calls; no duplicate windows.",
-                              {"months": {"type": "integer", "enum": [6, 12]},
-                               "reason": {"type": "string", "maxLength": 200}}),
+                              "ONE optional expansion straight to twelve months of "
+                              "synthetic merchant history for the same customer. 'reason' "
+                              "is a short note on the uncertainty it could resolve. "
+                              "Callable at most once per decision (including any repair).",
+                              {"reason": {"type": "string", "minLength": 8, "maxLength": 200}}),
                       _h("get_payment_history"), override=True)
     create_custom_toolset("revenue_recovery", "Case-scoped Case 3 evidence tools",
                           tools=list(TOOL_NAMES))
@@ -252,96 +347,115 @@ def main() -> int:
     from run_agent import AIAgent
 
     ctx = job["evidence_bundle"]["initial_context"]
-    sys_prompt = _system_prompt(job["skill_text"], ctx)
+    sys_prompt = _system_prompt(job["skill_text"], ctx, approved_messages)
 
     if job["mode"] == "mock":
         provider, model = "openai-compat", job["mock"]["model"]
-        kw = dict(api_key="offline-harness", base_url=job["mock"]["base_url"],
-                  provider=provider, model=model)
-    else:  # native Gemini
+        base_kw = dict(api_key="offline-harness", base_url=job["mock"]["base_url"],
+                       provider=provider, model=model)
+    else:
         provider, model = "gemini", job["gemini"]["model"]
-        kw = dict(provider=provider, model=model)  # GEMINI_API_KEY read from env by the runtime
-    audit["provider"], audit["model"] = provider, model
+        base_kw = dict(provider=provider, model=model)
+    audit["provider"], audit["provider_model"] = provider, model
 
-    agent = AIAgent(
-        max_iterations=int(job.get("max_iterations", 8)),
-        enabled_toolsets=["revenue_recovery"],
-        quiet_mode=True, skip_context_files=True, skip_memory=True,
-        skip_background_review=True, save_trajectories=False, platform="cli",
-        tool_start_callback=_tool_start,
-        ephemeral_system_prompt=sys_prompt,
-        **kw,
-    )
+    def _make_agent(max_iter: int):
+        return AIAgent(
+            max_iterations=max_iter, enabled_toolsets=["revenue_recovery"],
+            quiet_mode=True, skip_context_files=True, skip_memory=True,
+            skip_background_review=True, save_trajectories=False, platform="cli",
+            tool_start_callback=_tool_start, ephemeral_system_prompt=sys_prompt,
+            **base_kw,
+        )
+
+    agent = _make_agent(MODEL_ITERATION_BUDGET)
     exposed = sorted(getattr(agent, "valid_tool_names", set()) or set())
     if exposed != sorted(TOOL_NAMES):
-        audit["stop_reason"] = "tool_exposure_mismatch"
-        audit["duration_ms"] = round((time.monotonic() - started) * 1000)
-        _emit({"ok": False, "error": f"exposed tools {exposed} != {sorted(TOOL_NAMES)}", "audit": audit})
-        return 1
+        return _fail(_FAIL_TOOL_EXPOSURE, "agent_init")
 
-    user = "Decide the single next Case 3 recovery step now. Return only the JSON object."
+    def _iterations(result, msgs) -> int:
+        """TOTAL model iterations so far. ``msgs`` after the repair call is the
+        FULL conversation (initial + repair), so this stays absolute, never
+        double-counts, and honours the runtime's own counter when present."""
+        for k in ("iterations", "iteration_count", "num_iterations"):
+            v = result.get(k)
+            if isinstance(v, int) and v > 0:
+                return v
+        return sum(1 for m in msgs if isinstance(m, dict) and m.get("role") == "assistant") or 1
 
-    def _run(msg, history):
-        return agent.run_conversation(msg, conversation_history=history or [], task_id="case3")
+    def _final_text(msgs) -> str:
+        return next((m.get("content") for m in reversed(msgs)
+                     if isinstance(m, dict) and m.get("role") == "assistant" and m.get("content")),
+                    "") or ""
 
-    result = _run(user, [])
+    # -- initial reasoning ------------------------------------------------
+    result = agent.run_conversation(
+        "Decide the single next Case 3 recovery step now. Return only the JSON object.",
+        conversation_history=[], task_id="case3",
+    )
     msgs = result.get("messages", []) or []
-    final = next((m.get("content") for m in reversed(msgs)
-                  if isinstance(m, dict) and m.get("role") == "assistant" and m.get("content")), "") or ""
-    obj = _extract_json_object(final)
-    proposal, verdict = _validate(obj)
+    used = _iterations(result, msgs)
+    obj, why = _parse_strict_json_object(_final_text(msgs))
+    proposal, verdict = (None, why) if obj is None else _validate(obj, approved_set)
 
+    # -- single repair, sharing the SAME iteration + tool budgets --------
     if proposal is None:
         audit["repair_used"] = True
-        repair_user = ("Your previous reply was not a single valid JSON object with exactly "
-                       f"the keys {list(REQUIRED_KEYS)} ({verdict}). Reply again with ONLY "
-                       "that JSON object, no prose.")
-        result = _run(repair_user, msgs)
+        remaining = MODEL_ITERATION_BUDGET - used
+        if remaining < 1:
+            audit["validation_result"] = f"invalid:{verdict}"
+            audit["model_iterations_used"] = used
+            _finish_audit(audit, ev, calls, started, result, msgs, _iterations)
+            return _fail(_FAIL_ITER_BUDGET, "repair")
+        repair_agent = _make_agent(remaining)
+        result = repair_agent.run_conversation(
+            "Your previous reply was not a single valid JSON object matching the "
+            f"contract ({verdict}). Reply again with ONLY that JSON object, no prose, "
+            "keys exactly " + ", ".join(REQUIRED_KEYS) + ".",
+            conversation_history=msgs, task_id="case3",
+        )
         msgs = result.get("messages", []) or []
-        final = next((m.get("content") for m in reversed(msgs)
-                      if isinstance(m, dict) and m.get("role") == "assistant" and m.get("content")), "") or ""
-        obj = _extract_json_object(final)
-        proposal, verdict = _validate(obj)
+        used = max(used + 1, _iterations(result, msgs))  # absolute total, never below prior
+        obj, why = _parse_strict_json_object(_final_text(msgs))
+        proposal, verdict = (None, why) if obj is None else _validate(obj, approved_set)
         audit["validation_result"] = "repaired" if proposal is not None else f"invalid:{verdict}"
     else:
         audit["validation_result"] = "valid"
 
-    # usage / iterations if the runtime surfaced them
-    usage = result.get("usage") or result.get("token_usage")
-    if isinstance(usage, dict):
-        audit["tokens"] = {k: usage.get(k) for k in ("prompt_tokens", "completion_tokens", "total_tokens")
-                           if k in usage} or usage
-    audit["iterations_used"] = result.get("iterations") or result.get("iteration_count")
-    audit["tool_calls_used"] = ev.tool_calls
-    audit["evidence_requests"] = [
-        {"tool": c["tool"], **({"months": c["args"].get("months"),
-                                "reason": (c["args"].get("reason") or "")[:200]}
-                               if c["tool"] == "get_payment_history" else {})}
-        for c in calls
-    ]
-    audit["evidence_returned"] = ev.evidence_returned
-    audit["duration_ms"] = round((time.monotonic() - started) * 1000)
+    audit["model_iterations_used"] = used
+    _finish_audit(audit, ev, calls, started, result, msgs, _iterations)
 
     if proposal is None:
-        audit["stop_reason"] = "schema_repair_failed"
-        _emit({"ok": False, "error": f"no valid proposal ({verdict})", "audit": audit})
-        return 1
+        return _fail(_FAIL_SCHEMA, "repair" if audit["repair_used"] else "initial")
 
     audit["model_confidence"] = proposal["confidence"]
     audit["confidence_band"] = _band(proposal["confidence"])
-    audit["unresolved_uncertainty"] = (proposal.get("rationale") or "").strip()[:400] or "none stated"
-    audit["stop_reason"] = (
-        "iteration_limit" if result.get("partial") else
-        f"{proposal['action'].lower()}_proposed"
-    )
+    audit["decision_action"] = proposal["action"]
     _emit({"ok": True, "proposal": proposal, "audit": audit})
     return 0
+
+
+def _finish_audit(audit, ev, calls, started, result, msgs, _iterations) -> None:
+    usage = result.get("usage") or result.get("token_usage")
+    if isinstance(usage, dict):
+        audit["tokens"] = {k: usage[k] for k in
+                           ("prompt_tokens", "completion_tokens", "total_tokens")
+                           if k in usage} or None
+    audit["tool_calls_used"] = ev.tool_calls
+    audit["evidence_requests"] = [
+        {"tool": c["tool"], **({"reason": (c["args"].get("reason") or "")[:200]}
+                               if c["tool"] == "get_payment_history" else {})}
+        for c in calls
+    ][:8]
+    audit["evidence_returned"] = ev.evidence_returned[:8]
+    audit["duration_ms"] = round((time.monotonic() - started) * 1000)
 
 
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except Exception as exc:  # last-resort: never hang the parent
-        _emit({"ok": False, "error": f"{type(exc).__name__}: {exc}",
-               "audit": {"stop_reason": "child_exception"}})
+    except SystemExit:
+        raise
+    except BaseException:  # never a raw message; never hang the parent
+        _emit({"ok": False, "audit": {"failure_category": _FAIL_CHILD_EXCEPTION,
+                                      "failure_stage": "unhandled"}})
         sys.exit(1)

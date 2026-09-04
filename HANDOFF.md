@@ -40,40 +40,69 @@ requirements in `PROJECT_BRIEF.md`.
   expected-state capture guard is closed, the wait -> failed-retry -> changed-
   strategy -> recovery-link -> `hermes_assisted` path is proven end to end
   through `receive`/`run`/`inspect`, and Case 1's 36-test suite remains green.
-- Status: **Iteration 10 - isolated REAL Nous Hermes runtime for one Case 3
-  decision** on `feat/isolated-hermes-agent` (branched from `f9b640e`). A new
-  explicit `hermes` execution mode drives the actual `run_agent.AIAgent` (Hermes
-  checkout `e02d1e41`, pkg 0.20.4, Python 3.11.15) in a subprocess run by the
-  installed Hermes interpreter, in a project-local gitignored `HERMES_HOME`
-  (state isolation, not an OS sandbox): tool-search bridge off, positive
-  one-toolset allowlist, `skip_context_files` / `skip_memory` /
-  `skip_background_review`, no terminal/browser/file/delegation/cron/code-exec
-  tools, MCP + plugins + skill discovery inert. Exactly three case-scoped read
-  tools backed by a bounded immutable evidence bundle:
-  `get_payment_retry_facts`, `get_payment_history(6|12, reason)` (>=3-char
-  reason, <=2 requests, no duplicate/no-progress repeats, unavailable ->
-  "unavailable" not invented), `get_recovery_actions`. The agent gets limited
-  initial context (failure + policy limits + 3 months history), chooses whether
-  and which tools to call, and returns one JSON proposal that the deterministic
-  engine still validates and authorizes. Bounds: 6 tool executions, 8 model
-  iterations, one 90 s subprocess deadline (timed-out child reaped), <=1 schema
-  repair (budget not reset), one in-flight decision. Bounded redacted audit
-  metadata (`AI_MODEL_RUN.detail.hermes`): runtime revision, evidence requests
-  + reasons, returned source/coverage, uncalibrated confidence band + estimate,
-  unresolved uncertainty, stop reason, duration, tokens - short explanations
-  and tool evidence only, no transcripts/chain-of-thought. Confidence is
-  displayed low/medium/high as an explicitly uncalibrated model estimate; it
-  never grants a permission and is never required to rise after more data.
-  **No silent fallback to direct Gemini** (`live` mode keeps the direct-Gemini
-  adapter for comparison/tests; `hermes` refuses to launch on a Hermes revision
-  mismatch). FastAPI, Neon, attribution, pending-work persistence, single-runner
-  protections, and the existing UI are unchanged; the dashboard gains a "Actual
-  Hermes runtime" panel. Manual demo controls only - automatic queue wake-ups,
-  periodic sweeps, and broader batch evaluation are deferred until this path is
-  proven live. Offline harness verified (real `AIAgent` + tool loop with a
-  stubbed OpenAI-compat transport, no live Gemini/Neon/Razorpay). **Live
-  end-to-end NOT verified** - the user runs `scripts/hermes_agent_smoke.py`
-  (actual Hermes + Gemini) and `scripts/run_demo.ps1 -Mode hermes` (Neon-backed).
+- Status: **Iteration 11 - reviewed-Hermes-blocker corrections + visible Neon
+  proof path** on `feat/isolated-hermes-agent` (baseline `48de227`). Ten review
+  items fixed on the Iteration 10 isolated real-Hermes integration:
+  (1) the unauthorized-tool test uses a harmless sentinel + a canary-file
+  isolation assertion (never a destructive host command); `test_asgi_startup`
+  neutralises `.env` loading and builds synthetic Settings.
+  (2) the child's deadline watchdog is a daemon Timer cancelled on every normal
+  path - a clean decision returns promptly, not at the deadline; the parent
+  rejects any child exit code other than 0/1 even when stdout claims success;
+  the 8-model-iteration budget is now shared across the initial reasoning AND
+  the single repair (a fresh capped agent for the repair; tool budget already
+  shared), not 8 per `run_conversation`.
+  (3) raw diagnostics removed: no `stderr_tail`, no raw exception/`error`
+  strings anywhere (child, parent, smoke). Fixed failure CATEGORIES + an
+  allowlisted, bounded audit (`_sanitize_audit`); `unresolved_uncertainty`
+  (which had been the whole rationale) is gone, replaced by
+  `confidence_basis` + `decision_action`. Synthetic secrets in model output /
+  child exceptions / malformed output never reach console or audit (tested).
+  Smoke exits nonzero on failure and is described as "one decision may take
+  several model requests".
+  (4) the child now receives the approved message templates explicitly and
+  validates message choice + strict field types inside the one-repair boundary
+  (boolean confidence, zero/negative WAIT, wrong types, missing/extra keys,
+  unapproved message, non-JSON, and JSON-embedded-in-prose all rejected - no
+  silent coercion, no extraction). `PROMPT_VERSION` -> `hermes-agent/2026-09-05.1`.
+  (5) `get_recovery_actions` returns THIS case's ACTUAL prior activity (a
+  bounded redacted audit projection built by the engine via
+  `_case_history_projection`) plus a separately-labelled catalog of only the
+  actions deterministic policy can execute (no STOP). `get_payment_history` is
+  now ONE optional expansion straight to twelve months (6-month option removed),
+  needs a >=8-char uncertainty reason, is callable at most once (incl. during
+  repair), and reports ACTUAL / partial coverage. A deterministic terminal
+  `ESCALATE` transition was added (`authorize` -> `PolicyOutcome.ESCALATE` ->
+  `apply_evaluation` sets `escalated`/`unrecovered`, cancels pending work) so
+  an "evidence inadequate" outcome has a real safe path, never a faked one
+  (regression tests added). Synthetic history is supplied only when a trusted
+  `DEMO_CASE_PROVENANCE` record exists (`StrategySnapshot.is_demo_case`);
+  unknown cases inherit no fictional records. Synthetic date/outcome labels are
+  now derived from the day delta so they never disagree.
+  (6) **visible Neon proof**: `sql/neon_demo_inspect.sql` (checked-in,
+  read-only, `hermes_demo` schema, matches the JSON snapshot shape, safe while
+  the writer lock is held) projects case id/status/recovered amount, the
+  chronological audit timeline, and the actual Hermes tool evidence / proposal
+  / policy result. `scripts/neon_proof.py` (stdlib only, existing endpoints
+  only) creates one case, pauses for a pre-Hermes Neon inspection, runs ONE
+  real Hermes decision, shows its persisted `AI_MODEL_RUN` audit, then advances
+  the simulated outcome steps only when the case state permits.
+  Storage architecture unchanged (JSON snapshot ledger). No dashboard redesign;
+  the existing panel's stale fields were pointed at the new audit keys.
+  **No silent fallback to direct Gemini.** Offline verified: full suite +
+  parent-shape Hermes tests + real-Hermes harness with a stubbed transport +
+  compileall + `git diff --check` + local API startup + the CLI path
+  (`--no-hermes`). **Live end-to-end NOT verified** - the user runs
+  `scripts/hermes_agent_smoke.py` then `scripts/run_demo.ps1 -Mode hermes` +
+  `scripts/neon_proof.py` and views the rows via `sql/neon_demo_inspect.sql`.
+- Prior status: **Iteration 10 - isolated REAL Nous Hermes runtime for one
+  Case 3 decision** on `feat/isolated-hermes-agent` (branched from `f9b640e`).
+  New `hermes` execution mode driving the actual `run_agent.AIAgent` (checkout
+  `e02d1e41`) in an isolated subprocess with three case-scoped tools, bounded
+  iterations/tool-calls/deadline, one repair, one in-flight decision, and
+  bounded redacted audit metadata. Offline harness (real AIAgent + stub
+  transport) verified; live unverified. Superseded by the Iteration 11
+  corrections above.
 - Prior status: **Iteration 09 - reviewed-demo-blocker corrections + first
   user-run end-to-end test prep** on `fix/runnable-demo-boundaries` (branched
   from `d2e6572`). Six review blockers fixed: (1) full demo state survives an
@@ -147,6 +176,91 @@ requirements in `PROJECT_BRIEF.md`.
   For the smoke script the user now keeps a **replacement** `GEMINI_API_KEY` in
   a local gitignored `.env` (the previously used key was disclosed in chat and
   must stay revoked); the key is never requested in or pasted into chat.
+
+## Iteration 11 — Hermes-blocker corrections + visible Neon proof
+
+Baseline `48de227` on `feat/isolated-hermes-agent`. Implementation + verification
+only. Storage architecture unchanged.
+
+### Changed / new files
+
+- `tests/test_hermes_agent.py` - rewritten: harmless sentinel + canary-file
+  isolation assertion; strict-contract rejection matrix (boolean confidence,
+  zero WAIT, wrong types, extra key, STOP, JSON-in-prose); single-12m-expansion,
+  partial-coverage, unknown-case-no-history, prior-activity, secret-never-leaks;
+  parent-shape tests with a faked `subprocess.run` (abnormal-exit rejection,
+  allowlisted secret-free audit, no-result failure) that need no runtime.
+- `tests/test_asgi_startup.py` - child no-ops `_load_dotenv` and starts from a
+  minimal env; no real credential is read.
+- `tests/test_recovery_bounds.py` - `+` two ESCALATE regressions (authorize
+  permits it; it makes a real terminal transition, persisted, never a blocked
+  no-op).
+- `src/hermes/hermes_agent/child_main.py` - daemon watchdog cancelled in
+  `finally`; shared 8-iteration budget across initial + repair (fresh capped
+  agent for the repair); strict single-object JSON parse (no prose extraction);
+  `_validate` rejects bool confidence / non-positive WAIT / unapproved message /
+  key mismatch / unknown+unsupported action; fixed failure categories +
+  allowlisted audit; `get_payment_history(reason)` single 12m expansion with
+  actual/partial coverage; `get_recovery_actions` returns prior activity +
+  labelled executable-actions catalog.
+- `src/hermes/hermes_agent/__init__.py` - `MAX_HISTORY_REQUESTS = 1`.
+- `src/hermes/hermes_agent_strategist.py` - `PROMPT_VERSION` bump; passes
+  `approved_messages`; `_sanitize_audit` (allowlist, bounded, no `stderr_tail`);
+  rejects child exit codes outside {0,1}; fixed parent failure categories;
+  `_evidence_bundle` gates synthetic history on `snap.is_demo_case`, single
+  12-month window with `history_months_available` (partial), day-delta-derived
+  outcome labels, `prior_case_activity` from `snap.case_history`, policy-only
+  `allowed_actions`.
+- `src/hermes/types.py` - `StrategySnapshot.is_demo_case` + `case_history`.
+- `src/hermes/engine.py` - `_is_demo_case` / `_case_history_projection`
+  (bounded, redacted, via `audit_projection`); `authorize` -> ESCALATE branch.
+- `src/hermes/adapters.py` - `apply_evaluation` performs the ESCALATE terminal
+  transition (state `escalated`, attribution `unrecovered`, pending work
+  cancelled).
+- `src/hermes/asgi.py` - docstring covers `hermes` mode.
+- `config/hermes_agent/SKILL.md` - rewritten for the new contract (single 12m
+  expansion, executable actions only incl. ESCALATE, confidence basis).
+- `scripts/hermes_agent_smoke.py` - nonzero exit on failure, safe output with
+  no metadata, allowlisted fields, "several model requests" wording.
+- `scripts/demo_ui.py` - panel points at the new audit keys (no
+  `unresolved_uncertainty`).
+- `sql/neon_demo_inspect.sql` - NEW read-only inspection queries.
+- `scripts/neon_proof.py` - NEW user-run CLI over the existing local API.
+
+### Verification (offline, this machine)
+
+- `python -m pytest -q --ignore=tests/test_hermes_agent.py` -> **225 passed,
+  3 skipped** (`+2` ESCALATE regressions).
+- `python -m pytest -q tests/test_hermes_agent.py` (real Hermes child + stubbed
+  OpenAI-compat transport; 5 parent-shape / bundle tests need no runtime) ->
+  **28 passed in ~4.8 min**.
+- `python -m compileall -q src tests scripts` clean; `git diff --check` clean.
+- Local API startup: `hermes` mode fails cleanly without creds
+  (`SystemExit(1)`, sanitised line). `scripts/neon_proof.py --no-hermes --yes`
+  against the offline API creates + persists one case (exit 0); without
+  `--no-hermes` against a non-hermes API it aborts with a clear message
+  (exit 2).
+- **NOT verified live.** No live Gemini / Neon / Razorpay call was made; no
+  credentials were read or printed.
+
+### Limitations
+
+- The offline harness proves the real Hermes tool loop + every bound with a
+  stub transport; it does not prove live Gemini semantics or Neon persistence
+  under `hermes` mode - user-run.
+- `_case_history_projection` is a bounded (last 25) typed slice; it is not a
+  full event log.
+- The `hermes` demo path is still manual-control only; automatic queue
+  wake-ups / sweeps / batch evaluation remain deferred.
+- `_DEFAULT_CHECKOUT` / `_DEFAULT_PYTHON` default to this machine's install
+  path (env-overridable).
+
+### Exact next action
+
+The user runs the live proof (commands below): `scripts/hermes_agent_smoke.py`,
+then `scripts/run_demo.ps1 -Mode hermes` + `scripts/neon_proof.py`, viewing the
+persisted rows with `sql/neon_demo_inspect.sql`. Then Codex review of
+Iteration 11.
 
 ## Iteration 10 — Isolated real Nous Hermes runtime, one Case 3 decision
 

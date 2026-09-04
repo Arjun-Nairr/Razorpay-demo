@@ -492,6 +492,22 @@ class InMemoryLedger:
         ):
             return self._apply_recovery_link_intent(case, proposal, decision, cmd.now)
 
+        if decision.outcome is PolicyOutcome.ESCALATE:
+            # Smallest deterministic terminal transition for an authorized
+            # ESCALATE: -> escalated (unrecovered). Cancels pending work; never
+            # marks the case recovered. Idempotent via the terminal-state guard.
+            cancelled = self._pending_work(case.case_id)
+            for w in cancelled:
+                w.cancelled = True
+            case.state = CaseState.ESCALATED
+            case.attribution = Attribution.UNRECOVERED.value
+            case.version += 1
+            self._append(
+                cmd.now, case.case_id, AUDIT_TERMINAL_TRANSITION,
+                {"state": CaseState.ESCALATED.value, "reason": "manual_escalation"},
+            )
+            return ApplyResult(ok=True, reason="escalated", terminal=True)
+
         return ApplyResult(ok=True, blocked=decision.outcome is PolicyOutcome.BLOCK)
 
     def _apply_recovery_link_intent(

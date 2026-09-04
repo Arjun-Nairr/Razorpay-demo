@@ -205,3 +205,52 @@ def test_positive_wait_within_remaining_budget_is_clamped_and_bounded():
     # 0h of budget left -> blocked, not a zero-hour wait
     d0 = authorize(p, snap(MAX_TOTAL_WAIT_HOURS), 100, fact)
     assert d0.outcome.value == "BLOCK" and d0.reason_code == "total_wait_bound_reached"
+
+
+# --- deterministic terminal escalation (Iteration 10 correction) -----------
+
+
+class AlwaysEscalate:
+    """A model that returns the safe ESCALATE action every cycle."""
+
+    last_run_meta = None
+
+    def propose(self, snapshot):
+        return StrategyProposal(
+            action=ProposalAction.ESCALATE, diagnosis="d",
+            rationale="evidence inadequate; no supported action applies",
+            confidence=0.4, proposed_wait_hours=0,
+        )
+
+
+def test_authorize_permits_escalate_as_the_safe_path():
+    from hermes.types import CaseSnapshot
+
+    fact = ProviderRetryFact(OBL, False, None)
+    p = AlwaysEscalate().propose(None)
+    snap = CaseSnapshot(case_id="c", obligation_id=OBL, amount_minor=AMOUNT,
+                        currency="INR", state="active",
+                        failure_reason="insufficient_funds", version=1)
+    d = authorize(p, snap, 0, fact)
+    assert d.outcome.value == "ESCALATE" and d.reason_code == "manual_escalation_authorized"
+
+
+def test_escalate_proposal_makes_a_real_terminal_transition_not_a_blocked_noop():
+    from hermes.pg_ledger import InMemorySnapshotStore, PgLedger
+
+    store = InMemorySnapshotStore()
+    rp = FakeRazorpayAdapter()  # provider NOT retry-eligible -> wait is not an option
+    engine = RecoveryEngine(PgLedger(store), AlwaysEscalate(), rp)
+    r = engine.receive(_failed("e0"))
+    report = engine.run(until=1)
+
+    cv = engine.inspect(CaseQuery(case_id=r.case_id))
+    assert cv.state == "escalated"            # real terminal transition, not "blocked"
+    assert cv.attribution == "unrecovered"    # never pretended to be recovered
+    assert cv.pending_work == 0               # pending work cancelled
+    assert report.blocked == 0 and report.proposals == 1
+    assert "TERMINAL_TRANSITION" in _kinds(engine, r.case_id)
+
+    # persisted: a fresh engine over the same store sees the same terminal state
+    engine2 = RecoveryEngine(PgLedger(store), AlwaysEscalate(), rp)
+    assert engine2.inspect(CaseQuery(case_id=r.case_id)).state == "escalated"

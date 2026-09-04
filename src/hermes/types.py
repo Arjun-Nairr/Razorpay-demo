@@ -123,6 +123,12 @@ class StrategySnapshot:
     wait_hours_remaining: int = 0  # cumulative wait budget left before the total bound
     prior_action: str | None = None  # last proposal's action, across cycles
     prior_policy_outcome: str | None = None  # last policy decision's outcome
+    is_demo_case: bool = False  # a trusted DEMO_CASE_PROVENANCE record exists for this case
+    # Bounded chronological projection of THIS case's prior actions / policy
+    # decisions / outcomes, built by the engine from the ledger audit trail.
+    # Not placed in the strategist's initial prompt - surfaced only via the
+    # get_recovery_actions tool.
+    case_history: tuple = ()
 
 
 @dataclass(frozen=True)

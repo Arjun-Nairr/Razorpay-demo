@@ -1,10 +1,12 @@
 """ASGI entrypoint for uvicorn:  uvicorn hermes.asgi:app --host 127.0.0.1
 
-Mode comes from ``HERMES_MODE``: ``offline`` (default) or ``live``. Live mode
-requires ``GEMINI_API_KEY`` and ``DATABASE_URL`` and an initialised schema
-(``python scripts/init_neon.py``); if any is missing, or another process holds
-the demo writer lock, this module fails to import with a clear one-line reason
-and uvicorn exits without serving - so the UI never opens against a dead API.
+Mode comes from ``HERMES_MODE``: ``offline`` (default), ``live`` (direct
+Gemini), or ``hermes`` (isolated real Nous Hermes runtime). ``live`` and
+``hermes`` require ``GEMINI_API_KEY`` and ``DATABASE_URL`` and an initialised
+schema (``python scripts/init_neon.py``); ``hermes`` also needs the installed
+Hermes checkout at the proven revision. If any is missing, or another process
+holds the demo writer lock, this module fails to import with a clear one-line
+reason and uvicorn exits without serving - the UI never opens against a dead API.
 
 A startup failure is reported as a single controlled line naming the mode, the
 exception *type*, and the configuration fields worth checking - never the

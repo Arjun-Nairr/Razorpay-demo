@@ -138,6 +138,12 @@ def authorize(
         )
     if proposal.action is ProposalAction.CREATE_RECOVERY_LINK:
         return _authorize_recovery_link(proposal, case, now)
+    if proposal.action is ProposalAction.ESCALATE:
+        # The explicit safe path when evidence is inadequate or no other action
+        # is authorized: a deterministic terminal transition to `escalated`
+        # (unrecovered). Never advertised as "recovered" and never faked -
+        # `apply_evaluation` performs the real transition.
+        return PolicyDecision(PolicyOutcome.ESCALATE, "manual_escalation_authorized")
     return PolicyDecision(PolicyOutcome.BLOCK, "action_not_supported_in_slice")
 
 
@@ -466,7 +472,48 @@ class RecoveryEngine:
             wait_hours_remaining=max(0, MAX_TOTAL_WAIT_HOURS - snap.total_wait_hours),
             prior_action=snap.prior_action,
             prior_policy_outcome=snap.prior_policy_outcome,
+            is_demo_case=self._is_demo_case(snap.case_id),
+            case_history=self._case_history_projection(snap.case_id),
         )
+
+    # Audit kinds that describe a prior ACTION / POLICY DECISION / OUTCOME for a
+    # case - the material get_recovery_actions surfaces (not raw model text).
+    _HISTORY_KINDS = (
+        "AI_PROPOSAL", "POLICY_DECISION", "ACTION_INTENT", "ACTION_OUTCOME",
+        "RETRY_OUTCOME_RECORDED", "SCHEDULED_ACTION", "STRATEGIST_FAILURE",
+        "TERMINAL_TRANSITION",
+    )
+    _HISTORY_DETAIL_KEYS = (
+        "action", "outcome", "reason_code", "kind", "state", "due_time",
+        "attempt", "rescheduled", "exhausted", "message_authorized", "reason",
+        "message_sent",
+    )
+
+    def _is_demo_case(self, case_id: str) -> bool:
+        try:
+            recs = self._ledger.audit_projection(case_id).records
+        except Exception:  # pragma: no cover - defensive
+            return False
+        return any(r.kind == "DEMO_CASE_PROVENANCE" for r in recs)
+
+    def _case_history_projection(self, case_id: str) -> tuple:
+        """A bounded, redacted chronological projection of this case's prior
+        actions / decisions / outcomes, via the public audit projection. No free
+        text (diagnosis / rationale) - only stable typed fields."""
+        try:
+            recs = self._ledger.audit_projection(case_id).records
+        except Exception:  # pragma: no cover - defensive
+            return ()
+        out = []
+        for r in recs:
+            if r.kind not in self._HISTORY_KINDS:
+                continue
+            d = r.detail if isinstance(r.detail, dict) else {}
+            out.append({
+                "t": r.logical_time, "kind": r.kind,
+                **{k: d[k] for k in self._HISTORY_DETAIL_KEYS if k in d},
+            })
+        return tuple(out[-25:])
 
     def _note_model_run(self, case_id: str, *, error: str | None = None) -> None:
         """Append decision-linked model-run metadata to the audit trail when the

@@ -32,7 +32,10 @@ TOOL_NAMES = (
     "get_recovery_actions",
 )
 
+# Shared across the initial reasoning AND the single repair (not per call).
 MAX_TOOL_CALLS = 6
 MAX_MODEL_ITERATIONS = 8
 SUBPROCESS_DEADLINE_S = 90.0
-MAX_HISTORY_REQUESTS = 2
+# ONE optional expansion straight to twelve months; no second lookup, ever
+# (including during repair).
+MAX_HISTORY_REQUESTS = 1
