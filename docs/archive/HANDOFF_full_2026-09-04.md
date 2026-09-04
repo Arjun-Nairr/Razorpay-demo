@@ -2397,3 +2397,48 @@ IMPLEMENTATION_BACKLOG.md corrected: removed the stale "still uses
 FakeRazorpayAdapter" / "live pending" language (case-18 already proved the
 hybrid path live in Iteration 18) and trimmed one repeated historical-dataset
 sentence.
+
+---
+
+## Iteration 21 archived detail (moved from HANDOFF.md during Iteration 22)
+
+Hermes SOUL wiring + offline verification, then 4 review-finding corrections,
+same iteration. Codex authored config/hermes_agent/SOUL.md (agent identity/
+scope/limits) and the first exemplar rule in SKILL.md (consistent recent
+payment behavior); both preserved verbatim throughout. Wired both into the
+isolated child's ephemeral system prompt.
+
+Parent (hermes_agent_strategist.py): added _SOUL_PATH beside _SKILL_PATH and
+a soul_path constructor parameter; __init__ fails closed
+(HermesRuntimeUnavailable) if either file is missing, unreadable, or not
+valid UTF-8 (shared _read_utf8() helper, sanitized message: label + exception
+type only, never path/content). Both read as UTF-8 and sent to the child as
+two distinct job keys (soul_text, skill_text - never concatenated on the
+parent side). PROMPT_VERSION bumped (...2026-09-05.2).
+
+Child (hermes_agent/child_main.py): _system_prompt() takes soul_text first
+and prepends it, so the ephemeral prompt order is SOUL identity/scope -> SKILL
+judgment rules -> case context -> tool descriptions/approved messages/output
+contract. No other child behavior touched.
+
+Correction 2: _propose_locked creates HermesRunMeta and assigns
+last_run_meta BEFORE re-reading the instruction files; a load failure marks
+that fresh metadata (failure_category=instruction_load_failed,
+failure_stage=instruction_load) and raises - a prior successful run's
+metadata can no longer leak onto a later failure.
+
+tests/test_hermes_agent.py: missing SOUL/SKILL each fail closed
+independently; a faked subprocess.run captures the literal job JSON and
+proves soul_text/skill_text are the real files' exact contents as distinct
+fields; child_main._system_prompt() is proven to order SOUL before SKILL
+before case context, first with markers then with the real file contents;
+invalid-UTF-8 SOUL and SKILL each fail closed; a successful decision followed
+by a removed SOUL file proves last_run_meta belongs only to the new failure.
+The existing @requires_runtime real-Hermes/offline-stub tests still return a
+schema-valid proposal after the wiring change - this proves wiring/contract
+behavior only, never Hermes's judgment quality.
+
+Verified: offline focused python -m pytest -q tests/test_hermes_agent.py went
+33 -> 37 (wiring) -> 41 (corrections) passed; full offline suite steady at
+373 passed, 3 skipped throughout. compileall + git diff --check clean both
+times; no live service called in either sub-iteration.

@@ -1,6 +1,6 @@
 # Cross-Agent Handoff — current-state index
 
-Last updated: 2026-09-04 (Asia/Dubai), Iteration 21. Branch
+Last updated: 2026-09-05 (Asia/Dubai), Iteration 22. Branch
 `feat/isolated-hermes-agent`, latest commit at bottom. This file stays
 **under 280 lines**: it is an index, not a log. Detail lives in the linked
 docs; iteration-by-iteration history is in
@@ -121,94 +121,67 @@ for full narrative.
 
 ## Iteration 21 — Hermes SOUL wiring + offline verification
 
-Codex authored `config/hermes_agent/SOUL.md` (agent identity/scope/limits)
-and the first exemplar rule in `config/hermes_agent/SKILL.md` (consistent
-recent payment behavior); both preserved verbatim, unchanged by this
-iteration. Wired both into the isolated child's ephemeral system prompt.
+Condensed; full detail archived. Wired Codex's `config/hermes_agent/SOUL.md`
+(agent identity/scope) beside the existing `SKILL.md` Rule 1 (consistent
+recent payment behavior) into the isolated child's ephemeral system prompt,
+order SOUL -> SKILL -> case context -> tool/output contract; both files
+preserved verbatim. `__init__` fails closed (`HermesRuntimeUnavailable`) if
+either is missing, unreadable, or not valid UTF-8; `_propose_locked` assigns
+fresh `last_run_meta` before re-reading them so a load failure can never
+inherit a prior successful run's metadata. Offline
+`python -m pytest -q tests/test_hermes_agent.py` went 33 -> 37 (wiring) -> 41
+(4 correction regressions) passed; full offline suite steady at 373 passed,
+3 skipped throughout. See
+[`docs/archive/HANDOFF_full_2026-09-04.md`](docs/archive/HANDOFF_full_2026-09-04.md)
+for the full narrative.
 
-- **Parent** (`hermes_agent_strategist.py`): added `_SOUL_PATH` beside
-  `_SKILL_PATH` and a `soul_path` constructor parameter; `__init__` now
-  fails closed (`HermesRuntimeUnavailable`) if either file is missing or
-  unreadable. Both are read as UTF-8 and sent to the child as two distinct
-  `job` keys (`soul_text`, `skill_text` - never concatenated on the parent
-  side). `PROMPT_VERSION` bumped (`...2026-09-05.2`) since the child's
-  prompt contract changed.
-- **Child** (`hermes_agent/child_main.py`): `_system_prompt()` now takes
-  `soul_text` first and prepends it, so the ephemeral prompt order is SOUL
-  identity/scope -> SKILL judgment rules -> case context -> tool
-  descriptions/approved messages/output contract. No other child behavior
-  (tool budgets, repair limit, schema validation, audit allowlist) touched.
-- Everything else (isolation, subprocess deadline, tool budgets, one
-  in-flight decision, policy authority, audit sanitization, Neon, Razorpay,
-  FastAPI, fixtures, dashboard) is unchanged - this iteration only added the
-  SOUL file path/param/prompt-ordering wiring above.
+## Iteration 22 — one live consistent-history exemplar, persisted to Neon
 
-New offline tests in `tests/test_hermes_agent.py`: missing SOUL and missing
-SKILL each fail closed independently; a faked `subprocess.run` captures the
-literal `job` JSON and proves `soul_text`/`skill_text` are the real files'
-exact contents as two distinct fields; `child_main._system_prompt()` is
-called directly with marker strings to prove SOUL precedes SKILL precedes
-case context. The existing `@requires_runtime` real-Hermes/offline-stub tests
-(local OpenAI-compat stub, no live Gemini) still return a schema-valid
-proposal after the wiring change - this proves wiring and contract behavior
-only, not the quality of Hermes's judgment against the new SOUL/SKILL text.
+**First real run of the SOUL + Rule 1 wiring against live Gemini.** One new
+trusted demo case (`case-25`, obligation `sub_demo_0005_e2c073a9`) created via
+the existing `POST /demo/case` -> `POST /demo/step {"step":"advance"}` path,
+advanced exactly once, then stopped - no retry-failed, no recovery link, no
+capture, no second case. Local FastAPI only (`hermes.asgi:app`,
+`127.0.0.1:8000`, `HERMES_MODE=hermes`); no Streamlit, tunnel, relay, or
+Docker. Preflight: clean tree at `c43234c`, installed Hermes revision matched
+`EXPECTED_HERMES_REVISION`, `GEMINI_API_KEY`/`DATABASE_URL` present via
+`.env` (values never printed), all five Neon views present. `.env` still
+carries `RAZORPAY_PROVIDER=hybrid_test_mode` from Iteration 18 - overridden
+to `fake` via a process-only shell env var (`.env` untouched; `load_dotenv`
+uses `override=False`) so `/health` reported `payment_provider=fake` /
+`payment_provider_test_mode_enabled=false` before the case was created.
 
-**Iteration 21 corrections** (4 review findings closed, same iteration):
+**Result - every expected condition passed, verified, none forced:**
+`action=WAIT_FOR_PROVIDER_RETRY`, `policy_outcome=ALLOW`
+(`provider_retry_permitted`), `state=waiting`, `confidence=0.55` (medium
+band), one tool call (`get_payment_retry_facts` only, no
+`get_payment_history`, `history_expansion_requested=false`), zero recovery
+links/messages/Razorpay calls, `human_review_required=false`. Rationale cited
+the 3-month on-time pattern, its limited coverage, verified provider-retry
+eligibility, and the remaining uncertainty - unedited model output.
 
-1. Invalid-UTF-8 SOUL/SKILL content now fails closed too, not just missing/
-   unreadable: a shared `_read_utf8()` helper catches `(OSError, UnicodeError)`
-   in both `__init__` and `_propose_locked` and raises `HermesRuntimeUnavailable`
-   with a fixed, sanitized message (label + exception type only - never the
-   path or file content). New regression tests for SOUL and SKILL separately.
-2. `_propose_locked` now creates `HermesRunMeta` and assigns `last_run_meta`
-   **before** re-reading the instruction files; a load failure marks that
-   fresh metadata with `failure_category=instruction_load_failed` /
-   `failure_stage=instruction_load` and raises - a prior successful run's
-   confidence/tool/result metadata can no longer leak onto a later failure.
-   New regression: a successful decision, then a removed SOUL file, then
-   `last_run_meta` on the second (failing) call carries only the new failure.
-3. A direct test now builds the final `_system_prompt()` from the REAL
-   `SOUL.md`/`SKILL.md` file contents (not marker strings) and asserts both
-   exact texts appear, in order SOUL -> SKILL -> case context -> tool/output
-   contract.
-4. This section.
-
-No isolation, deadline, tool-budget, repair-limit, audit-allowlist, policy,
-dependency, provider, fixture, or dashboard change. No live service called.
+**Neon readback** (`hermes_demo`, scoped to `case-25`): `case_summary` 1 row
+(`display_status=WAITING_FOR_PROVIDER_RETRY`); `hermes_decisions` 1 row
+(`gemini-3.7-flash`, `prompt_version=hermes-agent/2026-09-05.2`, revision
+`e02d1e41f...`, 1 tool call/6 budget, 2 model iterations/8 budget, ~17.1s);
+`recovery_actions` 0 rows (correct - WAIT creates no link); `hermes_evidence`
+1 row (`get_payment_retry_facts`/`SIMULATED_PROVIDER`); `audit_timeline` 6
+rows (`INPUT_EVENT`, `DEMO_CASE_PROVENANCE`, `AI_MODEL_RUN`, `AI_PROPOSAL`,
+`POLICY_DECISION`, `SCHEDULED_ACTION`). No source code changed; no code-change
+rule invoked. API process stopped and port confirmed free after readback.
 
 ## Verified evidence
 
-- **Offline**: `python -m pytest -q --ignore=tests/test_hermes_agent.py` ->
-  **296 passed, 3 skipped** (was 284; `tests/test_razorpay_test_mode.py` grew
-  from 46 to 58 tests). Real-Hermes harness
-  `python -m pytest -q tests/test_hermes_agent.py` -> **33 passed**
-  (unaffected - this iteration touched only `razorpay_test_mode.py` and its
-  tests). `compileall` + `git diff --check` clean; diff confined to those two
-  files.
-- **Iteration 18**: `python -m pytest -q --ignore=tests/test_hermes_agent.py`
-  -> **308 passed, 3 skipped** (was 296; +12 `tests/test_webhook_relay.py`).
-  This iteration DID make live calls: real Hermes/Gemini decisions, one real
-  Razorpay Test Mode link, real Neon writes for `case-18`.
-- **Iteration 19**: `python -m pytest -q --ignore=tests/test_hermes_agent.py`
-  -> **369 passed, 3 skipped** (+16 `test_run_one_hybrid_case.py`, +3
-  `test_api.py` `/health` fields, +9 `test_webhook_relay.py` hardening,
-  +33 `test_neon_views.py`). Live: `scripts/init_neon.py` ran once (DDL only)
-  and the five views were read back directly - see Iteration 19 section above.
-- **Iteration 20**: `python -m pytest -q --ignore=tests/test_hermes_agent.py`
-  -> **373 passed, 3 skipped** (+4 `test_webhook_relay.py`). `compileall` +
-  `git diff --check` clean; secret scan clean. No API/relay/tunnel started, no
-  live Gemini/Razorpay/Neon call - offline only, as authorized.
-- **Iteration 21** (SOUL wiring + corrections), using the project
-  `.venv\Scripts\python.exe` (3.12.5): focused
-  `python -m pytest -q tests/test_hermes_agent.py` -> **41 passed** (was 33
-  pre-wiring, 37 after wiring, +4 correction regressions: invalid-UTF-8 SOUL,
-  invalid-UTF-8 SKILL, stale-metadata-not-leaked, real-file prompt-order
-  proof). Full offline `python -m pytest -q --ignore=tests/test_hermes_agent.py`
-  -> **373 passed, 3 skipped** (unchanged - this iteration touched only
-  `hermes_agent_strategist.py`/`child_main.py`/`test_hermes_agent.py`/
-  `HANDOFF.md`). `compileall` + `git diff --check` clean; diff inspected,
-  confined to those files plus this section; no secrets. Offline-stub tests
-  prove wiring/contract behavior only, never Hermes's judgment quality.
+Pre-Iteration-21 evidence (the generic offline baseline and Iterations 18-20)
+is archived - see
+[`docs/archive/HANDOFF_full_2026-09-04.md`](docs/archive/HANDOFF_full_2026-09-04.md).
+
+- **Iteration 21**: focused `tests/test_hermes_agent.py` -> **41 passed**;
+  full offline (`--ignore=tests/test_hermes_agent.py`) -> **373 passed, 3
+  skipped**. `compileall` + `git diff --check` clean.
+- **Iteration 22**: no source change, so no test suite re-run was required;
+  this iteration's evidence is the live Neon readback above. No API/relay/
+  tunnel left running; no Razorpay/payment/link/message/public-service call.
 
 ## Inspecting the persisted proof
 
@@ -243,13 +216,10 @@ actually wired to `hermes-runtime` + `hybrid_test_mode` + enabled.
 
 ## Next action
 
-Run one real consistent-history Hermes/Gemini exemplar (the SOUL + Rule 1
-judgment now wired in), persist it to Neon, and read it back through the five
-presentation views (`case_summary`, `hermes_decisions`, `recovery_actions`,
-`hermes_evidence`, `audit_timeline`). No further live action planned against
-`case-18`. The two remaining deferred exemplars (inconsistent / mixed-history
-rules + cases) stay deferred per the backlog. Keep future `HANDOFF.md`
-updates under 280 lines.
+Codex reviews the consistent-history result (`case-25`, above), then authors
+the inconsistent-history judgment rule for `SKILL.md`. No further live action
+planned against `case-18`/`case-25`. The mixed-history exemplar stays
+deferred per the backlog. Keep future `HANDOFF.md` updates under 280 lines.
 
 ## Working-document links
 
