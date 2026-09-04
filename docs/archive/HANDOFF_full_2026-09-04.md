@@ -2294,3 +2294,106 @@ signature over the untouched raw body first, then event-id/envelope/
 contradiction checks, then persisted link-id correlation, then the one
 independent provider readback, then engine.receive. The simulated
 /webhooks/razorpay route and its secret are untouched.
+
+---
+
+## Iteration 18 archived detail (moved from HANDOFF.md during Iteration 21)
+
+One live HYBRID attempt, stopped before payment (case-18). scripts/
+webhook_relay.py (new) is a loopback-only reverse proxy serving only POST
+/webhooks/razorpay-test - every other path/method rejected before touching
+the main app; no engine/DB/credentials of its own, so even an unrestricted
+tunnel pointed at it can never expose /demo/*//cases/*/docs. An SSH reverse
+tunnel (ssh -p 443 -R0:127.0.0.1:8100 free.pinggy.io, no new binary/no pip)
+exposed it publicly; verified end-to-end that unrelated paths 404, the wrong
+method 405s, an unsigned POST gets a genuine 401. One tunnel domain
+(lhr.life/localhost.run) was connection-reset by local Avast Web Shield
+(confirmed: unrelated HTTPS sites worked, that domain didn't) - not touched/
+excluded, just switched to a working provider (pinggy.io).
+
+scripts/run_one_hybrid_case.py (new) drove ONE case through real Hermes +
+Gemini decisions only (never simulated capture). Result: case-18 (obligation
+sub_demo_0004_8e781337) - decision 1: WAIT_FOR_PROVIDER_RETRY authorized;
+after the simulated failed-retry input, decision 2: CREATE_RECOVERY_LINK
+authorized -> ONE real Payment Link created (reference plink_TY2urjqVCjkjvB;
+checkout URL persisted in Neon, not reproduced here).
+
+Scope change mid-task: do not complete the checkout. The demo doesn't require
+a paid live checkout; recording uses this saved evidence instead. Case-18
+left exactly as-is - no simulated capture, no forged webhook, no state edit.
+All three processes were stopped by exact PID/port match; verified ports
+8000/8100 free, the tunnel URL no longer resolves, Neon re-read shows case-18
+unchanged.
+
+---
+
+## Iteration 19 archived detail (moved from HANDOFF.md during Iteration 21)
+
+Review findings closed + read-only Neon views. Phase A (offline only):
+/health now reports non-secret payment_provider /
+payment_provider_test_mode_enabled flags; run_one_hybrid_case.py fails closed
+(refuses POST /demo/case) unless both are the expected real values -
+evidence_mode=SIMULATED on the case's own synthetic intake is preserved,
+never relabelled. webhook_relay.py hardened: a documented 64 KiB body
+ceiling, Content-Length validated (missing/malformed/negative/oversized all
+rejected, 411/400/400/413, before any read), a bounded body-read deadline
+(408 on a stall), and logging reduced to method + a fixed route category +
+status only - never the raw path/query/headers/body.
+
+Phase B: five read-only views added to scripts/init_neon.py (CREATE OR
+REPLACE VIEW only; same single ledger_state JSONB row, nothing duplicated or
+made mutable): case_summary (authoritative state plus a derived,
+presentation-only display_status), hermes_decisions (one row per
+AI_PROPOSAL, joined to its own cycle's nearest AI_MODEL_RUN/POLICY_DECISION -
+never a global first/last), recovery_actions (checkout_url_present boolean,
+never the URL; message_authorized kept separate from message_sent),
+hermes_evidence, audit_timeline. Also fixed a real bug found running this:
+init_neon.py's bare psycopg.connect(dsn) had no timeout and no IPv4
+preference, so it hung indefinitely on this host's known IPv6 black hole -
+now reuses the app's own _connect_bounded.
+
+Ran init_neon.py once against the existing .env (DDL only, hermes_demo
+schema) and read all five views back directly: case-18 - state=active
+(authoritative, unchanged), display_status=RECOVERY_IN_PROGRESS,
+recovery_actions shows the real link with checkout_url_present=true,
+action_evidence_mode=REAL_TEST_MODE, message_authorized=true /
+message_sent=false (kept separate); hermes_decisions shows both real
+decisions correctly paired (WAIT_FOR_PROVIDER_RETRY then
+CREATE_RECOVERY_LINK, ~19.2s/~19.4s execution, confidence 0.95/high).
+case-11 unchanged: state=recovered, display_status=RECOVERED,
+attribution=hermes_assisted, counted=true.
+
+---
+
+## Iteration 20 archived detail (moved from HANDOFF.md during Iteration 21)
+
+Relay corrections (offline only, no live activity). Three defects closed in
+scripts/webhook_relay.py, none of them touching a live API/Gemini/Razorpay/
+Neon call or the relay/tunnel (neither was started):
+
+1. Absolute deadline, not inactivity-only. The old _read_body set one socket
+   timeout, then called self.rfile.read(length) - which loops internally
+   over MULTIPLE recv() calls, each getting its OWN fresh timeout, so a
+   sender drip-feeding bytes just inside each gap could extend the read
+   forever. Now an incremental loop recalculates remaining = deadline -
+   now() before every read and uses rfile.read1(want) (at most ONE
+   underlying recv() per call) - a continuously-active drip-feeder is still
+   cut off (408) once the absolute deadline passes, never forwarded partial.
+2. Premature EOF. A connection closing before exactly Content-Length bytes
+   arrive is now a distinct, fixed 400 rejection (was previously
+   indistinguishable from a timeout) - never forwarded upstream.
+3. Normalized log method. log_request printed self.command - the client's
+   raw, unvalidated method token - directly. Now mapped through a fixed
+   allowlist (GET/HEAD/POST/PUT/DELETE/PATCH/OPTIONS); anything else,
+   however crafted, logs as the fixed label "OTHER".
+
++4 tests in tests/test_webhook_relay.py: a continuously drip-feeding sender
+(never quiet long enough for a naive per-call timer to fire) is still
+rejected well inside the budget; a real premature EOF via shutdown(SHUT_WR)
+rejects 400 and never reaches the upstream stub; an attacker-controlled
+method string never appears in captured log output, only "OTHER".
+
+IMPLEMENTATION_BACKLOG.md corrected: removed the stale "still uses
+FakeRazorpayAdapter" / "live pending" language (case-18 already proved the
+hybrid path live in Iteration 18) and trimmed one repeated historical-dataset
+sentence.

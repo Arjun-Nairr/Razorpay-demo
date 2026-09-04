@@ -466,6 +466,76 @@ def test_wrong_revision_refuses_to_launch(tmp_path):
         HermesAgentStrategist(home=tmp_path / "h", verify_revision=True, checkout=tmp_path)
 
 
+# === SOUL wiring (offline, no runtime) ===================================
+
+
+def _fake_checkout(tmp_path) -> Path:
+    fake_checkout = tmp_path / "checkout"
+    fake_checkout.mkdir()
+    (fake_checkout / "run_agent.py").write_text("# fake\n", encoding="utf-8")
+    return fake_checkout
+
+
+def test_missing_soul_file_fails_closed(tmp_path):
+    with pytest.raises(HermesRuntimeUnavailable, match="soul"):
+        HermesAgentStrategist(
+            home=tmp_path / "h", checkout=_fake_checkout(tmp_path), verify_revision=False,
+            soul_path=tmp_path / "no_such_soul.md",
+        )
+
+
+def test_missing_skill_file_fails_closed(tmp_path):
+    with pytest.raises(HermesRuntimeUnavailable, match="skill"):
+        HermesAgentStrategist(
+            home=tmp_path / "h", checkout=_fake_checkout(tmp_path), verify_revision=False,
+            skill_path=tmp_path / "no_such_skill.md",
+        )
+
+
+def test_soul_and_skill_reach_child_job_as_distinct_exact_fields(monkeypatch, tmp_path):
+    """Prove the parent sends the real SOUL.md and SKILL.md contents verbatim,
+    as two distinct job keys - never concatenated on the parent side."""
+    from hermes.hermes_agent_strategist import _SKILL_PATH, _SOUL_PATH
+
+    captured = {}
+
+    def _fake_run(*args, **kwargs):
+        captured["job"] = json.loads(kwargs["input"])
+        return _fake_proc(_SENTINEL + json.dumps({
+            "ok": True,
+            "proposal": {"action": "ESCALATE", "diagnosis": "d", "rationale": "r",
+                         "confidence": 0.3, "proposed_wait_hours": 0, "message_intent": None},
+            "audit": {"validation_result": "valid"},
+        }), rc=0)
+
+    monkeypatch.setattr(mod.subprocess, "run", _fake_run)
+    strat = HermesAgentStrategist(
+        mock_base_url="http://127.0.0.1:1/v1", home=tmp_path / "h",
+        checkout=_fake_checkout(tmp_path), python=__import__("sys").executable,
+        verify_revision=False,
+    )
+    strat.propose(_snap())
+    job = captured["job"]
+    assert job["soul_text"] == _SOUL_PATH.read_text(encoding="utf-8")
+    assert job["skill_text"] == _SKILL_PATH.read_text(encoding="utf-8")
+    assert job["soul_text"] != job["skill_text"]
+
+
+def test_system_prompt_orders_soul_before_skill_before_case_context():
+    """Prove the exact order the child builds the system prompt in:
+    SOUL identity/scope, then SKILL judgment rules, then case context."""
+    from hermes.hermes_agent import child_main
+
+    prompt = child_main._system_prompt(
+        "SOUL-MARKER-IDENTITY", "SKILL-MARKER-JUDGMENT",
+        {"case_marker": "CASE-CONTEXT-MARKER"}, [_APPROVED_MSG],
+    )
+    i_soul = prompt.index("SOUL-MARKER-IDENTITY")
+    i_skill = prompt.index("SKILL-MARKER-JUDGMENT")
+    i_case = prompt.index("CASE-CONTEXT-MARKER")
+    assert i_soul < i_skill < i_case
+
+
 def test_child_stream_decoded_as_utf8_not_locale(tmp_path):
     """Regression: the child's result line must be recovered even when the
     Hermes runtime writes non-cp1252 bytes to its streams. A real tiny child

@@ -228,9 +228,11 @@ def _validate(obj, approved_messages: set):
     return obj, "valid"
 
 
-def _system_prompt(skill_text: str, ctx: dict, approved_messages: list) -> str:
+def _system_prompt(soul_text: str, skill_text: str, ctx: dict, approved_messages: list) -> str:
     return (
-        skill_text.strip()
+        soul_text.strip()
+        + "\n\n"
+        + skill_text.strip()
         + "\n\n--- THIS CASE (initial context; deliberately limited) ---\n"
         + json.dumps(ctx, indent=2)
         + "\n\nTools you may call (only when the answer would change your proposal):\n"
@@ -349,7 +351,7 @@ def _run(job, audit, approved_messages, approved_set, started, _fail) -> int:
     from run_agent import AIAgent
 
     ctx = job["evidence_bundle"]["initial_context"]
-    sys_prompt = _system_prompt(job["skill_text"], ctx, approved_messages)
+    sys_prompt = _system_prompt(job["soul_text"], job["skill_text"], ctx, approved_messages)
 
     if job["mode"] == "mock":
         provider, model = "openai-compat", job["mock"]["model"]

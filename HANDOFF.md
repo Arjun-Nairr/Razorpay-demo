@@ -103,100 +103,55 @@ implemented - retry eligibility always stays simulated. Iterations 15-17
   only), `.env` flags. Manual Test Mode checkout was **deliberately not
   completed** (see Iteration 18 below).
 
-## Iteration 18 — one live attempt, stopped before payment (case-18)
+## Iterations 18-20 — live case-18, Neon views, relay hardening
 
-`scripts/webhook_relay.py` (new) is a loopback-only reverse proxy serving
-**only** `POST /webhooks/razorpay-test` - every other path/method rejected
-before touching the main app; no engine/DB/credentials of its own, so even an
-unrestricted tunnel pointed at it can never expose `/demo/*`/`/cases/*`/docs.
-An SSH reverse tunnel (`ssh -p 443 -R0:127.0.0.1:8100 free.pinggy.io`, no new
-binary/no pip) exposed it publicly; verified end-to-end that unrelated paths
-404, the wrong method 405s, an unsigned `POST` gets a genuine `401`. One
-tunnel domain (`lhr.life`/`localhost.run`) was connection-reset by local Avast
-Web Shield (confirmed: unrelated HTTPS sites worked, that domain didn't) - not
-touched/excluded, just switched to a working provider (`pinggy.io`).
+Condensed; full detail archived. Iteration 18: one live HYBRID attempt via a
+loopback-only relay + SSH tunnel - real Hermes/Gemini decisions, one real
+Razorpay Test Mode link (**case-18**), **stopped before payment** on a
+Codex/user scope change (demo doesn't need a completed checkout). Iteration
+19: `/health` reports provider-mode flags, `run_one_hybrid_case.py` fails
+closed unless real; five read-only Neon views added to `init_neon.py`
+(`case_summary`, `hermes_decisions`, `recovery_actions`, `hermes_evidence`,
+`audit_timeline`); views read back and confirmed correct for case-18/case-11.
+Iteration 20: three `webhook_relay.py` hardening defects closed (absolute
+read deadline vs. drip-feed, premature-EOF rejection, log-method allowlist),
+offline only. See
+[`docs/archive/HANDOFF_full_2026-09-04.md`](docs/archive/HANDOFF_full_2026-09-04.md)
+for full narrative.
 
-`scripts/run_one_hybrid_case.py` (new) drove ONE case through real Hermes +
-Gemini decisions only (never simulated capture). Result: **case-18**
-(obligation `sub_demo_0004_8e781337`) - decision 1: `WAIT_FOR_PROVIDER_RETRY`
-authorized; after the simulated failed-retry input, decision 2:
-`CREATE_RECOVERY_LINK` authorized -> ONE real Payment Link created (reference
-`plink_TY2urjqVCjkjvB`; checkout URL persisted in Neon, not reproduced here).
+## Iteration 21 — Hermes SOUL wiring + offline verification
 
-**Scope change mid-task: do not complete the checkout.** The demo doesn't
-require a paid live checkout; recording uses this saved evidence instead.
-Case-18 left exactly as-is - no simulated capture, no forged webhook, no state
-edit. All three processes were stopped by exact PID/port match; verified ports
-8000/8100 free, the tunnel URL no longer resolves, Neon re-read shows case-18
-unchanged.
+Codex authored `config/hermes_agent/SOUL.md` (agent identity/scope/limits)
+and the first exemplar rule in `config/hermes_agent/SKILL.md` (consistent
+recent payment behavior); both preserved verbatim, unchanged by this
+iteration. Wired both into the isolated child's ephemeral system prompt.
 
-## Iteration 19 — review findings closed + read-only Neon views
+- **Parent** (`hermes_agent_strategist.py`): added `_SOUL_PATH` beside
+  `_SKILL_PATH` and a `soul_path` constructor parameter; `__init__` now
+  fails closed (`HermesRuntimeUnavailable`) if either file is missing or
+  unreadable. Both are read as UTF-8 and sent to the child as two distinct
+  `job` keys (`soul_text`, `skill_text` - never concatenated on the parent
+  side). `PROMPT_VERSION` bumped (`...2026-09-05.2`) since the child's
+  prompt contract changed.
+- **Child** (`hermes_agent/child_main.py`): `_system_prompt()` now takes
+  `soul_text` first and prepends it, so the ephemeral prompt order is SOUL
+  identity/scope -> SKILL judgment rules -> case context -> tool
+  descriptions/approved messages/output contract. No other child behavior
+  (tool budgets, repair limit, schema validation, audit allowlist) touched.
+- Everything else (isolation, subprocess deadline, tool budgets, one
+  in-flight decision, policy authority, audit sanitization, Neon, Razorpay,
+  FastAPI, fixtures, dashboard) is unchanged - this iteration only added the
+  SOUL file path/param/prompt-ordering wiring above.
 
-**Phase A** (offline only): `/health` now reports non-secret
-`payment_provider` / `payment_provider_test_mode_enabled` flags;
-`run_one_hybrid_case.py` fails closed (refuses `POST /demo/case`) unless both
-are the expected real values - `evidence_mode=SIMULATED` on the case's own
-synthetic intake is preserved, never relabelled. `webhook_relay.py` hardened:
-a documented 64 KiB body ceiling, `Content-Length` validated (missing/
-malformed/negative/oversized all rejected, 411/400/400/413, before any read),
-a bounded body-read deadline (408 on a stall), and logging reduced to method +
-a fixed route category + status only - never the raw path/query/headers/body.
-
-**Phase B**: five read-only views added to `scripts/init_neon.py`
-(`CREATE OR REPLACE VIEW` only; same single `ledger_state` JSONB row, nothing
-duplicated or made mutable): `case_summary` (authoritative `state` plus a
-derived, presentation-only `display_status`), `hermes_decisions` (one row per
-`AI_PROPOSAL`, joined to its own cycle's nearest `AI_MODEL_RUN`/
-`POLICY_DECISION` - never a global first/last), `recovery_actions`
-(`checkout_url_present` boolean, never the URL; `message_authorized` kept
-separate from `message_sent`), `hermes_evidence`, `audit_timeline`. Also fixed
-a real bug found running this: `init_neon.py`'s bare `psycopg.connect(dsn)`
-had no timeout and no IPv4 preference, so it hung indefinitely on this host's
-known IPv6 black hole - now reuses the app's own `_connect_bounded`.
-
-Ran `init_neon.py` once against the existing `.env` (DDL only, `hermes_demo`
-schema) and read all five views back directly: **case-18** - `state=active`
-(authoritative, unchanged), `display_status=RECOVERY_IN_PROGRESS`,
-`recovery_actions` shows the real link with `checkout_url_present=true`,
-`action_evidence_mode=REAL_TEST_MODE`, `message_authorized=true` /
-`message_sent=false` (kept separate); `hermes_decisions` shows both real
-decisions correctly paired (`WAIT_FOR_PROVIDER_RETRY` then
-`CREATE_RECOVERY_LINK`, ~19.2s/~19.4s execution, confidence 0.95/`high`).
-**case-11** unchanged: `state=recovered`, `display_status=RECOVERED`,
-`attribution=hermes_assisted`, `counted=true`.
-
-## Iteration 20 — relay corrections (offline only, no live activity)
-
-Three defects closed in `scripts/webhook_relay.py`, none of them touching a
-live API/Gemini/Razorpay/Neon call or the relay/tunnel (neither was started):
-
-1. **Absolute deadline, not inactivity-only.** The old `_read_body` set one
-   socket timeout, then called `self.rfile.read(length)` - which loops
-   internally over MULTIPLE `recv()` calls, each getting its OWN fresh
-   timeout, so a sender drip-feeding bytes just inside each gap could extend
-   the read forever. Now an incremental loop recalculates `remaining =
-   deadline - now()` before every read and uses `rfile.read1(want)` (at most
-   ONE underlying `recv()` per call, so the recalculated timeout genuinely
-   bounds just that step) - a continuously-active drip-feeder is still cut
-   off (408) once the absolute deadline passes, never forwarded partial.
-2. **Premature EOF.** A connection closing before exactly `Content-Length`
-   bytes arrive is now a distinct, fixed `400` rejection (was previously
-   indistinguishable from a timeout) - never forwarded upstream.
-3. **Normalized log method.** `log_request` printed `self.command` - the
-   client's raw, unvalidated method token - directly. Now mapped through a
-   fixed allowlist (`GET`/`HEAD`/`POST`/`PUT`/`DELETE`/`PATCH`/`OPTIONS`);
-   anything else, however crafted, logs as the fixed label `"OTHER"`.
-
-+4 tests in `tests/test_webhook_relay.py`: a continuously drip-feeding sender
-(never quiet long enough for a naive per-call timer to fire) is still
-rejected well inside the budget; a real premature EOF via `shutdown(SHUT_WR)`
-rejects 400 and never reaches the upstream stub; an attacker-controlled
-method string never appears in captured log output, only `"OTHER"`.
-
-`IMPLEMENTATION_BACKLOG.md` corrected: removed the stale "still uses
-FakeRazorpayAdapter" / "live pending" language (case-18 already proved the
-hybrid path live in Iteration 18) and trimmed one repeated historical-dataset
-sentence.
+New offline tests in `tests/test_hermes_agent.py`: missing SOUL and missing
+SKILL each fail closed independently; a faked `subprocess.run` captures the
+literal `job` JSON and proves `soul_text`/`skill_text` are the real files'
+exact contents as two distinct fields; `child_main._system_prompt()` is
+called directly with marker strings to prove SOUL precedes SKILL precedes
+case context. The existing `@requires_runtime` real-Hermes/offline-stub tests
+(local OpenAI-compat stub, no live Gemini) still return a schema-valid
+proposal after the wiring change - this proves wiring and contract behavior
+only, not the quality of Hermes's judgment against the new SOUL/SKILL text.
 
 ## Verified evidence
 

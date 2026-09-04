@@ -45,7 +45,7 @@ from .types import InvalidProposal, ProposalAction, StrategyProposal, StrategySn
 # validates message choice + strict field types inside the one-repair boundary;
 # get_payment_history is a single 12-month expansion; get_recovery_actions
 # returns the real per-case audit projection.
-PROMPT_VERSION = "hermes-agent/2026-09-05.1"
+PROMPT_VERSION = "hermes-agent/2026-09-05.2"
 
 # Bump to invalidate any previously-cached CA bundle on disk (e.g. the earlier
 # fix imported every OS root indiscriminately, ignoring trust purpose and
@@ -90,6 +90,7 @@ _DEFAULT_HOME = Path(os.environ.get(
     str(Path(__file__).resolve().parents[2] / ".hermes_home" / "isolated"),
 ))
 _SKILL_PATH = Path(__file__).resolve().parents[2] / "config" / "hermes_agent" / "SKILL.md"
+_SOUL_PATH = Path(__file__).resolve().parents[2] / "config" / "hermes_agent" / "SOUL.md"
 
 
 class HermesRuntimeUnavailable(RuntimeError):
@@ -244,6 +245,7 @@ class HermesAgentStrategist:
         python: Path | str = _DEFAULT_PYTHON,
         home: Path | str = _DEFAULT_HOME,
         skill_path: Path | str = _SKILL_PATH,
+        soul_path: Path | str = _SOUL_PATH,
         mock_base_url: str | None = None,   # offline harness: OpenAI-compat stub
         mock_model: str = "stub-model",
         gemini_model: str = "gemini-3.7-flash",
@@ -256,6 +258,7 @@ class HermesAgentStrategist:
         self._python = Path(python)
         self._home = Path(home)
         self._skill_path = Path(skill_path)
+        self._soul_path = Path(soul_path)
         self._mock_base_url = mock_base_url
         self._mock_model = mock_model
         self._gemini_model = gemini_model
@@ -271,6 +274,13 @@ class HermesAgentStrategist:
             raise HermesRuntimeUnavailable(f"Hermes checkout not found at {self._checkout}")
         if not self._skill_path.exists():
             raise HermesRuntimeUnavailable(f"project skill file missing: {self._skill_path}")
+        if not self._soul_path.exists():
+            raise HermesRuntimeUnavailable(f"project soul file missing: {self._soul_path}")
+        try:
+            self._skill_path.read_text(encoding="utf-8")
+            self._soul_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise HermesRuntimeUnavailable(f"project soul/skill file unreadable: {exc}") from exc
         self._revision = _verify_revision(self._checkout) if verify_revision else "unverified"
         self._prepare_home()
 
@@ -379,6 +389,7 @@ class HermesAgentStrategist:
             "mode": "mock" if self._mock_base_url else "gemini",
             "deadline_s": self._deadline_s,
             "max_iterations": MAX_MODEL_ITERATIONS,
+            "soul_text": self._soul_path.read_text(encoding="utf-8"),
             "skill_text": self._skill_path.read_text(encoding="utf-8"),
             "approved_messages": list(APPROVED_MESSAGE_INTENT_LIST),
             "evidence_bundle": _evidence_bundle(

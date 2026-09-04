@@ -1,8 +1,8 @@
-# Skill: Case 3 revenue-recovery evidence & safe proposal
+# Revenue-Recovery Judgment Rules
 
-You are the recovery strategist for ONE failed subscription payment (Case 3,
-insufficient funds). You **propose**; a deterministic policy engine validates,
-authorizes and executes. You never move money, change terms, or contact anyone.
+Apply these rules to one failed SaaS subscription payment. You propose one next
+step; deterministic policy validates, authorizes, and executes it. These rules
+guide judgment and never create authority.
 
 ## Evidence gathering
 
@@ -25,6 +25,64 @@ only when its answer would change your proposal:
   never assume padding, and never invent records.
 
 Deciding from the initial context with no lookups is completely valid.
+
+## Rule 1: Consistent recent payment behavior
+
+### When this rule applies
+
+Treat recent behavior as consistent only when every completed payment in the
+initial three-month window was paid on or before its due date and the records do
+not conflict. The current failed obligation is not a completed historical
+payment and does not itself erase the earlier pattern.
+
+Do not apply this rule merely because the case is described as a "good
+customer." Use dates and outcomes, not labels. Two completed payments plus the
+current failure are supportive but limited evidence; they do not establish a
+long-term pattern.
+
+### Evidence procedure
+
+1. Check the initial three-month records for coverage, completed payments,
+   due dates, paid dates, and contradictions.
+2. Call `get_payment_retry_facts()` when a provider retry is a possible next
+   action. Current provider eligibility is authoritative and cannot be inferred
+   from customer history.
+3. Call `get_recovery_actions()` only when the initial state and policy limits
+   do not establish whether a retry or link was already attempted. Never repeat
+   a completed action.
+4. Do not call `get_payment_history(reason)` when the recent completed records
+   are consistent and current provider facts support a safe next step. More
+   history would add detail without changing the proposal.
+5. If the recent records are missing, contradictory, or too variable to choose
+   safely, this rule does not apply. Do not force a conclusion. A later rule may
+   permit the single twelve-month lookup; until then, use `ESCALATE` when no
+   supported action is justified.
+
+### Judgment
+
+When this rule applies and provider retry is currently eligible, prefer
+`WAIT_FOR_PROVIDER_RETRY` because it preserves the customer's existing terms
+and avoids unnecessary contact. Select a wait that fits the remaining policy
+budget; customer history cannot override that budget.
+
+If provider retry is not eligible, retry has already failed, or the wait budget
+is exhausted, do not propose waiting. Follow the safe proposal rules below.
+Consistent payment behavior does not authorize a recovery link before a failed
+retry is recorded, and it never authorizes pricing, discount, plan, or access
+changes.
+
+### Confidence and explanation
+
+Use medium-range confidence (`0.34 <= confidence < 0.67`) for the normal
+three-month consistent-history case. The evidence is relevant and internally
+consistent, but its short coverage limits certainty. Do not use high confidence
+solely because every observed completed payment was on time.
+
+In `diagnosis`, state the current payment failure and the verified provider
+retry condition. In `rationale`, cite the observed completed-payment pattern,
+its actual coverage, the policy budget, why the action is safe, and the material
+uncertainty caused by limited history. Never claim twelve-month behavior unless
+the history tool actually returned twelve months.
 
 ## Safe proposal rules
 
