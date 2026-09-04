@@ -13,6 +13,7 @@ the five reviewed defects they regress.
 
 from __future__ import annotations
 
+import http.server
 import json
 import threading
 import time
@@ -28,6 +29,7 @@ from hermes.razorpay_test_mode import (
     RazorpayTestModeAdapter,
     RealWebhookError,
     _AmbiguousCompletion,
+    _live_post,
     case_id_from_reference,
     handle_payment_link_paid_webhook,
     load_credentials,
@@ -428,6 +430,133 @@ def test_webhook_rejects_contradictory_signed_currency():
     assert ei.value.status_code == 422
 
 
+# === signed-envelope agreement with case/readback, and correct statuses ===
+# (envelope entities can agree with EACH OTHER while both disagreeing with
+# what we actually know about the case - that must still be rejected, and a
+# missing/wrong status must never reach a provider call either)
+
+
+def test_webhook_rejects_missing_link_status():
+    envelope = _paid_envelope(link_id="plink_x", reference_id="hermes-case-1", payment_id="pay_x")
+    del envelope["payload"]["payment_link"]["entity"]["status"]
+    raw = json.dumps(envelope).encode("utf-8")
+    engine, provider, _ = _hybrid_engine()
+    with pytest.raises(RealWebhookError) as ei:
+        handle_payment_link_paid_webhook(
+            engine=engine, provider=provider, webhook_secret=WEBHOOK_SECRET,
+            raw=raw, signature=_demo_sign(raw), event_id="evt_no_link_status",
+        )
+    assert ei.value.status_code == 422
+
+
+def test_webhook_rejects_wrong_link_status():
+    envelope = _paid_envelope(link_id="plink_x", reference_id="hermes-case-1", payment_id="pay_x")
+    envelope["payload"]["payment_link"]["entity"]["status"] = "created"  # not "paid"
+    raw = json.dumps(envelope).encode("utf-8")
+    engine, provider, _ = _hybrid_engine()
+    with pytest.raises(RealWebhookError) as ei:
+        handle_payment_link_paid_webhook(
+            engine=engine, provider=provider, webhook_secret=WEBHOOK_SECRET,
+            raw=raw, signature=_demo_sign(raw), event_id="evt_wrong_link_status",
+        )
+    assert ei.value.status_code == 422
+
+
+def test_webhook_rejects_missing_payment_status():
+    envelope = _paid_envelope(link_id="plink_x", reference_id="hermes-case-1", payment_id="pay_x")
+    del envelope["payload"]["payment"]["entity"]["status"]
+    raw = json.dumps(envelope).encode("utf-8")
+    engine, provider, _ = _hybrid_engine()
+    with pytest.raises(RealWebhookError) as ei:
+        handle_payment_link_paid_webhook(
+            engine=engine, provider=provider, webhook_secret=WEBHOOK_SECRET,
+            raw=raw, signature=_demo_sign(raw), event_id="evt_no_payment_status",
+        )
+    assert ei.value.status_code == 422
+
+
+def test_webhook_rejects_wrong_payment_status():
+    envelope = _paid_envelope(link_id="plink_x", reference_id="hermes-case-1", payment_id="pay_x")
+    envelope["payload"]["payment"]["entity"]["status"] = "authorized"  # not "captured"
+    raw = json.dumps(envelope).encode("utf-8")
+    engine, provider, _ = _hybrid_engine()
+    with pytest.raises(RealWebhookError) as ei:
+        handle_payment_link_paid_webhook(
+            engine=engine, provider=provider, webhook_secret=WEBHOOK_SECRET,
+            raw=raw, signature=_demo_sign(raw), event_id="evt_wrong_payment_status",
+        )
+    assert ei.value.status_code == 422
+
+
+def test_webhook_rejects_envelope_amount_that_agrees_internally_but_not_with_the_case():
+    """The link and payment entities agree with EACH OTHER (so the earlier
+    contradiction check passes) but both disagree with the case's actual
+    persisted obligation amount - this must still be rejected, before any
+    provider call."""
+    calls = []
+    get = lambda url, **k: calls.append(url) or {}
+    post = lambda url, **k: {"id": "plink_agree_wrong", "short_url": "https://rzp.io/l/x"}
+    engine, provider, led = _hybrid_engine(http_post=post, http_get=get)
+    case_id = _drive_to_link(engine, provider)
+    reference_id = reference_id_for(case_id)
+    envelope = _paid_envelope(link_id="plink_agree_wrong", reference_id=reference_id,
+                              payment_id="pay_x", amount=AMOUNT + 500)  # same on both entities
+    raw = json.dumps(envelope).encode("utf-8")
+    with pytest.raises(RealWebhookError) as ei:
+        handle_payment_link_paid_webhook(
+            engine=engine, provider=provider, webhook_secret=WEBHOOK_SECRET,
+            raw=raw, signature=_demo_sign(raw), event_id="evt_agree_wrong_amount",
+        )
+    assert ei.value.status_code == 409
+    assert calls == []  # rejected before any provider fetch
+    assert led.case_projection(case_id=case_id).state != "recovered"
+
+
+def test_webhook_rejects_envelope_currency_that_agrees_internally_but_not_with_the_case():
+    calls = []
+    get = lambda url, **k: calls.append(url) or {}
+    post = lambda url, **k: {"id": "plink_agree_wrong_ccy", "short_url": "https://rzp.io/l/y"}
+    engine, provider, led = _hybrid_engine(http_post=post, http_get=get)
+    case_id = _drive_to_link(engine, provider)
+    reference_id = reference_id_for(case_id)
+    envelope = _paid_envelope(link_id="plink_agree_wrong_ccy", reference_id=reference_id,
+                              payment_id="pay_x", currency="USD")  # same on both entities
+    raw = json.dumps(envelope).encode("utf-8")
+    with pytest.raises(RealWebhookError) as ei:
+        handle_payment_link_paid_webhook(
+            engine=engine, provider=provider, webhook_secret=WEBHOOK_SECRET,
+            raw=raw, signature=_demo_sign(raw), event_id="evt_agree_wrong_ccy",
+        )
+    assert ei.value.status_code == 409
+    assert calls == []
+    assert led.case_projection(case_id=case_id).state != "recovered"
+
+
+def test_webhook_still_recovers_when_envelope_agrees_with_the_case_and_readback():
+    """Preserved valid-event path: the new status + case-agreement checks
+    must not break a genuinely correct, fully-agreeing webhook."""
+    post = lambda url, **k: {"id": "plink_agree_ok", "short_url": "https://rzp.io/l/ok"}
+    engine, provider, led = _hybrid_engine(http_post=post)
+    case_id = _drive_to_link(engine, provider)
+    reference_id = reference_id_for(case_id)
+
+    def get(url, *, auth):
+        if "/payment_links/" in url:
+            return _link_resp(link_id="plink_agree_ok", reference_id=reference_id,
+                              payments=[_pay_entry("pay_ok")])
+        return _payment_resp(payment_id="pay_ok")
+
+    provider._real._get = get
+    envelope = _paid_envelope(link_id="plink_agree_ok", reference_id=reference_id, payment_id="pay_ok")
+    raw = json.dumps(envelope).encode("utf-8")
+    result = handle_payment_link_paid_webhook(
+        engine=engine, provider=provider, webhook_secret=WEBHOOK_SECRET,
+        raw=raw, signature=_demo_sign(raw), event_id="evt_agree_ok",
+    )
+    assert result["accepted"] is True
+    assert led.case_projection(case_id=case_id).state == "recovered"
+
+
 # === defect 3: request-specific verification, performed once =============
 
 
@@ -623,6 +752,108 @@ def test_provider_success_before_local_persistence_is_still_safe_on_crash():
     engine2.reconcile_uncertain_intents()
     proj = led2.case_projection(case_id=case_id)
     assert proj.state == "escalated"  # not recovered - uncertainty, not invented success
+
+
+# === malformed/truncated RAW HTTP response bytes (_live_post) =============
+# Real bytes over a real local socket - not an injected decoded dict - so the
+# actual transport/read/decode exception types (JSONDecodeError,
+# UnicodeDecodeError, http.client.IncompleteRead) are what gets exercised.
+
+
+class _MalformedPostHandler(http.server.BaseHTTPRequestHandler):
+    mode = "ok"  # set per-test before starting the server
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        self.rfile.read(length)  # consume the request body fully
+        if self.mode == "bad_json":
+            payload = b'{"id": "plink_bad", invalid-json'
+        elif self.mode == "bad_encoding":
+            payload = b"\xff\xfe\x00\x01\x02\x03\x04\x05"
+        elif self.mode == "truncated":
+            payload = b'{"id": "plink_truncated_should_never_surface_1234567890"}'
+        else:
+            payload = json.dumps({"id": "plink_ok", "short_url": "https://rzp.io/l/ok"}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        if self.mode == "truncated":
+            # Promise more bytes than are actually sent, then close early -
+            # triggers http.client.IncompleteRead on the client's read().
+            self.send_header("Content-Length", str(len(payload) + 1000))
+            self.end_headers()
+            self.wfile.write(payload[: len(payload) // 2])
+            self.close_connection = True
+        else:
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    def log_message(self, *a):  # silence
+        pass
+
+
+@pytest.fixture
+def malformed_server():
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _MalformedPostHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield srv
+    srv.shutdown()
+
+
+def test_malformed_json_bytes_raise_ambiguous_completion(malformed_server):
+    _MalformedPostHandler.mode = "bad_json"
+    port = malformed_server.server_address[1]
+    with pytest.raises(_AmbiguousCompletion):
+        _live_post(f"http://127.0.0.1:{port}/v1/payment_links",
+                  auth=("rzp_test_x", "secret"), json_body={"a": 1})
+
+
+def test_invalid_encoding_bytes_raise_ambiguous_completion(malformed_server):
+    _MalformedPostHandler.mode = "bad_encoding"
+    port = malformed_server.server_address[1]
+    with pytest.raises(_AmbiguousCompletion):
+        _live_post(f"http://127.0.0.1:{port}/v1/payment_links",
+                  auth=("rzp_test_x", "secret"), json_body={"a": 1})
+
+
+def test_truncated_response_body_raises_ambiguous_completion(malformed_server):
+    _MalformedPostHandler.mode = "truncated"
+    port = malformed_server.server_address[1]
+    with pytest.raises(_AmbiguousCompletion):
+        _live_post(f"http://127.0.0.1:{port}/v1/payment_links",
+                  auth=("rzp_test_x", "secret"), json_body={"a": 1})
+
+
+def test_well_formed_response_bytes_still_work(malformed_server):
+    """Sanity check: the local server + client plumbing itself is not what's
+    rejecting - a normal response parses fine."""
+    _MalformedPostHandler.mode = "ok"
+    port = malformed_server.server_address[1]
+    resp = _live_post(f"http://127.0.0.1:{port}/v1/payment_links",
+                      auth=("rzp_test_x", "secret"), json_body={"a": 1})
+    assert resp == {"id": "plink_ok", "short_url": "https://rzp.io/l/ok"}
+
+
+def test_truncated_response_bytes_persist_a_safe_uncertain_state_through_the_engine(malformed_server):
+    """The durable outcome: real truncated wire bytes reach engine.run() and
+    end up in the SAME safe uncertain/escalated state as a caught timeout -
+    never an uncaught crash, never a fabricated success."""
+    _MalformedPostHandler.mode = "truncated"
+    port = malformed_server.server_address[1]
+
+    def redirecting_post(url, *, auth, json_body):
+        # redirects the hardcoded Razorpay URL to the local malformed server -
+        # exercises the REAL _live_post against REAL malformed bytes.
+        return _live_post(f"http://127.0.0.1:{port}/v1/payment_links",
+                          auth=auth, json_body=json_body)
+
+    engine, provider, led = _hybrid_engine(http_post=redirecting_post)
+    case_id = _drive_to_wait_then_retry_failed(engine, provider)
+    engine.run(until=2)
+    proj = led.case_projection(case_id=case_id)
+    assert proj.state == "escalated" and proj.attribution == "unrecovered"
+    assert proj.linked_payment_id is None  # never recovered
+    assert proj.action_intents[0].status == "uncertain"
 
 
 # === defect 5: message authorization vs actual delivery ===================

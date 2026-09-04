@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import http.client
 import json
 import re
 import urllib.request
@@ -100,12 +101,23 @@ def _live_post(url: str, *, auth: tuple[str, str], json_body: dict) -> dict:
     req = urllib.request.Request(url, data=body, method="POST",
                                   headers={"Content-Type": "application/json"})
     _basic_auth(req, auth)
+    # The request may have reached Razorpay even if reading/decoding the
+    # response then fails - a truncated body, invalid encoding, or malformed
+    # JSON is exactly as ambiguous as a timeout: we still cannot tell whether
+    # a live link was created. Every failure from "sent" onward funnels into
+    # the SAME _AmbiguousCompletion -> ProviderActionUncertain path.
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read())
+            raw = resp.read()
     except TimeoutError as exc:
         raise _AmbiguousCompletion(str(type(exc).__name__)) from exc
-    except OSError as exc:  # connection reset, broken pipe, etc. - ambiguous
+    except OSError as exc:  # connection reset, broken pipe, etc.
+        raise _AmbiguousCompletion(str(type(exc).__name__)) from exc
+    except http.client.HTTPException as exc:  # e.g. IncompleteRead: truncated body
+        raise _AmbiguousCompletion(str(type(exc).__name__)) from exc
+    try:
+        return json.loads(raw)
+    except ValueError as exc:  # JSONDecodeError or UnicodeDecodeError (bad encoding)
         raise _AmbiguousCompletion(str(type(exc).__name__)) from exc
 
 
@@ -432,15 +444,20 @@ def handle_payment_link_paid_webhook(
     parsing), then the event id, then full envelope shape/type validation
     (every required id/status/amount/currency present and correctly typed -
     a malformed envelope raises a controlled :class:`RealWebhookError`, never
-    an uncaught exception), then a same-envelope cross-check (the link's own
-    claimed amount/currency must agree with the payment's - contradictory
-    signed facts are rejected before any provider call), then this case's own
-    persisted link correlation, then ONE independent provider readback
-    (:meth:`RazorpayTestModeAdapter.verify_link_payment`), and only then
-    ``engine.receive`` - the one path that can mark a case ``recovered``,
-    still running every ledger validation (dedup, terminal-state, version,
-    atomic finalization) unchanged. Rejects on any unverified, mismatched,
-    unrelated, or partial payment.
+    an uncaught exception), then the envelope's OWN claimed statuses (link
+    ``paid``, payment ``captured``), then a same-envelope cross-check (the
+    link's own claimed amount/currency must agree with the payment's -
+    contradictory signed facts are rejected before any provider call), then
+    - once the case is resolved - that the envelope's amount/currency also
+    agree with the PERSISTED obligation (agreeing with each other on the
+    wrong number is not enough), then this case's own persisted link
+    correlation, then ONE independent provider readback
+    (:meth:`RazorpayTestModeAdapter.verify_link_payment`, which re-confirms
+    status/amount/currency against the SAME persisted obligation from the
+    provider's own records), and only then ``engine.receive`` - the one path
+    that can mark a case ``recovered``, still running every ledger validation
+    (dedup, terminal-state, version, atomic finalization) unchanged. Rejects
+    on any unverified, mismatched, unrelated, or partial payment.
     """
     if not _signature_ok(webhook_secret, raw, signature):
         raise RealWebhookError(401, "invalid signature")
@@ -464,15 +481,23 @@ def handle_payment_link_paid_webhook(
 
     reference_id = _entity_str(link_entity, "reference_id")
     link_id = _entity_str(link_entity, "id")
+    link_status = _entity_str(link_entity, "status")
     link_amount = _entity_amount(link_entity, "amount")
     link_currency = _entity_currency(link_entity, "currency")
     payment_id = _entity_str(payment_entity, "id")
+    payment_status = _entity_str(payment_entity, "status")
     payment_amount = _entity_amount(payment_entity, "amount")
     payment_currency = _entity_currency(payment_entity, "currency")
-    required = (reference_id, link_id, link_amount, link_currency,
-                payment_id, payment_amount, payment_currency)
+    required = (reference_id, link_id, link_status, link_amount, link_currency,
+                payment_id, payment_status, payment_amount, payment_currency)
     if any(v is None for v in required):
         raise RealWebhookError(422, "malformed payment_link.paid envelope")
+
+    # The signed envelope must itself claim the paid/captured statuses this
+    # route exists to handle - a missing or different status is rejected
+    # here, not left for the provider readback to catch alone.
+    if link_status != _PAID or payment_status != _CAPTURED:
+        raise RealWebhookError(422, "signed envelope status is not paid/captured")
 
     # Contradictory signed facts, rejected BEFORE any provider call: the
     # link's own claimed amount/currency must agree with the payment's.
@@ -489,6 +514,17 @@ def handle_payment_link_paid_webhook(
         case = engine.inspect(CaseQuery(case_id=case_id))
     except KeyError:
         raise RealWebhookError(404, "unknown case")
+
+    # The envelope's own (mutually-agreeing) amount/currency must ALSO agree
+    # with the persisted obligation - internal agreement alone is not enough
+    # if both entities simply agree on the WRONG number. This still isn't
+    # the source of truth (the independent provider readback below is) but a
+    # webhook that already contradicts our own case data is rejected without
+    # spending a provider round trip on it.
+    if link_amount != case.amount_minor or link_currency != case.currency:
+        raise RealWebhookError(
+            409, "signed envelope amount/currency does not match this case's obligation"
+        )
 
     stored_ref = next(
         (i.reference for i in case.action_intents

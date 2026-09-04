@@ -2221,3 +2221,41 @@ Offline: 269 passed, 3 skipped (was 237; +31 tests/test_razorpay_test_mode.py
 + 1 startup-grace regression). Real-Hermes harness 33 passed, unaffected.
 case-11 re-read read-only, unchanged. No live Razorpay/Gemini call, no new
 Neon case, no public tunnel started.
+
+---
+
+## Iteration 16 archived detail (moved from HANDOFF.md during Iteration 17)
+
+Fixed five Codex-reviewed defects in the Iteration 15 Razorpay HYBRID slice,
+offline only. (1) Independent payment-to-link verification:
+RazorpayTestModeAdapter.verify_link_payment now fetches BOTH the Payment Link
+and the payment (was: payment only, with the webhook's claimed link id
+copied unverified into "verified" evidence); requires the link's own
+id/reference_id/status/amount/currency to match, the payment's own
+id/status/amount/currency to match, and the link's own `payments` list to
+show this payment captured at the expected amount. (2) No silent fallback on
+incomplete evidence: a missing/wrong-typed currency (or any required field)
+now fails closed - the old `capture.currency or case.currency` fallback was
+removed; contradictory link/payment amount or currency within the SAME
+signed envelope is rejected before any provider call; malformed nested
+entity types raise a controlled RealWebhookError, never crash. (3)
+Request-scoped verification, once: removed the mutable
+`_pending[obligation_id]` dict; `verify_link_payment(LinkPaymentClaim)` takes
+an immutable per-call claim; `RazorpayWebhook.pre_verified_capture` carries
+confirmed evidence into `engine.receive` so the engine no longer re-fetches
+(one provider fetch pair per webhook, not two) while every ledger validation
+stays unchanged. (4) Safe stop for uncertain link creation:
+`create_recovery_link` raises `ProviderActionUncertain` on an ambiguous POST
+or malformed response; `engine.run()` catches it and persists an explicit
+`apply_action_intent_uncertain` transition (intent "uncertain", case
+"escalated"/"unrecovered"); new `RecoveryEngine.reconcile_uncertain_intents()`
+(wired into `runtime.build_app`) catches the same case after a raw crash. (5)
+`message_sent` is real capability AND authorization: the real/hybrid
+provider exposes `message_delivery_capable = False`, so a real/hybrid case
+never reports a message as sent regardless of what policy authorized;
+FakeRazorpayAdapter is unaffected (defaults True).
+
+`tests/test_razorpay_test_mode.py` rewritten: 46 tests (was 31). Offline:
+284 passed, 3 skipped (was 269). Real-Hermes harness 33 passed, unaffected.
+case-11 re-read read-only, unchanged. No live Razorpay/Gemini call, no new
+Neon case, no public tunnel.

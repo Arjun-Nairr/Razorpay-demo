@@ -1,6 +1,6 @@
 # Cross-Agent Handoff — current-state index
 
-Last updated: 2026-09-04 (Asia/Dubai), Iteration 16. Branch
+Last updated: 2026-09-04 (Asia/Dubai), Iteration 17. Branch
 `feat/isolated-hermes-agent`, latest commit at bottom. This file stays
 **under 300 lines**: it is an index, not a log. Detail lives in the linked
 docs; iteration-by-iteration history is in
@@ -33,10 +33,10 @@ index; it does **not** authorize implementation. History on demand: the archive.
 
 ## Authorization (current)
 
-- Fix five Codex-reviewed defects in the Razorpay Test Mode HYBRID slice,
-  offline only (this iteration). **No live Razorpay or Gemini call, no new
-  Neon case, no public tunnel.** ONE live hybrid test remains authorized only
-  after Codex reviews this correction.
+- Apply two small Codex-reviewed corrections to the Razorpay Test Mode HYBRID
+  slice, offline only (this iteration). **No live Razorpay or Gemini call, no
+  new Neon case, no public tunnel.** ONE live hybrid test remains authorized
+  only after Codex reviews this correction.
 - Earlier authorization (still valid, unchanged): local startup fixes and the
   ONE already-completed real Gemini-backed Hermes case against the existing
   `hermes_demo` Neon schema (`case-11` - preserved, re-verified unchanged).
@@ -83,7 +83,7 @@ the budget is spent, what's left (including ~0) is what the next step gets,
 never a re-granted window. Regression:
 `test_no_fresh_grace_period_after_connect_exhausts_the_budget`.
 
-## Razorpay Test Mode — HYBRID slice (Iterations 15–16, offline-tested only)
+## Razorpay Test Mode — HYBRID slice (Iterations 15–17, offline-tested only)
 
 Per [`RAZORPAY_TEST_SLICE.md`](RAZORPAY_TEST_SLICE.md). The simulated SaaS
 obligation, its 3/12-month history, and the accelerated failure/retry sequence
@@ -93,51 +93,40 @@ confirmation go through genuine Razorpay Test Mode calls when the
 independent of Hermes/Gemini mode; default remains `fake`, zero behavior
 change). Native subscription-retry signals and historical-data retrieval are
 **not** implemented - retry eligibility always stays simulated. Iteration 15's
-first cut is archived; Iteration 16 fixed five Codex-reviewed defects in it:
+first cut and Iteration 16's five-defect correction are archived (independent
+payment-to-link verification, no silent evidence fallback, request-scoped
+single verification, safe uncertain-outcome persistence, authorization ≠
+delivery). Iteration 17 closed two more small gaps in that correction:
 
-1. **Independent payment-to-link verification.** The old `verify_capture`
-   fetched only the payment and copied the webhook's *claimed* link id
-   straight into "verified" evidence. `RazorpayTestModeAdapter.verify_link_payment`
-   now fetches BOTH the Payment Link and the payment, requires the link's own
-   fetched `id`/`reference_id`/`status`/`amount`/`currency` to match, the
-   payment's own fetched `id`/`status`/`amount`/`currency` to match, **and**
-   the link's own `payments` list (Razorpay's documented per-link payment
-   history) to contain this payment id, itself `captured` at the expected
-   amount - the actual evidence one belongs to the other, not two
-   separately-plausible records.
-2. **No silent fallback on incomplete evidence.** A missing/wrong-typed
-   currency (or any other required id/status/amount) now fails the match
-   outright - it is never treated as "no evidence" and waved through with a
-   `capture.currency or case.currency` fallback (removed). The webhook
-   envelope's own required fields are validated by type before use, and a
-   link/payment amount or currency that contradicts each other within the
-   SAME signed envelope is rejected before any provider call.
-3. **Request-scoped verification, once.** The mutable `_pending[obligation_id]`
-   dict is gone. `verify_link_payment(claim: LinkPaymentClaim)` takes an
-   immutable, per-call claim and returns fresh evidence from its own two
-   fetches only - concurrent deliveries for the same obligation cannot mix.
-   `RazorpayWebhook.pre_verified_capture` carries that evidence straight into
-   `engine.receive`, so `_on_captured` skips its own `record_capture`/
-   `verify_capture` round trip for `REAL_TEST_MODE` (one provider fetch pair
-   per webhook, not two) while every ledger validation (dedup, terminal-state,
-   version, atomic finalization) still runs unchanged.
-4. **Safe stop for uncertain link creation.** `create_recovery_link` now
-   raises `ProviderActionUncertain` (not a bare `RuntimeError`) on an
-   ambiguous POST or a malformed response; `engine.run()` catches it and
-   persists an explicit `apply_action_intent_uncertain` transition - intent
-   status `uncertain`, case `escalated`/`unrecovered` - never recovered, never
-   a replacement link, never a silent automatic retry. A NEW
-   `RecoveryEngine.reconcile_uncertain_intents()` sweep (wired into
-   `runtime.build_app`) finds any intent still `pending` after a genuine crash
-   (not just a caught exception) and applies the same safe stop on startup.
-5. **Authorization ≠ delivery.** `message_sent` is no longer
-   `result.message_authorized` verbatim. The real/hybrid provider exposes
-   `message_delivery_capable = False` (no messaging adapter exists in this
-   slice); the engine now sends `message_sent = message_authorized AND
-   capable`, so a real/hybrid case never reports a message as sent (and its
-   contact counters never move) regardless of what policy authorized. The
-   simulated `FakeRazorpayAdapter` has no such attribute (defaults `True`) -
-   its existing, tested "simulated sending" behavior is unchanged.
+1. **Malformed/truncated raw POST responses now reach the same safe path.**
+   `_live_post` caught timeout/`OSError`, but not a truncated response body
+   (`http.client.IncompleteRead`), invalid byte encoding, or malformed JSON
+   after the request was sent - those propagated uncaught instead of
+   becoming `ProviderActionUncertain`. Every failure from "request sent"
+   onward - transport, read, or decode - now funnels into the same
+   `_AmbiguousCompletion` → `ProviderActionUncertain` → `uncertain`/
+   `escalated` path as an ambiguous timeout. Verified against REAL bytes over
+   a real local socket (a `Content-Length`-truncated response, invalid UTF-8,
+   and syntactically-broken JSON), not an injected decoded dict.
+2. **Signed-envelope agreement, not just internal consistency.**
+   `handle_payment_link_paid_webhook` now requires the envelope's own claimed
+   `payment_link.status == "paid"` and `payment.status == "captured"`
+   (previously only checked by the provider readback, not the envelope
+   itself), and requires the envelope's (mutually-agreeing) amount/currency
+   to also match the **persisted case obligation** - two entities that agree
+   with each other on the wrong number are now rejected before any provider
+   call, not just entities that disagree with each other. The independent
+   provider readback (`verify_link_payment`) still re-confirms all of this
+   against the provider's own records; this is an earlier, cheaper reject,
+   not a replacement for it.
+
+**Fixture-vs-provider verification**: the Payment Link entity's `payments`
+array field names used in the test fixtures (`payment_id`, `amount`,
+`status`) were checked against Razorpay's own documented Create-Standard-Link
+response description (fetched live via `WebFetch` this iteration) - confirmed
+matching. This confirms the fixture *shape* agrees with the documented
+contract; it is not a substitute for the one still-pending live Test Mode
+call, which alone proves actual API behavior.
 
 - **`HybridPaymentProvider`**: composes the existing `FakeRazorpayAdapter`
   (retry eligibility only) with the real adapter (link creation + capture
@@ -175,32 +164,26 @@ first cut is archived; Iteration 16 fixed five Codex-reviewed defects in it:
 ## Verified evidence
 
 - **Offline**: `python -m pytest -q --ignore=tests/test_hermes_agent.py` ->
-  **284 passed, 3 skipped** (was 269; `tests/test_razorpay_test_mode.py`
-  rewritten to 46 tests - the old 31 plus new coverage for all five defects,
-  net +15). Real-Hermes harness `python -m pytest -q tests/test_hermes_agent.py`
-  -> **33 passed** (unaffected; confirms the type/protocol additions stay
-  backward compatible). `compileall` + `git diff --check` clean.
-- New coverage per defect: (1) unrelated-payment rejection (valid payment,
-  absent from the link's own `payments` list), link-id echo mismatch,
-  reference-id mismatch, wrong-status-on-link rejection; (2) missing currency
-  on either fetched record, mismatched amount/currency/status, malformed
-  (non-dict) readback responses, malformed webhook entity types, contradictory
-  same-envelope amount/currency; (3) exactly-one-fetch-pair-per-call, a
-  50ms-skewed two-thread concurrent-delivery test proving evidence never
-  mixes, and a handler+engine single-fetch regression; (4) ambiguous POST and
-  malformed-response uncertain-state persistence, no-auto-retry, restart
-  reconciliation after both a caught exception and a raw crash, and a
-  provider-success-before-local-persistence crash case; (5) real/hybrid
-  `message_sent` always `False` with contact counters unmoved even when
-  policy authorized a message, vs. the simulated path's unchanged behavior.
-  Plus the retained defect-independent coverage: signature rejection,
-  duplicate event id, duplicate payment across deliveries, out-of-order
-  delivery on a terminal case, and restart correlation.
-- **`case-11` preserved**: re-read read-only this iteration (direct `psycopg`,
-  no writes) to confirm it still loads cleanly under the new optional
-  dataclass fields - `state=recovered`, `attribution=hermes_assisted`,
-  `recovered_minor=1,000,000`, unchanged. No new Neon case; no live
-  Razorpay/Gemini call; no public tunnel.
+  **296 passed, 3 skipped** (was 284; `tests/test_razorpay_test_mode.py` grew
+  from 46 to 58 tests). Real-Hermes harness
+  `python -m pytest -q tests/test_hermes_agent.py` -> **33 passed**
+  (unaffected - this iteration touched only `razorpay_test_mode.py` and its
+  tests). `compileall` + `git diff --check` clean; diff confined to those two
+  files.
+- New coverage this iteration: (1) a local `http.server` fixture producing
+  REAL truncated/invalid-encoding/malformed-JSON response bytes over a real
+  socket, tested both directly against `_live_post` and end-to-end through
+  `engine.run()` to the durable `escalated`/`uncertain` outcome, plus a
+  well-formed-bytes sanity check; (2) missing/wrong `payment_link.status` and
+  `payment.status` in the signed envelope, an envelope whose link/payment
+  entities agree with each other on an amount or currency that disagrees with
+  the persisted case (rejected before any provider call), and a preserved
+  fully-agreeing valid-event path.
+- Ledger/persistence code was **not touched** this iteration (only the
+  Razorpay adapter/webhook module and its tests) - `case-11` and the
+  snapshot schema are structurally unaffected; no fresh readback was needed
+  to confirm that. No new Neon case; no live Razorpay/Gemini call; no public
+  tunnel.
 
 ## Inspecting the persisted proof
 
@@ -229,11 +212,12 @@ hybrid_test_mode` (+ the three `RAZORPAY_*` secrets) before launch; leave
 
 ## Next action
 
-Codex review of the Iteration 16 corrections (offline evidence above). Then,
-per the backlog: ONE authorized live hybrid test (real Test Mode link ->
-manual checkout -> real webhook -> Neon evidence), followed by the three
-deferred exemplars (on-time / late / mixed-history) - not before. Keep future
-`HANDOFF.md` updates under 300 lines.
+Codex review of the Iteration 17 corrections (offline evidence above). Then,
+per the backlog and per this prompt's own closing instruction: webhook/tunnel
+setup and ONE manual Test Mode checkout - not another feature phase. The
+three deferred exemplars (on-time / late / mixed-history) still wait until
+after that one verified hybrid flow. Keep future `HANDOFF.md` updates under
+300 lines.
 
 ## Working-document links
 
