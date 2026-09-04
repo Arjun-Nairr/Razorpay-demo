@@ -48,6 +48,11 @@ class RazorpayWebhook:
     consent: bool = True  # merchant-recorded contact consent
     reachable_channel: bool = True  # merchant has a reachable contact channel
     evidence_mode: str = "SIMULATED"  # "SIMULATED" | "REAL_TEST_MODE"
+    link_id: str | None = None  # REAL_TEST_MODE only: the provider's own Payment
+    # Link id (e.g. "plink_..."), independently confirmed by the webhook route
+    # BEFORE this webhook is built - never the payment id. Threads through to
+    # attribution correlation (see ``CaptureCommand.link_id``). Always ``None``
+    # for SIMULATED events.
 
 
 @dataclass(frozen=True)
@@ -70,6 +75,10 @@ class CaptureInfo:
     obligation_id: str
     payment_id: str
     amount_minor: int
+    currency: str | None = None  # independently confirmed by the provider, when
+    # known; a real adapter's own readback, never the caller's claim.
+    link_id: str | None = None  # the provider's own Payment Link id this capture
+    # was independently confirmed against, when known (REAL_TEST_MODE only).
 
 
 def valid_payment_id(value: str | None) -> bool:
@@ -273,8 +282,11 @@ class ActionIntent:
     idempotency_key: str
     created_time: int
     status: str = "pending"  # "pending" | "executed"
-    reference: str | None = None  # the fake executor's simulated correlation id
+    reference: str | None = None  # the executor's correlation id (fake link
+    # reference, or a real Razorpay Payment Link id)
     message_sent: bool = False
+    url: str | None = None  # the real Payment Link's checkout URL, when known
+    # (REAL_TEST_MODE only; distinct from ``reference``, the provider's link id)
 
 
 # Audit event kinds (append-only trail).
@@ -434,6 +446,10 @@ class CaptureCommand:
     expected_version: int  # case version observed before provider verification
     expected_state: str  # case state observed before provider verification
     evidence_mode: str = "SIMULATED"  # "SIMULATED" | "REAL_TEST_MODE"
+    link_id: str | None = None  # the provider's own Payment Link id this
+    # capture was independently confirmed against (REAL_TEST_MODE only). Lets
+    # attribution correlate a real payment (its own id, e.g. "pay_...") to the
+    # link it paid, without conflating a payment id with a link id.
 
 
 @dataclass(frozen=True)
@@ -447,8 +463,9 @@ class ActionIntentOutcomeCommand:
     intent_id: str
     case_id: str
     now: int
-    reference: str  # the fake executor's deterministic, uniquely correlated id
+    reference: str  # the executor's deterministic, uniquely correlated id
     message_sent: bool
+    url: str | None = None  # REAL_TEST_MODE only: the Payment Link checkout URL
 
 
 # --- engine results ------------------------------------------------------
@@ -501,6 +518,7 @@ class ActionIntentProjection:
     status: str  # "pending" | "executed"
     reference: str | None
     message_sent: bool
+    url: str | None = None  # REAL_TEST_MODE only: the Payment Link checkout URL
 
 
 @dataclass(frozen=True)

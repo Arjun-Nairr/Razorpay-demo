@@ -1,5 +1,14 @@
 # Five-Case Scenario Matrix
 
+> **SUPERSEDED (2026-09-04, Iteration 14/15):** this five-case plan is
+> replaced by THREE deferred exemplars - consistently on-time, consistently
+> late, and mixed history with a justified optional history lookup - built
+> only after the Razorpay Test Mode HYBRID slice (`RAZORPAY_TEST_SLICE.md`,
+> `IMPLEMENTATION_BACKLOG.md` §2/§5) is Codex-reviewed and live-verified. Case
+> 3 below is the one already-proven vertical slice (`case-11`); the table
+> stays as historical reference for its shared constraints and policy shape,
+> not as an authorization to build cases 1/2/4/5 as written.
+
 The batch contains three common payment failures and two payment-history
 outliers. All five use the same workflow, action types, and policy engine.
 

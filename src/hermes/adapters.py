@@ -91,8 +91,12 @@ class FakeRazorpayAdapter:
         )
 
     def record_capture(
-        self, obligation_id: str, payment_id: str, amount_minor: int
+        self, obligation_id: str, payment_id: str, amount_minor: int,
+        *, link_id: str | None = None,
     ) -> None:
+        # ``link_id`` is a REAL_TEST_MODE-only signal (see the real adapter);
+        # this simulated adapter never receives one and never needs it - the
+        # simulated flow already correlates by payment_id == link reference.
         self._captures.setdefault(
             obligation_id, CaptureInfo(obligation_id, payment_id, amount_minor)
         )
@@ -100,12 +104,17 @@ class FakeRazorpayAdapter:
     def verify_capture(self, obligation_id: str) -> CaptureInfo | None:
         return self._captures.get(obligation_id)
 
-    def create_recovery_link(self, case_id: str, idempotency_key: str) -> str:
+    def create_recovery_link(
+        self, case_id: str, idempotency_key: str,
+        *, amount_minor: int | None = None, currency: str | None = None,
+    ) -> str:
         """Simulated Razorpay Payment Link. Deterministic and idempotent: the
         SAME ``idempotency_key`` always returns the SAME reference, so a
         replayed execution attempt can never mint a second link - a real
         adapter would achieve the same guarantee via Razorpay's own
-        idempotency-key support.
+        idempotency-key support. ``amount_minor``/``currency`` are accepted for
+        protocol compatibility and ignored - the simulated link never carries
+        real money.
         """
         return self._links.setdefault(idempotency_key, f"rlnk_{idempotency_key}")
 
@@ -290,7 +299,7 @@ class InMemoryLedger:
             action_intents=tuple(
                 ActionIntentProjection(
                     intent_id=i.intent_id, action=i.action, status=i.status,
-                    reference=i.reference, message_sent=i.message_sent,
+                    reference=i.reference, message_sent=i.message_sent, url=i.url,
                 )
                 for i in self._action_intents.values()
                 if i.case_id == c.case_id
@@ -689,7 +698,11 @@ class InMemoryLedger:
             cmd.now,
             case.case_id,
             AUDIT_PAYMENT_CONFIRMATION,
-            {"payment_id": cmd.payment_id, "amount_minor": cmd.amount_minor},
+            {
+                "payment_id": cmd.payment_id, "amount_minor": cmd.amount_minor,
+                "evidence_mode": cmd.evidence_mode,
+                **({"link_id": cmd.link_id} if cmd.link_id else {}),
+            },
         )
         cancelled = self._pending_work(case.case_id)
         for w in cancelled:
@@ -711,9 +724,16 @@ class InMemoryLedger:
         # (retry or original attempt) -> provider_self_recovered. Never
         # implies the link settled or reactivated the original subscription -
         # both remain the SAME case/obligation; only the collection path differs.
+        # Two correlation shapes: the SIMULATED fake executor's own reference
+        # equals the eventual (fake) payment_id by construction, so a direct
+        # membership check works; a REAL_TEST_MODE payment's own id (e.g.
+        # "pay_...") never equals the link's id (e.g. "plink_...") it was paid
+        # through, so ``cmd.link_id`` - independently confirmed by the provider
+        # readback before this command was built - is checked instead.
         attribution = (
             Attribution.HERMES_ASSISTED.value
-            if cmd.payment_id in case.link_references
+            if (cmd.payment_id in case.link_references
+                or (cmd.link_id is not None and cmd.link_id in case.link_references))
             else Attribution.PROVIDER_SELF_RECOVERED.value
         )
         case.attribution = attribution
@@ -746,6 +766,7 @@ class InMemoryLedger:
         intent.status = "executed"
         intent.reference = cmd.reference
         intent.message_sent = cmd.message_sent
+        intent.url = cmd.url
         case = self._cases[intent.case_id]
         case.link_references = case.link_references | {cmd.reference}
         if cmd.message_sent:
@@ -759,6 +780,7 @@ class InMemoryLedger:
                 "action": intent.action,
                 "reference": cmd.reference,
                 "message_sent": cmd.message_sent,
+                **({"url": cmd.url} if cmd.url else {}),
             },
         )
         return ApplyResult(ok=True, terminal=False)

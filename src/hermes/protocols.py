@@ -39,14 +39,23 @@ class PaymentProvider(Protocol):
     def retry_eligibility(self, obligation_id: str) -> ProviderRetryFact: ...
 
     def record_capture(
-        self, obligation_id: str, payment_id: str, amount_minor: int
+        self, obligation_id: str, payment_id: str, amount_minor: int,
+        *, link_id: str | None = None,
     ) -> None: ...
 
     def verify_capture(self, obligation_id: str) -> CaptureInfo | None: ...
 
-    def create_recovery_link(self, case_id: str, idempotency_key: str) -> str: ...
+    def create_recovery_link(
+        self, case_id: str, idempotency_key: str,
+        *, amount_minor: int | None = None, currency: str | None = None,
+    ) -> str: ...
     # Deterministic fake executor: the SAME idempotency_key always returns the
-    # SAME simulated, uniquely correlated reference - never a real Razorpay call.
+    # SAME simulated, uniquely correlated reference - never a real Razorpay call
+    # by default. ``amount_minor``/``currency`` come from the engine's trusted
+    # case snapshot (never the model); a real adapter needs them to create an
+    # actual Payment Link and requires both. Returns the provider's own
+    # correlation id (a real adapter returns its Payment Link id, e.g.
+    # "plink_..." - never a payment id).
 
 
 class Ledger(Protocol):

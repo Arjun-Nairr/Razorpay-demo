@@ -100,8 +100,8 @@ class ReentrantProvider:
     def retry_eligibility(self, obligation_id):
         return self._inner.retry_eligibility(obligation_id)
 
-    def record_capture(self, obligation_id, payment_id, amount_minor):
-        return self._inner.record_capture(obligation_id, payment_id, amount_minor)
+    def record_capture(self, obligation_id, payment_id, amount_minor, *, link_id=None):
+        return self._inner.record_capture(obligation_id, payment_id, amount_minor, link_id=link_id)
 
     def verify_capture(self, obligation_id):
         if not self._fired:

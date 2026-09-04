@@ -296,12 +296,20 @@ class RecoveryEngine:
             return ReceiveResult(True, False, case_id)
 
         payment_id = webhook.payment_id.strip()  # type: ignore[union-attr]
-        # External verification, outside any ledger transaction.
+        # External verification, outside any ledger transaction. For a REAL_TEST_MODE
+        # webhook, ``verify_capture`` performs an independent Razorpay readback
+        # (never trusts the webhook body alone) and returns confirmed figures;
+        # for SIMULATED it is the same record/read round-trip as before.
         self._razorpay.record_capture(
-            webhook.obligation_id, payment_id, webhook.amount_minor
+            webhook.obligation_id, payment_id, webhook.amount_minor,
+            link_id=webhook.link_id,
         )
         capture = self._razorpay.verify_capture(webhook.obligation_id)
-        if capture is None or capture.amount_minor != snap.amount_minor:
+        currency_mismatch = (
+            capture is not None and capture.currency is not None
+            and capture.currency != snap.currency
+        )
+        if capture is None or capture.amount_minor != snap.amount_minor or currency_mismatch:
             led.note_event(
                 NoteEventCommand(
                     case_id=case_id,
@@ -329,6 +337,7 @@ class RecoveryEngine:
                 expected_version=snap.version,
                 expected_state=snap.state,
                 evidence_mode=webhook.evidence_mode,
+                link_id=capture.link_id,
             )
         )
         return ReceiveResult(True, result.reason == "duplicate_event", case_id)
@@ -407,8 +416,15 @@ class RecoveryEngine:
             # a lost/duplicated outcome write can never re-run it.
             if result.should_execute and result.action_intent_id is not None:
                 reference = self._razorpay.create_recovery_link(
-                    claim.case_id, result.idempotency_key or ""
+                    claim.case_id, result.idempotency_key or "",
+                    amount_minor=snap.amount_minor, currency=snap.currency,
                 )
+                # Optional: a real adapter exposes the checkout URL separately
+                # from its own correlation id (``reference``, e.g. a Payment
+                # Link id) - never conflate the two. The fake adapter has no
+                # such method, so this stays None for the simulated path.
+                link_url = getattr(self._razorpay, "link_url", None)
+                url = link_url(claim.case_id) if callable(link_url) else None
                 led.apply_action_outcome(
                     ActionIntentOutcomeCommand(
                         intent_id=result.action_intent_id,
@@ -416,6 +432,7 @@ class RecoveryEngine:
                         now=self._clock,
                         reference=reference,
                         message_sent=result.message_authorized,
+                        url=url,
                     )
                 )
 

@@ -362,7 +362,10 @@ class PostgresSnapshotStore:
                     f"{int(budget)}s startup budget")
 
         def _remaining() -> float:
-            return max(2.0, budget - (time.monotonic() - start))
+            # No fresh grace period: once connect has spent the whole startup
+            # budget, the lock probe / first read get whatever is left -
+            # including ~0 - never a re-granted multi-second window.
+            return max(0.0, budget - (time.monotonic() - start))
 
         def _take_lock() -> bool:
             with self._conn.cursor() as cur:

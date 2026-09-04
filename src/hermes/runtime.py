@@ -66,7 +66,16 @@ class Settings:
     has_gemini_key: bool = False
     has_database_url: bool = False
     gemini_model: str = "gemini-3.7-flash"
+    # Provider selection is INDEPENDENT of Hermes/Gemini `mode` above -
+    # "offline"/"live"/"hermes" pick the strategist; this picks the payment
+    # provider. Default "fake": zero behavior change, no credentials needed.
+    razorpay_provider: str = "fake"  # "fake" | "hybrid_test_mode"
+    razorpay_test_mode_enabled: bool = False
+    has_razorpay_test_credentials: bool = False
     _database_url: str | None = field(default=None, repr=False)
+    _razorpay_key_id: str | None = field(default=None, repr=False)
+    _razorpay_key_secret: str | None = field(default=None, repr=False)
+    _razorpay_webhook_secret: str | None = field(default=None, repr=False)
 
     @classmethod
     def load(cls, *, mode: str = "offline", load_env: bool = True) -> "Settings":
@@ -94,6 +103,27 @@ class Settings:
                     + " in the environment or root .env (values are never printed)"
                 )
 
+        razorpay_provider = os.environ.get("RAZORPAY_PROVIDER", "").strip() or "fake"
+        if razorpay_provider not in ("fake", "hybrid_test_mode"):
+            raise ValueError("RAZORPAY_PROVIDER must be 'fake' or 'hybrid_test_mode'")
+        key_id = key_secret = webhook_secret = None
+        test_mode_enabled = False
+        if razorpay_provider == "hybrid_test_mode":
+            from .razorpay_test_mode import load_credentials
+
+            try:
+                creds = load_credentials(os.environ)  # raises on non-test key
+            except ValueError as exc:
+                raise RuntimeError(str(exc)) from exc
+            if creds is None:
+                raise RuntimeError(
+                    "hybrid_test_mode provider requires RAZORPAY_KEY_ID, "
+                    "RAZORPAY_KEY_SECRET, RAZORPAY_WEBHOOK_SECRET in the "
+                    "environment or root .env (values are never printed)"
+                )
+            key_id, key_secret, webhook_secret = creds.key_id, creds.key_secret, creds.webhook_secret
+            test_mode_enabled = creds.enabled
+
         return cls(
             mode=mode,
             demo_signing_secret=demo_secret,
@@ -101,7 +131,13 @@ class Settings:
             has_gemini_key=bool(gemini_key),
             has_database_url=bool(database_url),
             gemini_model=model,
+            razorpay_provider=razorpay_provider,
+            razorpay_test_mode_enabled=test_mode_enabled,
+            has_razorpay_test_credentials=key_id is not None,
             _database_url=database_url or None,
+            _razorpay_key_id=key_id,
+            _razorpay_key_secret=key_secret,
+            _razorpay_webhook_secret=webhook_secret,
         )
 
     def describe(self) -> dict:
@@ -113,6 +149,9 @@ class Settings:
             "gemini_model": self.gemini_model,
             "demo_schema": self.demo_schema,
             "demo_signing_secret_present": bool(self.demo_signing_secret),
+            "razorpay_provider": self.razorpay_provider,
+            "razorpay_test_credentials_present": self.has_razorpay_test_credentials,
+            "razorpay_test_mode_enabled": self.razorpay_test_mode_enabled,
         }
 
 
@@ -142,13 +181,29 @@ def build_strategist(settings: Settings):
     return ScriptedStrategist()
 
 
+def build_provider(settings: Settings):
+    """The payment provider - independent of ``build_strategist``'s Hermes/
+    Gemini mode. Default ``"fake"``: unchanged simulated adapter. Only
+    ``"hybrid_test_mode"`` builds a real Razorpay Test Mode adapter (retry
+    eligibility stays simulated; see ``razorpay_test_mode.py``)."""
+    if settings.razorpay_provider != "hybrid_test_mode":
+        return FakeRazorpayAdapter()
+    from .razorpay_test_mode import HybridPaymentProvider, RazorpayTestModeAdapter
+
+    real = RazorpayTestModeAdapter(
+        settings._razorpay_key_id or "", settings._razorpay_key_secret or "",
+        enabled=settings.razorpay_test_mode_enabled,
+    )
+    return HybridPaymentProvider(FakeRazorpayAdapter(), real)
+
+
 def build_engine(
-    settings: Settings, *, ledger=None, razorpay: FakeRazorpayAdapter | None = None
+    settings: Settings, *, ledger=None, razorpay=None
 ) -> RecoveryEngine:
     return RecoveryEngine(
         ledger or build_ledger(settings),
         build_strategist(settings),
-        razorpay or FakeRazorpayAdapter(),
+        razorpay if razorpay is not None else build_provider(settings),
     )
 
 
@@ -161,7 +216,7 @@ def _demo_provenance(engine: RecoveryEngine, case_id: str) -> dict | None:
     return None
 
 
-def _bootstrap_demo_state(engine: RecoveryEngine, ledger, razorpay: FakeRazorpayAdapter):
+def _bootstrap_demo_state(engine: RecoveryEngine, ledger, razorpay):
     """From the persisted ledger, rebuild - ONLY for cases carrying trusted demo
     provenance - the synthetic merchant-context registry and the simulated
     provider's current retry eligibility, plus the next serial.
@@ -201,15 +256,20 @@ def build_app(settings: Settings):
     """Compose the FastAPI app around a persistent ledger + reconstructed demo
     state. The simulated provider is shared with ``create_app`` so ``/demo/*``
     can drive it. The ledger is closed on app shutdown."""
-    razorpay = FakeRazorpayAdapter()
+    razorpay = build_provider(settings)
     ledger = build_ledger(settings)
     engine = build_engine(settings, ledger=ledger, razorpay=razorpay)
     merchant_context, next_serial = _bootstrap_demo_state(engine, ledger, razorpay)
     config = ApiConfig(webhook_secret=settings.demo_signing_secret)  # SIMULATED only
+    real_secret = (
+        settings._razorpay_webhook_secret
+        if settings.razorpay_provider == "hybrid_test_mode" else None
+    )
     return create_app(
         engine=engine, config=config, razorpay=razorpay,
         merchant_context=merchant_context, demo_serial_start=next_serial,
         mode_label={"hermes": "hermes-runtime", "live": "live-gemini"}.get(
             settings.mode, "scripted-offline"),
         on_shutdown=ledger.close, ledger=ledger,
+        real_webhook_secret=real_secret,
     )

@@ -11,10 +11,15 @@ Invariants:
 - The webhook route never runs the recovery loop; only ``POST /demo/run`` does.
 - No module-level secret and no global engine: both are injected into
   :func:`create_app` and held on ``app.state``.
-- Every event this app ingests is stamped ``evidence_mode="SIMULATED"`` - this
-  slice accepts only locally signed simulated fixtures. Any other configured
-  ``evidence_mode`` (including ``REAL_TEST_MODE``) is rejected at construction;
-  there is no real/Test Mode path here.
+- Every event ``/webhooks/razorpay`` and the ``/demo/*`` controls ingest is
+  stamped ``evidence_mode="SIMULATED"`` - ``ApiConfig`` accepts only that
+  value; a differently configured ``evidence_mode`` is rejected at
+  construction. The ONE real path, ``/webhooks/razorpay-test`` (genuine
+  Razorpay Test Mode ``payment_link.paid`` events, ``evidence_mode=
+  "REAL_TEST_MODE"``), is a separate opt-in route with its own secret and its
+  own verification code in ``razorpay_test_mode.py`` - it is mounted only when
+  ``create_app(real_webhook_secret=...)`` is supplied, never through this
+  module's ``ApiConfig``/``_ingest`` path.
 - No verified merchant-context source exists yet, so normalization sets
   ``consent=False`` and ``reachable_channel=False`` unconditionally. Payment
   payload fields can never grant communication consent. Authorized customer
@@ -55,6 +60,7 @@ from .demo_fixtures import (
     mint_demo_ids,
 )
 from .engine import RecoveryEngine
+from .razorpay_test_mode import RealWebhookError, handle_payment_link_paid_webhook
 from .types import AuditQuery, CaseQuery, NoteEventCommand, RazorpayWebhook, WebhookType
 
 _SUPPORTED_EVENTS: dict[str, WebhookType] = {
@@ -283,6 +289,7 @@ def create_app(
     mode_label: str = "scripted-offline",
     on_shutdown: "Callable[[], None] | None" = None,
     ledger: Any | None = None,
+    real_webhook_secret: str | None = None,
 ) -> FastAPI:
     """Build the ingress app around an injected engine and config.
 
@@ -299,6 +306,15 @@ def create_app(
     ``DEMO_CASE_PROVENANCE`` audit record that restart reconstruction keys on;
     without it a demo case still works for this process but is not
     reconstructable after a restart.
+
+    ``real_webhook_secret`` (when supplied) mounts ONE additional route,
+    ``POST /webhooks/razorpay-test`` - genuine Razorpay Test Mode
+    ``payment_link.paid`` events, verified against this SEPARATE secret via a
+    SEPARATE code path (``razorpay_test_mode.py``); the simulated
+    ``/webhooks/razorpay`` route is completely untouched. A public tunnel MUST
+    be configured to forward ONLY this one path - never the whole app (see
+    HANDOFF.md for a concrete ingress-rule example). Omit to leave this route
+    unmounted entirely (the default, offline-safe state).
 
     Concurrency: the ledger serialises its own operations; a slow model call in
     ``engine.run`` happens between ledger ops and holds no lock, so webhook
@@ -368,6 +384,29 @@ def create_app(
         return await run_in_threadpool(
             _ingest, engine, config, _mctx_lookup, raw, signature, event_id
         )
+
+    # -- REAL Razorpay Test Mode webhook: separate secret, separate code path,
+    #    only mounted when a secret is actually configured. Never reachable
+    #    from the simulated /webhooks/razorpay route or its secret.
+    if real_webhook_secret is not None:
+
+        @app.post("/webhooks/razorpay-test")
+        async def razorpay_test_webhook(request: Request) -> dict:
+            raw = await request.body()
+            signature = request.headers.get("x-razorpay-signature")
+            event_id = request.headers.get("x-razorpay-event-id")
+
+            def _sync() -> dict:
+                try:
+                    return handle_payment_link_paid_webhook(
+                        engine=engine, provider=app.state.razorpay,
+                        webhook_secret=real_webhook_secret,
+                        raw=raw, signature=signature, event_id=event_id,
+                    )
+                except RealWebhookError as exc:
+                    raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+
+            return await run_in_threadpool(_sync)
 
     # -- demo controls -------------------------------------------------
 

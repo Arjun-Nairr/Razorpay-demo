@@ -435,6 +435,34 @@ def test_post_connect_lock_probe_is_inside_the_budget():
     assert time.monotonic() - t0 < 8
 
 
+def test_no_fresh_grace_period_after_connect_exhausts_the_budget():
+    """Regression: the lock-probe/read budget must be whatever time is LEFT
+    after connect, never a re-granted minimum window. A connect that eats
+    almost the whole budget must not buy the probe a fresh few seconds."""
+    from hermes.pg_ledger import PostgresSnapshotStore
+
+    class _HangingCursor(_FakeCursor):
+        def execute(self, sql, params=None):
+            if "pg_try_advisory_lock" in sql:
+                time.sleep(20)
+            return super().execute(sql, params)
+
+    class _HangingConn(_FakeConn):
+        def cursor(self):
+            return _HangingCursor(self)
+
+    fp = _FakePsycopg(_HangingConn(row=_empty_dump(), lock_grants=[True]), delay_s=1.8)
+    t0 = time.monotonic()
+    with pytest.raises(RuntimeError, match=r"writer-lock probe within the 2s startup budget"):
+        PostgresSnapshotStore("postgresql://localhost/x", "hermes_demo_t",
+                              _psycopg=fp, connect_timeout_s=2)
+    elapsed = time.monotonic() - t0
+    # connect spent ~1.8s of the 2s budget; the probe must fail almost right
+    # after (~0.2s more), not after a fresh multi-second window (the old bug:
+    # a `max(2.0, ...)` floor re-granted 2 more seconds regardless).
+    assert elapsed < 3.0
+
+
 def test_stalled_dns_is_bounded_not_infinite(monkeypatch):
     """DNS pre-resolution used to run before the deadline clock started, so a
     hung resolver stalled forever. It must now consume its own bounded slice
