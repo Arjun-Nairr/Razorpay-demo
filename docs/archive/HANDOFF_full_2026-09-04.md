@@ -2259,3 +2259,38 @@ FakeRazorpayAdapter is unaffected (defaults True).
 284 passed, 3 skipped (was 269). Real-Hermes harness 33 passed, unaffected.
 case-11 re-read read-only, unchanged. No live Razorpay/Gemini call, no new
 Neon case, no public tunnel.
+
+---
+
+## Iteration 17 archived detail (moved from HANDOFF.md during Iteration 19)
+
+Razorpay Test Mode HYBRID slice, Iterations 15-17 (code + offline tests, no
+live call yet at that point). Per RAZORPAY_TEST_SLICE.md: simulated SaaS
+obligation/history/retry sequence unchanged; only recovery-link creation and
+payment confirmation go through genuine Razorpay Test Mode calls when the
+hybrid_test_mode provider is selected (RAZORPAY_PROVIDER=hybrid_test_mode,
+independent of Hermes/Gemini mode; default fake, zero behavior change).
+Native subscription-retry signals and historical-data retrieval remain not
+implemented. Iteration 15's first cut and Iteration 16's five-defect
+correction (independent payment-to-link verification, no silent evidence
+fallback, request-scoped single verification, safe uncertain-outcome
+persistence, authorization != delivery) are archived above. Iteration 17
+closed two more gaps: (1) malformed/truncated raw POST responses (not just
+timeout/OSError) now reach the same ProviderActionUncertain safe path,
+verified against real bytes over a real local socket; (2)
+handle_payment_link_paid_webhook requires the envelope's own claimed
+payment_link.status=="paid" and payment.status=="captured", and requires its
+amount/currency to agree with the persisted case, not just with each other.
+Fixture-vs-provider verification: the Payment Link "payments" array field
+names in test fixtures (payment_id, amount, status) were checked against
+Razorpay's documented Create-Standard-Link response (fetched via WebFetch) -
+confirmed matching; not a substitute for a live call.
+
+HybridPaymentProvider composes FakeRazorpayAdapter (retry eligibility only)
+with the real adapter. New webhook route POST /webhooks/razorpay-test
+(mounted only when real_webhook_secret is configured) verifies a genuine
+payment_link.paid envelope against a separate secret via separate code -
+signature over the untouched raw body first, then event-id/envelope/
+contradiction checks, then persisted link-id correlation, then the one
+independent provider readback, then engine.receive. The simulated
+/webhooks/razorpay route and its secret are untouched.

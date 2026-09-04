@@ -1,6 +1,6 @@
 # Cross-Agent Handoff — current-state index
 
-Last updated: 2026-09-04 (Asia/Dubai), Iteration 18. Branch
+Last updated: 2026-09-04 (Asia/Dubai), Iteration 19. Branch
 `feat/isolated-hermes-agent`, latest commit at bottom. This file stays
 **under 300 lines**: it is an index, not a log. Detail lives in the linked
 docs; iteration-by-iteration history is in
@@ -83,114 +83,91 @@ the budget is spent, what's left (including ~0) is what the next step gets,
 never a re-granted window. Regression:
 `test_no_fresh_grace_period_after_connect_exhausts_the_budget`.
 
-## Razorpay Test Mode — HYBRID slice (Iterations 15–17: code + offline tests)
+## Razorpay Test Mode — HYBRID slice
 
 Per [`RAZORPAY_TEST_SLICE.md`](RAZORPAY_TEST_SLICE.md). The simulated SaaS
 obligation, its 3/12-month history, and the accelerated failure/retry sequence
 are **unchanged**. Only authorized recovery-link creation and payment
 confirmation go through genuine Razorpay Test Mode calls when the
 `hybrid_test_mode` provider is selected (`RAZORPAY_PROVIDER=hybrid_test_mode`,
-independent of Hermes/Gemini mode; default remains `fake`, zero behavior
-change). Native subscription-retry signals and historical-data retrieval are
-**not** implemented - retry eligibility always stays simulated. Iteration 15's
-first cut and Iteration 16's five-defect correction are archived (independent
-payment-to-link verification, no silent evidence fallback, request-scoped
-single verification, safe uncertain-outcome persistence, authorization ≠
-delivery). Iteration 17 closed two more small gaps in that correction:
+independent of Hermes/Gemini mode; default remains `fake`). Native
+subscription-retry signals and historical-data retrieval are **not**
+implemented - retry eligibility always stays simulated. Iterations 15-17
+(first cut, five-defect correction, two small gap fixes) are archived.
 
-1. **Malformed/truncated raw POST responses now reach the same safe path.**
-   `_live_post` caught timeout/`OSError`, but not a truncated response body
-   (`http.client.IncompleteRead`), invalid byte encoding, or malformed JSON
-   after the request was sent - those propagated uncaught instead of
-   becoming `ProviderActionUncertain`. Every failure from "request sent"
-   onward - transport, read, or decode - now funnels into the same
-   `_AmbiguousCompletion` → `ProviderActionUncertain` → `uncertain`/
-   `escalated` path as an ambiguous timeout. Verified against REAL bytes over
-   a real local socket (a `Content-Length`-truncated response, invalid UTF-8,
-   and syntactically-broken JSON), not an injected decoded dict.
-2. **Signed-envelope agreement, not just internal consistency.**
-   `handle_payment_link_paid_webhook` now requires the envelope's own claimed
-   `payment_link.status == "paid"` and `payment.status == "captured"`
-   (previously only checked by the provider readback, not the envelope
-   itself), and requires the envelope's (mutually-agreeing) amount/currency
-   to also match the **persisted case obligation** - two entities that agree
-   with each other on the wrong number are now rejected before any provider
-   call, not just entities that disagree with each other. The independent
-   provider readback (`verify_link_payment`) still re-confirms all of this
-   against the provider's own records; this is an earlier, cheaper reject,
-   not a replacement for it.
-
-**Fixture-vs-provider verification**: the Payment Link entity's `payments`
-array field names used in the test fixtures (`payment_id`, `amount`,
-`status`) were checked against Razorpay's own documented Create-Standard-Link
-response description (fetched live via `WebFetch` this iteration) - confirmed
-matching. This confirms the fixture *shape* agrees with the documented
-contract; it is not a substitute for the one still-pending live Test Mode
-call, which alone proves actual API behavior.
-
-- **`HybridPaymentProvider`**: composes the existing `FakeRazorpayAdapter`
-  (retry eligibility only) with the real adapter (link creation + capture
-  confirmation). `/demo/*`'s `set_retry_eligibility` is forwarded unchanged.
-- **New webhook route**: `POST /webhooks/razorpay-test` (mounted only when
-  `real_webhook_secret` is configured) verifies a genuine `payment_link.paid`
-  envelope against a **separate** secret via **separate** code
-  (`razorpay_test_mode.handle_payment_link_paid_webhook`) - signature over the
-  untouched raw body first, then event-id/envelope/contradiction checks, then
-  this case's own persisted link-id correlation, then the ONE independent
-  provider readback above, and only then `engine.receive`. The simulated
-  `/webhooks/razorpay` route and its secret are completely untouched.
-- **Tunnel guidance (not started this iteration)**: expose **only**
-  `POST https://<tunnel>/webhooks/razorpay-test` - never the whole app (no
-  `/demo/*`, no `/cases/*`, no docs). Example `cloudflared` ingress rule:
-  ```yaml
-  ingress:
-    - hostname: <your-tunnel-host>
-      path: ^/webhooks/razorpay-test$
-      service: http://localhost:8000
-    - service: http_status:404
-  ```
-  A raw `ngrok http 8000` forwards the whole port - do not use that alone;
-  pair it with a reverse proxy that 404s everything else, or use a tool with
-  native path-restricted ingress.
-- **User-only setup**: DONE this iteration - Test Mode key pair, webhook
-  (`payment_link.paid` only), `RAZORPAY_PROVIDER=hybrid_test_mode`,
-  `RAZORPAY_TEST_MODE_ENABLED=1` are all in `.env`. Manual Test Mode checkout
-  remains a user step and was **deliberately not completed** (see below).
+- **`HybridPaymentProvider`** composes `FakeRazorpayAdapter` (retry eligibility
+  only) with the real adapter (link creation + capture confirmation).
+- **`POST /webhooks/razorpay-test`** (mounted only when `real_webhook_secret`
+  is configured) verifies a genuine `payment_link.paid` envelope against a
+  **separate** secret via separate code - signature first, then envelope/
+  contradiction checks, then this case's persisted link correlation, then one
+  independent provider readback, then `engine.receive`. The simulated
+  `/webhooks/razorpay` route is untouched.
+- **User-only setup**: DONE - Test Mode key pair, webhook (`payment_link.paid`
+  only), `.env` flags. Manual Test Mode checkout was **deliberately not
+  completed** (see Iteration 18 below).
 
 ## Iteration 18 — one live attempt, stopped before payment (case-18)
 
-Webhook-only exposure: `scripts/webhook_relay.py` (new; 12 offline tests) is a
-loopback-only reverse proxy that serves **only** `POST /webhooks/razorpay-test`
-- every other path/method is rejected before touching the main app, and it
-holds no engine/DB/credentials of its own, so even an unrestricted tunnel
-pointed at it can never expose `/demo/*`/`/cases/*`/docs. An SSH reverse
-tunnel (`ssh -p 443 -R0:127.0.0.1:8100 free.pinggy.io`, no new binary/no pip -
-plain OpenSSH) exposed the relay publicly; verified end-to-end (locally and
-through the public URL) that unrelated paths 404, the wrong method on the
-right path 405s, and an unsigned `POST` reaches the real handler and gets a
-genuine `401`. One tunnel domain (`lhr.life`, via `localhost.run`) was
-connection-reset by local Avast Web Shield (confirmed: unrelated HTTPS sites
-worked, that specific domain didn't, even via raw TLS) - not touched/excluded,
-just switched to a working provider (`pinggy.io`).
+`scripts/webhook_relay.py` (new) is a loopback-only reverse proxy serving
+**only** `POST /webhooks/razorpay-test` - every other path/method rejected
+before touching the main app; no engine/DB/credentials of its own, so even an
+unrestricted tunnel pointed at it can never expose `/demo/*`/`/cases/*`/docs.
+An SSH reverse tunnel (`ssh -p 443 -R0:127.0.0.1:8100 free.pinggy.io`, no new
+binary/no pip) exposed it publicly; verified end-to-end that unrelated paths
+404, the wrong method 405s, an unsigned `POST` gets a genuine `401`. One
+tunnel domain (`lhr.life`/`localhost.run`) was connection-reset by local Avast
+Web Shield (confirmed: unrelated HTTPS sites worked, that domain didn't) - not
+touched/excluded, just switched to a working provider (`pinggy.io`).
 
 `scripts/run_one_hybrid_case.py` (new) drove ONE case through real Hermes +
-Gemini decisions only (never the simulated capture step). Result: **case-18**
+Gemini decisions only (never simulated capture). Result: **case-18**
 (obligation `sub_demo_0004_8e781337`) - decision 1: `WAIT_FOR_PROVIDER_RETRY`
 authorized; after the simulated failed-retry input, decision 2:
-`CREATE_RECOVERY_LINK` authorized -> ONE real Razorpay Test Mode Payment Link
-created (reference `plink_TY2urjqVCjkjvB`; URL persisted in Neon, not
-reproduced here). State: **`active`, `counted=false`, awaiting payment** -
-this is the honest, current, final state for this iteration.
+`CREATE_RECOVERY_LINK` authorized -> ONE real Payment Link created (reference
+`plink_TY2urjqVCjkjvB`; checkout URL persisted in Neon, not reproduced here).
 
-**Scope change mid-task (Codex/user): do not complete the checkout.** The demo
-does not require a paid live checkout; recording will use this saved evidence
-rather than depend on a live payment. Case-18 was left exactly as-is - no
-simulated capture, no forged webhook, no state edit. All three processes this
-task started were stopped by exact PID/port match (main app :8000, relay
-:8100, the one `ssh.exe` tunneling :8100) - nothing else was touched. Verified
-after stopping: ports 8000/8100 no longer listening, the public tunnel URL no
-longer resolves, and a direct Neon re-read shows case-18 unchanged (same
-version) - no write happened after shutdown.
+**Scope change mid-task: do not complete the checkout.** The demo doesn't
+require a paid live checkout; recording uses this saved evidence instead.
+Case-18 left exactly as-is - no simulated capture, no forged webhook, no state
+edit. All three processes were stopped by exact PID/port match; verified ports
+8000/8100 free, the tunnel URL no longer resolves, Neon re-read shows case-18
+unchanged.
+
+## Iteration 19 — review findings closed + read-only Neon views
+
+**Phase A** (offline only): `/health` now reports non-secret
+`payment_provider` / `payment_provider_test_mode_enabled` flags;
+`run_one_hybrid_case.py` fails closed (refuses `POST /demo/case`) unless both
+are the expected real values - `evidence_mode=SIMULATED` on the case's own
+synthetic intake is preserved, never relabelled. `webhook_relay.py` hardened:
+a documented 64 KiB body ceiling, `Content-Length` validated (missing/
+malformed/negative/oversized all rejected, 411/400/400/413, before any read),
+a bounded body-read deadline (408 on a stall), and logging reduced to method +
+a fixed route category + status only - never the raw path/query/headers/body.
+
+**Phase B**: five read-only views added to `scripts/init_neon.py`
+(`CREATE OR REPLACE VIEW` only; same single `ledger_state` JSONB row, nothing
+duplicated or made mutable): `case_summary` (authoritative `state` plus a
+derived, presentation-only `display_status`), `hermes_decisions` (one row per
+`AI_PROPOSAL`, joined to its own cycle's nearest `AI_MODEL_RUN`/
+`POLICY_DECISION` - never a global first/last), `recovery_actions`
+(`checkout_url_present` boolean, never the URL; `message_authorized` kept
+separate from `message_sent`), `hermes_evidence`, `audit_timeline`. Also fixed
+a real bug found running this: `init_neon.py`'s bare `psycopg.connect(dsn)`
+had no timeout and no IPv4 preference, so it hung indefinitely on this host's
+known IPv6 black hole - now reuses the app's own `_connect_bounded`.
+
+Ran `init_neon.py` once against the existing `.env` (DDL only, `hermes_demo`
+schema) and read all five views back directly: **case-18** - `state=active`
+(authoritative, unchanged), `display_status=RECOVERY_IN_PROGRESS`,
+`recovery_actions` shows the real link with `checkout_url_present=true`,
+`action_evidence_mode=REAL_TEST_MODE`, `message_authorized=true` /
+`message_sent=false` (kept separate); `hermes_decisions` shows both real
+decisions correctly paired (`WAIT_FOR_PROVIDER_RETRY` then
+`CREATE_RECOVERY_LINK`, ~19.2s/~19.4s execution, confidence 0.95/`high`).
+**case-11** unchanged: `state=recovered`, `display_status=RECOVERED`,
+`attribution=hermes_assisted`, `counted=true`.
 
 ## Verified evidence
 
@@ -210,20 +187,24 @@ version) - no write happened after shutdown.
   entities agree with each other on an amount or currency that disagrees with
   the persisted case (rejected before any provider call), and a preserved
   fully-agreeing valid-event path.
-- Ledger/persistence code was **not touched** in Iteration 17 (only the
-  Razorpay adapter/webhook module and its tests) - `case-11`'s snapshot schema
-  was structurally unaffected.
 - **Iteration 18**: `python -m pytest -q --ignore=tests/test_hermes_agent.py`
   -> **308 passed, 3 skipped** (was 296; +12 `tests/test_webhook_relay.py`).
-  `compileall` + `git diff --check` clean. This iteration DID make live calls:
-  real Hermes/Gemini decisions, one real Razorpay Test Mode link, real Neon
-  writes for `case-18` - see the Iteration 18 section above for the actual
-  evidence and its intentionally-incomplete (awaiting payment) final state.
+  This iteration DID make live calls: real Hermes/Gemini decisions, one real
+  Razorpay Test Mode link, real Neon writes for `case-18`.
+- **Iteration 19**: `python -m pytest -q --ignore=tests/test_hermes_agent.py`
+  -> **369 passed, 3 skipped** (+16 `test_run_one_hybrid_case.py`, +3
+  `test_api.py` `/health` fields, +9 `test_webhook_relay.py` hardening,
+  +33 `test_neon_views.py`). `compileall` + `git diff --check` clean; secret
+  scan clean. Live: `scripts/init_neon.py` ran once (DDL only) and the five
+  views were read back directly - see Iteration 19 section above for the
+  exact case-18/case-11 results.
 
 ## Inspecting the persisted proof
 
-- Neon SQL editor, schema `hermes_demo`:
-  [`sql/neon_demo_inspect.sql`](sql/neon_demo_inspect.sql). User-run flow:
+- Neon SQL editor, schema `hermes_demo`: query the five views directly (e.g.
+  `SELECT * FROM hermes_demo.case_summary`) - see
+  [`sql/neon_demo_inspect.sql`](sql/neon_demo_inspect.sql) for ready-made
+  all-cases and one-case queries (swap in `'case-18'`). User-run flow:
   [`scripts/neon_proof.py`](scripts/neon_proof.py).
 
 ## Repeatable launch
@@ -251,7 +232,7 @@ actually wired to `hermes-runtime` + `hybrid_test_mode` + enabled.
 
 ## Next action
 
-Codex review of Iteration 18. No further live action planned against
+Codex review of Iteration 19. No further live action planned against
 `case-18`. The three deferred exemplars (on-time / late / mixed-history)
 remain deferred per the backlog. Keep future `HANDOFF.md` updates under
 300 lines.

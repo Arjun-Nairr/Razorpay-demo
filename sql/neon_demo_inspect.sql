@@ -7,20 +7,35 @@
 --  advisory *writer* lock, so these are safe to run while `hermes` mode holds
 --  it.
 --
---  Storage is unchanged - one JSONB snapshot row:
---    schema : hermes_demo              (override with HERMES_DEMO_SCHEMA before
---                                       `python scripts/init_neon.py`, then
---                                       search-and-replace hermes_demo below)
---    table  : hermes_demo.ledger_state (id = 1; data = whole-ledger snapshot)
+--  Storage is unchanged - ONE JSONB snapshot row is still the single
+--  authoritative source (`hermes_demo.ledger_state`, id = 1). The five views
+--  below (added by `scripts/init_neon.py`; re-run it any time to refresh them
+--  after a code change - it only ever does CREATE OR REPLACE VIEW) are a
+--  read-only PRESENTATION layer over that same row - nothing is duplicated
+--  or made mutable, and Neon's table/view browser can display them directly
+--  instead of everyone hand-unpacking JSON:
 --
---  Snapshot shape (hermes.pg_ledger.dump_ledger):
---    data->'cases'          : { case_id -> case object }
---    data->'audit'          : [ { seq, logical_time, case_id, kind, detail } ]
---    data->'action_intents' : { intent_id -> intent object }
---    data->>'recovered_minor': integer paise, counted once
+--    hermes_demo.case_summary      - one row per case; authoritative `state`
+--                                    plus a derived, presentation-only
+--                                    `display_status` (RECOVERED /
+--                                    HUMAN_REVIEW_REQUIRED /
+--                                    RECOVERY_IN_PROGRESS /
+--                                    WAITING_FOR_PROVIDER_RETRY / ACTIVE)
+--    hermes_demo.hermes_decisions  - one row per AI_PROPOSAL, joined to its
+--                                    OWN decision cycle's nearest AI_MODEL_RUN
+--                                    and POLICY_DECISION (never a global
+--                                    first/last)
+--    hermes_demo.recovery_actions  - one row per durable action intent;
+--                                    `checkout_url_present` only, never the
+--                                    full URL; `message_authorized` vs
+--                                    `message_sent` kept separate
+--    hermes_demo.hermes_evidence   - one row per evidence tool call, with its
+--                                    requested reason alongside what came back
+--    hermes_demo.audit_timeline    - one row per raw audit event (bounded
+--                                    `detail` JSON kept for full inspection)
 --
---  Blocks 2..5 filter one case: replace the literal 'REPLACE_WITH_CASE_ID'
---  with the id the CLI printed (e.g. 'case-1').
+--  The raw JSON is still there if you need something these views don't
+--  surface - see "raw snapshot" at the bottom.
 -- ============================================================================
 
 
@@ -35,89 +50,67 @@ FROM   hermes_demo.ledger_state
 WHERE  id = 1;
 
 
--- 1. every case: id, status, simulated recovered amount --------------------
-SELECT c.key                                       AS case_id,
-       c.value->>'obligation_id'                   AS obligation_id,
-       c.value->>'state'                           AS status,
-       (c.value->>'counted')::boolean              AS counted_once,
-       COALESCE((c.value->>'amount_minor')::int,0) AS amount_paise,
-       CASE WHEN (c.value->>'counted')::boolean
-            THEN (c.value->>'amount_minor')::int ELSE 0 END
-                                                   AS simulated_recovered_paise,
-       c.value->>'attribution'                     AS attribution,
-       c.value->>'failure_reason'                  AS failure_reason,
-       (c.value->>'version')::int                  AS version
-FROM   hermes_demo.ledger_state s,
-       jsonb_each(s.data->'cases') AS c
-WHERE  s.id = 1
-ORDER  BY (c.value->>'created_time')::int;
+-- ============================================================================
+--  Demo queries: ALL CASES
+-- ============================================================================
+
+-- 1. every case: authoritative state + derived display status --------------
+SELECT case_id, obligation_id, state, display_status, amount_minor, currency,
+       recovered_amount_minor, evidence_mode, attribution, counted,
+       human_review_required, created_logical_time
+FROM   hermes_demo.case_summary
+ORDER  BY created_logical_time;
+
+-- 2. every real Test Mode recovery action (any case) ------------------------
+SELECT case_id, intent_id, proposed_action, execution_status, provider_reference,
+       checkout_url_present, action_evidence_mode, message_authorized, message_sent,
+       case_state, human_review_required, uncertain_reason
+FROM   hermes_demo.recovery_actions
+ORDER  BY created_logical_time;
+
+-- 3. every Hermes/Gemini decision (any case), most recent first -------------
+SELECT case_id, decision_number, logical_time, model, hermes_runtime_revision,
+       execution_duration_seconds, latency_ms, validation_result, repair_used,
+       confidence, confidence_band, proposed_action, policy_outcome, authorized
+FROM   hermes_demo.hermes_decisions
+ORDER  BY logical_time DESC;
 
 
--- 2. chronological audit timeline for ONE case ---------------------------
-SELECT (e->>'seq')::int          AS seq,
-       (e->>'logical_time')::int AS t,
-       e->>'kind'                AS kind,
-       e->'detail'              AS detail
-FROM   hermes_demo.ledger_state s,
-       jsonb_array_elements(s.data->'audit') AS e
-WHERE  s.id = 1
-  AND  e->>'case_id' = 'REPLACE_WITH_CASE_ID'
-ORDER  BY (e->>'seq')::int;
+-- ============================================================================
+--  Demo queries: ONE case (replace 'REPLACE_WITH_CASE_ID', e.g. 'case-18')
+-- ============================================================================
+
+-- 4. one-line case summary --------------------------------------------------
+SELECT * FROM hermes_demo.case_summary WHERE case_id = 'REPLACE_WITH_CASE_ID';
+
+-- 5. its recovery action(s) --------------------------------------------------
+SELECT * FROM hermes_demo.recovery_actions WHERE case_id = 'REPLACE_WITH_CASE_ID'
+ORDER BY created_logical_time;
+
+-- 6. its Hermes/Gemini decisions, in order -----------------------------------
+SELECT * FROM hermes_demo.hermes_decisions WHERE case_id = 'REPLACE_WITH_CASE_ID'
+ORDER BY decision_number;
+
+-- 7. its evidence tool calls (what was requested vs what came back) ---------
+SELECT * FROM hermes_demo.hermes_evidence WHERE case_id = 'REPLACE_WITH_CASE_ID'
+ORDER BY model_run_seq;
+
+-- 8. its full chronological audit timeline -----------------------------------
+SELECT seq, logical_time, kind, action, outcome, reason, state, evidence_mode, detail
+FROM   hermes_demo.audit_timeline
+WHERE  case_id = 'REPLACE_WITH_CASE_ID'
+ORDER  BY seq;
 
 
--- 3. ACTUAL Hermes evidence, proposal and policy result for ONE case ----
---    AI_MODEL_RUN.detail->'hermes' is the bounded, redacted Hermes audit
---    (runtime revision, provider/model, evidence requests + returned
---    source/coverage, uncalibrated confidence band, decision action,
---    failure category/stage). AI_PROPOSAL / POLICY_DECISION are engine rows.
-SELECT (e->>'seq')::int                          AS seq,
-       (e->>'logical_time')::int                 AS t,
-       e->>'kind'                                AS kind,
-       e->'detail'->>'model'                     AS model,
-       e->'detail'->'hermes'->>'runtime_revision'  AS hermes_revision,
-       e->'detail'->'hermes'->>'decision_action'   AS hermes_decision_action,
-       e->'detail'->'hermes'->>'confidence_band'   AS confidence_band,
-       e->'detail'->'hermes'->>'confidence_basis'  AS confidence_basis,
-       e->'detail'->'hermes'->'evidence_requests'  AS evidence_requests,
-       e->'detail'->'hermes'->'evidence_returned'  AS evidence_returned,
-       e->'detail'->'hermes'->>'failure_category'  AS failure_category,
-       e->'detail'->>'validation_result'           AS validation_result,
-       e->'detail'->>'action'                      AS proposal_action,
-       e->'detail'->>'outcome'                     AS policy_outcome,
-       e->'detail'->>'reason_code'                 AS policy_reason
-FROM   hermes_demo.ledger_state s,
-       jsonb_array_elements(s.data->'audit') AS e
-WHERE  s.id = 1
-  AND  e->>'case_id' = 'REPLACE_WITH_CASE_ID'
-  AND  e->>'kind' IN ('AI_MODEL_RUN','AI_PROPOSAL','POLICY_DECISION',
-                      'ACTION_INTENT','ACTION_OUTCOME','TERMINAL_TRANSITION')
-ORDER  BY (e->>'seq')::int;
+-- ============================================================================
+--  Raw snapshot (only if a view above doesn't cover what you need)
+-- ============================================================================
 
+-- 9. raw case JSON for one case ----------------------------------------------
+SELECT data->'cases'->'REPLACE_WITH_CASE_ID' AS raw_case
+FROM   hermes_demo.ledger_state WHERE id = 1;
 
--- 4. authorized recovery-link intents (simulated; never a real link) ----
-SELECT i.value->>'intent_id'            AS intent_id,
-       i.value->>'case_id'              AS case_id,
-       i.value->>'action'               AS action,
-       i.value->>'status'               AS status,
-       i.value->>'reference'            AS simulated_reference,
-       (i.value->>'message_sent')::boolean AS message_sent
-FROM   hermes_demo.ledger_state s,
-       jsonb_each(s.data->'action_intents') AS i
-WHERE  s.id = 1
-ORDER  BY (i.value->>'created_time')::int;
-
-
--- 5. one-line recovery summary for ONE case ---------------------------
-SELECT c.key             AS case_id,
-       c.value->>'state'  AS status,
-       CASE WHEN (c.value->>'counted')::boolean
-            THEN (c.value->>'amount_minor')::int ELSE 0 END AS simulated_recovered_paise,
-       c.value->>'attribution' AS attribution,
-       (SELECT count(*) FROM jsonb_array_elements(s.data->'audit') a
-         WHERE a->>'case_id' = c.key)                       AS audit_event_count,
-       (SELECT count(*) FROM jsonb_array_elements(s.data->'audit') a
-         WHERE a->>'case_id' = c.key AND a->>'kind' = 'AI_MODEL_RUN') AS hermes_decisions
-FROM   hermes_demo.ledger_state s,
-       jsonb_each(s.data->'cases') AS c
-WHERE  s.id = 1
-  AND  c.key = 'REPLACE_WITH_CASE_ID';
+-- 10. raw action_intents JSON -------------------------------------------------
+SELECT i.key AS intent_id, i.value AS raw_intent
+FROM   hermes_demo.ledger_state s, jsonb_each(s.data->'action_intents') AS i
+WHERE  s.id = 1 AND i.value->>'case_id' = 'REPLACE_WITH_CASE_ID';
