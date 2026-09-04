@@ -6,13 +6,29 @@ link creation and payment confirmation become real Razorpay Test Mode API
 calls. Native subscription-retry signals and historical-data retrieval are NOT
 implemented here - :class:`RazorpayTestModeAdapter.retry_eligibility` always
 raises, and the composite :class:`HybridPaymentProvider` never routes that
-call to it (retry eligibility stays simulated).
+call to it (retry eligibility stays simulated). No messaging adapter exists
+either: ``message_delivery_capable`` is ``False`` so the engine never reports
+an authorized message as actually sent (see ``engine.run``).
 
 Every event this module ever produces is stamped ``evidence_mode=
 "REAL_TEST_MODE"``. Signature verification here (:func:`_signature_ok`) is a
 SEPARATE function over a SEPARATE secret from the simulated ingress's own
 HMAC check in ``api.py`` - a locally signed simulated fixture can never verify
 against the real Razorpay webhook secret, and vice versa.
+
+Capture verification (:func:`RazorpayTestModeAdapter.verify_link_payment`) is
+a single, immutable, request-scoped operation: it takes an explicit
+:class:`LinkPaymentClaim`, fetches BOTH the payment and its claimed owning
+Payment Link independently, and returns evidence built ONLY from what those
+two fetches say - never from shared per-instance state keyed by obligation id
+(the earlier design's ``record_capture``/``verify_capture`` pair could let a
+second, concurrent webhook delivery for the same obligation overwrite the
+first's pending claim before it was read back - see ``test_razorpay_test_mode.py``'s
+concurrency regressions). ``record_capture``/``verify_capture`` remain on this
+adapter only to satisfy the ``PaymentProvider`` protocol shape; they now raise
+- the real webhook path never calls them (``RazorpayWebhook.pre_verified_capture``
+carries the already-confirmed evidence straight to ``engine.receive``, so there
+is exactly ONE provider fetch per webhook, not two).
 
 No fastapi import here: this module is the verification/business logic only;
 ``api.py`` (or a future minimal webhook-only app) wires it to an HTTP route.
@@ -29,13 +45,16 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .engine import RecoveryEngine
-from .types import CaptureInfo, CaseQuery, RazorpayWebhook, WebhookType
+from .types import CaptureInfo, CaseQuery, ProviderActionUncertain, RazorpayWebhook, WebhookType
 
 _TEST_KEY_PREFIX = "rzp_test_"
 _HEX_SHA256 = re.compile(r"\A[0-9a-fA-F]{64}\Z")
+_ISO_CURRENCY = re.compile(r"\A[A-Z]{3}\Z")
 _REFERENCE_PREFIX = "hermes-"
 _MAX_REFERENCE_LEN = 40  # Razorpay's own documented reference_id limit
 _PAID_EVENT = "payment_link.paid"
+_CAPTURED = "captured"
+_PAID = "paid"
 
 
 def _looks_like_test_key(key_id: str) -> bool:
@@ -72,8 +91,8 @@ def _signature_ok(secret: str, raw: bytes, provided: str | None) -> bool:
 
 class _AmbiguousCompletion(Exception):
     """The POST may or may not have reached Razorpay (e.g. a timeout/connection
-    reset after the request was sent). Never safe to assume success OR to
-    blindly retry with a fresh reference - the caller must reconcile or stop."""
+    reset after the request was sent). Internal only - :meth:`create_recovery_link`
+    always converts this to :class:`~hermes.types.ProviderActionUncertain`."""
 
 
 def _live_post(url: str, *, auth: tuple[str, str], json_body: dict) -> dict:
@@ -104,6 +123,23 @@ def _basic_auth(req: urllib.request.Request, auth: tuple[str, str]) -> None:
     req.add_header("Authorization", f"Basic {token}")
 
 
+@dataclass(frozen=True)
+class LinkPaymentClaim:
+    """Everything needed to independently verify ONE payment against ONE
+    Payment Link - built fresh per webhook delivery from OUR OWN trusted case
+    data plus the two ids the signed envelope names, never shared or mutated
+    across calls. ``expected_*`` fields come from the caller's own persisted
+    case, never from the webhook body - they are what the fetched provider
+    records must match, not what they are assumed to already say."""
+
+    link_id: str
+    payment_id: str
+    expected_reference_id: str
+    expected_amount_minor: int
+    expected_currency: str
+    obligation_id: str
+
+
 class RazorpayTestModeAdapter:
     """Real Razorpay Test Mode calls behind the ``PaymentProvider`` seam.
 
@@ -112,6 +148,8 @@ class RazorpayTestModeAdapter:
     construction, before any request is possible - live credentials can never
     reach this adapter even if ``enabled`` is mistakenly set.
     """
+
+    message_delivery_capable = False  # no messaging adapter exists; see engine.run
 
     def __init__(
         self, key_id: str, key_secret: str, *, enabled: bool = False,
@@ -128,8 +166,7 @@ class RazorpayTestModeAdapter:
         self._enabled = bool(enabled)
         self._post = http_post or _live_post
         self._get = http_get or _live_get
-        self._links: dict[str, dict] = {}      # case_id -> link record
-        self._pending: dict[str, dict] = {}     # obligation_id -> claimed capture
+        self._links: dict[str, dict] = {}      # case_id -> link record (local cache only)
 
     def _require_enabled(self) -> None:
         if not self._enabled:
@@ -174,18 +211,18 @@ class RazorpayTestModeAdapter:
             )
         except _AmbiguousCompletion as exc:
             # Never mint a second reference_id and re-POST: that risks two
-            # live links (duplicate collection). Stop with a clear, actionable
-            # message; an operator reconciles via the Razorpay dashboard using
-            # THIS reference_id before any retry.
-            raise RuntimeError(
-                f"payment link creation for reference_id={reference_id!r} did "
-                "not confirm completion (ambiguous network failure); reconcile "
-                "manually via the Razorpay Test Mode dashboard - do not retry "
-                "with a new reference"
+            # live links (duplicate collection). The caller (engine.run)
+            # persists an explicit, safe "uncertain" stop for this case's
+            # already-recorded action intent - no automatic retry, no
+            # replacement link, never marked recovered.
+            raise ProviderActionUncertain(
+                f"recovery_link_creation_ambiguous:{type(exc).__name__}"
             ) from exc
-        link_id = resp.get("id")
+        link_id = resp.get("id") if isinstance(resp, dict) else None
         if not isinstance(link_id, str) or not link_id:
-            raise RuntimeError("payment link creation response missing an id")
+            # A malformed/incomplete response is exactly as uncertain as a
+            # network failure - we cannot tell whether a live link exists.
+            raise ProviderActionUncertain("recovery_link_creation_malformed_response")
         self._links[case_id] = {
             "link_id": link_id, "reference_id": reference_id,
             "url": resp.get("short_url"),
@@ -204,37 +241,113 @@ class RazorpayTestModeAdapter:
         self, obligation_id: str, payment_id: str, amount_minor: int,
         *, link_id: str | None = None,
     ) -> None:
-        self._require_enabled()
-        self._pending[obligation_id] = {
-            "payment_id": payment_id, "amount_minor": amount_minor, "link_id": link_id,
-        }
+        raise NotImplementedError(
+            "superseded by verify_link_payment (one immutable, request-scoped "
+            "readback of both the payment and its link) - the real webhook "
+            "path never calls this"
+        )
 
     def verify_capture(self, obligation_id: str) -> CaptureInfo | None:
-        """Independent Razorpay readback - never trusts the caller's claimed
-        amount, only what THIS fetch returns. Any fetch failure or a status
-        other than ``captured`` rejects (returns ``None``), never guesses."""
+        raise NotImplementedError(
+            "superseded by verify_link_payment (one immutable, request-scoped "
+            "readback of both the payment and its link) - the real webhook "
+            "path never calls this"
+        )
+
+    def verify_link_payment(self, claim: LinkPaymentClaim) -> CaptureInfo | None:
+        """Independent, single-shot readback for ONE claim: fetches the
+        payment AND its claimed owning Payment Link, and accepts only if
+        EVERY one of the following holds - any failure rejects (returns
+        ``None``), never guesses:
+
+        - both fetches succeed and return the expected top-level shape;
+        - the link's own fetched ``id`` == ``claim.link_id`` (not merely the
+          id we asked for - a defensive echo check);
+        - the link's own fetched ``reference_id`` == ``claim.expected_reference_id``
+          (the case correlation, confirmed from the PROVIDER's record, not
+          just the signed webhook body);
+        - the link's own ``status`` == ``"paid"``, its ``amount``/``currency``
+          match exactly;
+        - the payment's own fetched ``id`` == ``claim.payment_id``, its
+          ``status`` == ``"captured"``, its ``amount``/``currency`` match
+          exactly;
+        - the link's own ``payments`` list (Razorpay's documented per-link
+          payment history) contains an entry for THIS payment id, itself
+          ``captured`` at the expected amount - the actual evidence that this
+          payment belongs to this link, not merely two separately-plausible
+          records.
+
+        Every currency is required and compared as an exact string - a
+        missing or wrong-typed currency fails the match, it is never treated
+        as "no evidence" and quietly waved through.
+        """
         self._require_enabled()
-        pending = self._pending.get(obligation_id)
-        if pending is None:
-            return None
         try:
+            link = self._get(
+                f"https://api.razorpay.com/v1/payment_links/{claim.link_id}",
+                auth=(self._key_id, self._key_secret),
+            )
             payment = self._get(
-                f"https://api.razorpay.com/v1/payments/{pending['payment_id']}",
+                f"https://api.razorpay.com/v1/payments/{claim.payment_id}",
                 auth=(self._key_id, self._key_secret),
             )
         except Exception:  # noqa: BLE001 - unverified -> reject, never invent
             return None
-        if payment.get("status") != "captured":
+        if not isinstance(link, dict) or not isinstance(payment, dict):
             return None
-        amount = payment.get("amount")
-        if isinstance(amount, bool) or not isinstance(amount, int):
+
+        if not self._link_matches(link, claim):
             return None
-        currency = payment.get("currency")
+        if not self._payment_matches(payment, claim):
+            return None
+        if not self._payment_is_on_link(link, claim):
+            return None
+
         return CaptureInfo(
-            obligation_id=obligation_id, payment_id=pending["payment_id"],
-            amount_minor=amount, currency=currency if isinstance(currency, str) else None,
-            link_id=pending.get("link_id"),
+            obligation_id=claim.obligation_id, payment_id=claim.payment_id,
+            amount_minor=claim.expected_amount_minor, currency=claim.expected_currency,
+            link_id=claim.link_id,
         )
+
+    @staticmethod
+    def _link_matches(link: dict, claim: LinkPaymentClaim) -> bool:
+        return (
+            link.get("id") == claim.link_id
+            and link.get("reference_id") == claim.expected_reference_id
+            and link.get("status") == _PAID
+            and link.get("amount") == claim.expected_amount_minor
+            and link.get("currency") == claim.expected_currency
+        )
+
+    @staticmethod
+    def _payment_matches(payment: dict, claim: LinkPaymentClaim) -> bool:
+        return (
+            payment.get("id") == claim.payment_id
+            and payment.get("status") == _CAPTURED
+            and payment.get("amount") == claim.expected_amount_minor
+            and payment.get("currency") == claim.expected_currency
+        )
+
+    @staticmethod
+    def _payment_is_on_link(link: dict, claim: LinkPaymentClaim) -> bool:
+        """The actual "this payment belongs to this link" evidence: the
+        link's own ``payments`` array must list this payment id, itself
+        captured at the expected amount. A matching payment id alone (with a
+        mismatched status/amount in the link's own record of it) is NOT
+        sufficient - the link's bookkeeping must agree too."""
+        entries = link.get("payments")
+        if not isinstance(entries, list):
+            return False
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("payment_id") != claim.payment_id:
+                continue
+            return (
+                entry.get("status") == _CAPTURED
+                and entry.get("amount") == claim.expected_amount_minor
+            )
+        return False
 
 
 class HybridPaymentProvider:
@@ -246,6 +359,7 @@ class HybridPaymentProvider:
     def __init__(self, simulated: Any, real: RazorpayTestModeAdapter) -> None:
         self._simulated = simulated
         self._real = real
+        self.message_delivery_capable = real.message_delivery_capable
 
     def retry_eligibility(self, obligation_id: str):
         return self._simulated.retry_eligibility(obligation_id)
@@ -276,6 +390,9 @@ class HybridPaymentProvider:
     def verify_capture(self, obligation_id: str) -> CaptureInfo | None:
         return self._real.verify_capture(obligation_id)
 
+    def verify_link_payment(self, claim: LinkPaymentClaim) -> CaptureInfo | None:
+        return self._real.verify_link_payment(claim)
+
 
 class RealWebhookError(Exception):
     """Carries an HTTP status code + a fixed, non-sensitive detail string. The
@@ -288,18 +405,42 @@ class RealWebhookError(Exception):
         self.detail = detail
 
 
+def _entity_str(d: dict, key: str) -> str | None:
+    v = d.get(key)
+    return v if isinstance(v, str) and v else None
+
+
+def _entity_amount(d: dict, key: str) -> int | None:
+    v = d.get(key)
+    if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+        return None
+    return v
+
+
+def _entity_currency(d: dict, key: str) -> str | None:
+    v = d.get(key)
+    return v if isinstance(v, str) and _ISO_CURRENCY.match(v) else None
+
+
 def handle_payment_link_paid_webhook(
     *, engine: RecoveryEngine, provider: Any, webhook_secret: str,
     raw: bytes, signature: str | None, event_id: str | None,
 ) -> dict:
     """Verify + process ONE genuine ``payment_link.paid`` webhook.
 
-    Order matches the simulated ingress's own discipline: signature over the
-    UNTOUCHED raw bytes first (before any JSON parsing), then the event id,
-    then shape validation, then case correlation, then an independent
-    provider readback, and only then ``engine.receive`` - the one path that
-    can mark a case ``recovered``. Rejects (raises :class:`RealWebhookError`)
-    on any unverified, mismatched, unrelated, or partial payment.
+    Order: signature over the UNTOUCHED raw bytes first (before any JSON
+    parsing), then the event id, then full envelope shape/type validation
+    (every required id/status/amount/currency present and correctly typed -
+    a malformed envelope raises a controlled :class:`RealWebhookError`, never
+    an uncaught exception), then a same-envelope cross-check (the link's own
+    claimed amount/currency must agree with the payment's - contradictory
+    signed facts are rejected before any provider call), then this case's own
+    persisted link correlation, then ONE independent provider readback
+    (:meth:`RazorpayTestModeAdapter.verify_link_payment`), and only then
+    ``engine.receive`` - the one path that can mark a case ``recovered``,
+    still running every ledger validation (dedup, terminal-state, version,
+    atomic finalization) unchanged. Rejects on any unverified, mismatched,
+    unrelated, or partial payment.
     """
     if not _signature_ok(webhook_secret, raw, signature):
         raise RealWebhookError(401, "invalid signature")
@@ -318,17 +459,27 @@ def handle_payment_link_paid_webhook(
         payment_entity = payload["payment"]["entity"]
     except (KeyError, TypeError):
         raise RealWebhookError(422, "malformed payment_link.paid envelope")
-
-    reference_id = link_entity.get("reference_id")
-    link_id = link_entity.get("id")
-    payment_id = payment_entity.get("id")
-    claimed_amount = payment_entity.get("amount")
-    if (
-        not isinstance(reference_id, str) or not isinstance(link_id, str)
-        or not isinstance(payment_id, str)
-        or isinstance(claimed_amount, bool) or not isinstance(claimed_amount, int)
-    ):
+    if not isinstance(link_entity, dict) or not isinstance(payment_entity, dict):
         raise RealWebhookError(422, "malformed payment_link.paid envelope")
+
+    reference_id = _entity_str(link_entity, "reference_id")
+    link_id = _entity_str(link_entity, "id")
+    link_amount = _entity_amount(link_entity, "amount")
+    link_currency = _entity_currency(link_entity, "currency")
+    payment_id = _entity_str(payment_entity, "id")
+    payment_amount = _entity_amount(payment_entity, "amount")
+    payment_currency = _entity_currency(payment_entity, "currency")
+    required = (reference_id, link_id, link_amount, link_currency,
+                payment_id, payment_amount, payment_currency)
+    if any(v is None for v in required):
+        raise RealWebhookError(422, "malformed payment_link.paid envelope")
+
+    # Contradictory signed facts, rejected BEFORE any provider call: the
+    # link's own claimed amount/currency must agree with the payment's.
+    if link_amount != payment_amount or link_currency != payment_currency:
+        raise RealWebhookError(
+            422, "contradictory link/payment amount or currency in the signed envelope"
+        )
 
     case_id = case_id_from_reference(reference_id)
     if case_id is None:
@@ -348,20 +499,24 @@ def handle_payment_link_paid_webhook(
         # and persisted for this case - reject rather than trust the claim.
         raise RealWebhookError(409, "link does not match this case's authorized recovery link")
 
-    provider.record_capture(case.obligation_id, payment_id, claimed_amount, link_id=link_id)
-    capture = provider.verify_capture(case.obligation_id)
+    claim = LinkPaymentClaim(
+        link_id=link_id, payment_id=payment_id,
+        expected_reference_id=reference_id_for(case_id),
+        expected_amount_minor=case.amount_minor, expected_currency=case.currency,
+        obligation_id=case.obligation_id,
+    )
+    capture = provider.verify_link_payment(claim)
     if capture is None:
-        raise RealWebhookError(409, "payment could not be independently verified with the provider")
-    if capture.amount_minor != case.amount_minor or (
-        capture.currency is not None and capture.currency != case.currency
-    ):
-        raise RealWebhookError(409, "payment amount/currency does not match this case's obligation")
+        raise RealWebhookError(
+            409, "payment could not be independently verified against the provider"
+        )
 
     webhook = RazorpayWebhook(
         event_id=event_id, type=WebhookType.PAYMENT_CAPTURED,
         obligation_id=case.obligation_id, amount_minor=capture.amount_minor,
-        currency=capture.currency or case.currency, payment_id=capture.payment_id,
+        currency=capture.currency, payment_id=capture.payment_id,
         evidence_mode="REAL_TEST_MODE", link_id=capture.link_id,
+        pre_verified_capture=capture,
         consent=False, reachable_channel=False, customer_notify=False,
     )
     result = engine.receive(webhook)

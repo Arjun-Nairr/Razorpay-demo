@@ -25,6 +25,7 @@ from .types import (
     ActionIntent,
     ActionIntentOutcomeCommand,
     ActionIntentProjection,
+    ActionIntentUncertainCommand,
     ApplyResult,
     Attribution,
     AuditEvent,
@@ -784,6 +785,41 @@ class InMemoryLedger:
             },
         )
         return ApplyResult(ok=True, terminal=False)
+
+    def apply_action_intent_uncertain(self, cmd: ActionIntentUncertainCommand) -> ApplyResult:
+        """Safe stop for a ``ProviderActionUncertain`` action (ambiguous POST
+        completion, malformed response) or a still-``pending`` intent found at
+        startup after an interrupted attempt. Never marks the case recovered
+        and never schedules a fresh attempt - a human resolves it. Idempotent:
+        an intent that is already ``executed`` or already ``uncertain`` is
+        left alone (no duplicate escalation), matching every other terminal
+        guard in this ledger.
+        """
+        intent = self._action_intents.get(cmd.intent_id)
+        if intent is None or intent.case_id != cmd.case_id:
+            return ApplyResult(ok=False, reason="unknown_intent")
+        if intent.status != "pending":
+            return ApplyResult(ok=True, reason="already_resolved")
+        intent.status = "uncertain"
+        case = self._cases[intent.case_id]
+        self._append(
+            cmd.now, case.case_id, AUDIT_ACTION_OUTCOME,
+            {"intent_id": intent.intent_id, "action": intent.action,
+             "status": "uncertain", "reason": cmd.reason},
+        )
+        if case.state.value in TERMINAL_STATES:
+            return ApplyResult(ok=True, terminal=True, reason="uncertain")
+        cancelled = self._pending_work(case.case_id)
+        for w in cancelled:
+            w.cancelled = True
+        case.state = CaseState.ESCALATED
+        case.attribution = Attribution.UNRECOVERED.value
+        case.version += 1
+        self._append(
+            cmd.now, case.case_id, AUDIT_TERMINAL_TRANSITION,
+            {"state": CaseState.ESCALATED.value, "reason": cmd.reason},
+        )
+        return ApplyResult(ok=True, terminal=True, reason="uncertain")
 
     # -- internals -------------------------------------------------
 

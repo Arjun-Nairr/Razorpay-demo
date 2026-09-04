@@ -259,6 +259,12 @@ def build_app(settings: Settings):
     razorpay = build_provider(settings)
     ledger = build_ledger(settings)
     engine = build_engine(settings, ledger=ledger, razorpay=razorpay)
+    # Startup safety sweep (Iteration 16): a CREATE_RECOVERY_LINK action intent
+    # left "pending" by a process interruption is otherwise silently stuck -
+    # nothing schedules it again. Never guesses whether the provider call
+    # completed; marks it "uncertain" for manual review. Idempotent, cheap
+    # (local state only), and a no-op for every case that never used it.
+    engine.reconcile_uncertain_intents()
     merchant_context, next_serial = _bootstrap_demo_state(engine, ledger, razorpay)
     config = ApiConfig(webhook_secret=settings.demo_signing_secret)  # SIMULATED only
     real_secret = (

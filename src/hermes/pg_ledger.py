@@ -500,6 +500,7 @@ class PgLedger:
         "advance_clock", "claim_due_work", "apply_intake", "mark_event_seen",
         "note_event", "apply_evaluation", "apply_strategist_failure",
         "apply_capture", "apply_action_outcome", "discard_work",
+        "apply_action_intent_uncertain",
     })
 
     def __init__(self, store: SnapshotStore) -> None:

@@ -11,6 +11,7 @@ from typing import Protocol, Sequence
 
 from .types import (
     ActionIntentOutcomeCommand,
+    ActionIntentUncertainCommand,
     ApplyResult,
     AuditProjection,
     BatchProjection,
@@ -98,6 +99,11 @@ class Ledger(Protocol):
 
     def apply_action_outcome(self, cmd: ActionIntentOutcomeCommand) -> ApplyResult: ...
     # Idempotent: replaying an already-``executed`` intent_id is a no-op.
+
+    def apply_action_intent_uncertain(self, cmd: ActionIntentUncertainCommand) -> ApplyResult: ...
+    # Safe stop for a ``ProviderActionUncertain`` (or a still-``pending``
+    # intent found at startup): marks the intent ``uncertain`` and the case
+    # ``escalated`` - idempotent, never recovered, never retried automatically.
 
     def discard_work(self, cmd: DiscardWorkCommand) -> ApplyResult: ...
 

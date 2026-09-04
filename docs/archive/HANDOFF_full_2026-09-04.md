@@ -2175,3 +2175,49 @@ Iteration 13; the earlier "Neon outage" claim is superseded/unproven.
   from the two defects fixed there (UTF-8 decode; Avast TLS) and were left
   escalated/unrecovered - not drained or retried; only case-11 ever reached
   recovered.
+
+---
+
+## Iteration 15 archived detail (moved from HANDOFF.md during Iteration 16)
+
+### Razorpay Test Mode - HYBRID slice, first cut (Iteration 15, offline-tested only)
+
+Per RAZORPAY_TEST_SLICE.md. The simulated SaaS obligation, its 3/12-month
+history, and the accelerated failure/retry sequence stayed unchanged. Only
+authorized recovery-link creation and payment confirmation went through
+genuine Razorpay Test Mode calls when the hybrid_test_mode provider was
+selected (RAZORPAY_PROVIDER=hybrid_test_mode, independent of Hermes/Gemini
+mode; default remained fake, zero behavior change). Native subscription-retry
+signals and historical-data retrieval were not implemented.
+
+RazorpayTestModeAdapter (src/hermes/razorpay_test_mode.py): disabled by
+default; rejected any key id not starting with rzp_test_ at construction.
+create_recovery_link called POST /v1/payment_links with the case's trusted
+amount_minor/currency, accept_partial:false, notify:{sms:false,email:false},
+reminder_enable:false, and a stable reference_id (hermes-<case_id>). On an
+ambiguous POST outcome it raised a "reconcile via the dashboard" RuntimeError.
+verify_capture did an independent GET /v1/payments/{id} readback but ONLY
+fetched the payment, not its claimed owning link, and copied the caller's
+claimed link_id into the returned evidence unverified - this was Iteration
+16's defect #1. A mutable `_pending[obligation_id]` dict keyed the
+record_capture/verify_capture round trip - Iteration 16's defect #3
+(concurrent webhook deliveries for the same obligation could mix evidence).
+Missing currency on the readback fell back silently to case.currency instead
+of failing closed - Iteration 16's defect #2. An ambiguous POST completion
+raised past engine.run() uncaught, leaving a "pending" action intent with no
+explicit resolution state - Iteration 16's defect #4. message_sent was set
+equal to policy's message_authorized regardless of whether any messaging
+adapter existed - Iteration 16's defect #5.
+
+HybridPaymentProvider composed the existing FakeRazorpayAdapter (retry
+eligibility only) with the real adapter. New webhook route POST
+/webhooks/razorpay-test (mounted only when real_webhook_secret configured)
+verified a genuine payment_link.paid envelope against a separate secret via
+separate code. CaptureInfo/CaptureCommand gained an optional link_id;
+apply_capture's attribution check accepted either the old direct match
+(simulated) or a link_id match (real).
+
+Offline: 269 passed, 3 skipped (was 237; +31 tests/test_razorpay_test_mode.py
++ 1 startup-grace regression). Real-Hermes harness 33 passed, unaffected.
+case-11 re-read read-only, unchanged. No live Razorpay/Gemini call, no new
+Neon case, no public tunnel started.

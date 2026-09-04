@@ -22,6 +22,7 @@ from .types import (
     AUDIT_INPUT_EVENT,
     AUDIT_POLICY_DECISION,
     ActionIntentOutcomeCommand,
+    ActionIntentUncertainCommand,
     AuditQuery,
     BatchQuery,
     CaptureCommand,
@@ -35,6 +36,7 @@ from .types import (
     PolicyDecision,
     PolicyOutcome,
     ProposalAction,
+    ProviderActionUncertain,
     ProviderRetryFact,
     RazorpayWebhook,
     ReceiveResult,
@@ -296,15 +298,21 @@ class RecoveryEngine:
             return ReceiveResult(True, False, case_id)
 
         payment_id = webhook.payment_id.strip()  # type: ignore[union-attr]
-        # External verification, outside any ledger transaction. For a REAL_TEST_MODE
-        # webhook, ``verify_capture`` performs an independent Razorpay readback
-        # (never trusts the webhook body alone) and returns confirmed figures;
-        # for SIMULATED it is the same record/read round-trip as before.
-        self._razorpay.record_capture(
-            webhook.obligation_id, payment_id, webhook.amount_minor,
-            link_id=webhook.link_id,
-        )
-        capture = self._razorpay.verify_capture(webhook.obligation_id)
+        # External verification, outside any ledger transaction.
+        if webhook.pre_verified_capture is not None:
+            # REAL_TEST_MODE: the webhook route already ran ONE independent
+            # provider readback (payment AND its owning link) before building
+            # this webhook - do not fetch again. Every check below still runs
+            # unchanged on this evidence, and finalization is still the SAME
+            # atomic ``apply_capture`` call as the SIMULATED path.
+            capture = webhook.pre_verified_capture
+        else:
+            # SIMULATED: the same record/read round-trip as before.
+            self._razorpay.record_capture(
+                webhook.obligation_id, payment_id, webhook.amount_minor,
+                link_id=webhook.link_id,
+            )
+            capture = self._razorpay.verify_capture(webhook.obligation_id)
         currency_mismatch = (
             capture is not None and capture.currency is not None
             and capture.currency != snap.currency
@@ -413,25 +421,52 @@ class RecoveryEngine:
             # replay) is executed only now, OUTSIDE the transaction that
             # created it - the strategist never creates or runs the effect
             # itself; the fake executor is deterministic and idempotent, so
-            # a lost/duplicated outcome write can never re-run it.
+            # a lost/duplicated outcome write can never re-run it. The intent
+            # itself was ALREADY persisted (status "pending") by the
+            # ``apply_evaluation`` call above - see ``apply_action_intent_uncertain``
+            # for what happens if the call below cannot confirm its outcome.
             if result.should_execute and result.action_intent_id is not None:
-                reference = self._razorpay.create_recovery_link(
-                    claim.case_id, result.idempotency_key or "",
-                    amount_minor=snap.amount_minor, currency=snap.currency,
-                )
+                try:
+                    reference = self._razorpay.create_recovery_link(
+                        claim.case_id, result.idempotency_key or "",
+                        amount_minor=snap.amount_minor, currency=snap.currency,
+                    )
+                except ProviderActionUncertain as exc:
+                    # Completion is genuinely unknown (ambiguous network
+                    # failure, malformed response) - never guess success or
+                    # failure. Persist an explicit safe stop and move on;
+                    # nothing here schedules a fresh attempt or a replacement
+                    # link, and the case is never marked recovered.
+                    led.apply_action_intent_uncertain(
+                        ActionIntentUncertainCommand(
+                            intent_id=result.action_intent_id, case_id=claim.case_id,
+                            now=self._clock, reason=exc.reason,
+                        )
+                    )
+                    continue
                 # Optional: a real adapter exposes the checkout URL separately
                 # from its own correlation id (``reference``, e.g. a Payment
                 # Link id) - never conflate the two. The fake adapter has no
                 # such method, so this stays None for the simulated path.
                 link_url = getattr(self._razorpay, "link_url", None)
                 url = link_url(claim.case_id) if callable(link_url) else None
+                # message_sent is ACTUAL delivery, never merely what policy
+                # AUTHORIZED (``result.message_authorized``): a provider that
+                # cannot deliver messages itself (no messaging adapter exists
+                # for this hybrid slice - see ``message_delivery_capable``)
+                # must report False regardless of authorization, and the
+                # ledger's own message/contact counters are gated on this
+                # value. The simulated fake executor is unaffected - it has no
+                # such attribute, so it keeps its existing, tested behavior.
+                capable = getattr(self._razorpay, "message_delivery_capable", True)
+                message_sent = bool(result.message_authorized) and bool(capable)
                 led.apply_action_outcome(
                     ActionIntentOutcomeCommand(
                         intent_id=result.action_intent_id,
                         case_id=claim.case_id,
                         now=self._clock,
                         reference=reference,
-                        message_sent=result.message_authorized,
+                        message_sent=message_sent,
                         url=url,
                     )
                 )
@@ -445,6 +480,39 @@ class RecoveryEngine:
             blocked=blocked,
             stale_claims=stale,
         )
+
+    # -- startup safety sweep --------------------------------------------
+
+    def reconcile_uncertain_intents(self) -> int:
+        """Call once after loading a persisted ledger (process restart).
+
+        A ``CREATE_RECOVERY_LINK`` action intent can be left ``pending``
+        forever if the process stopped between ``apply_evaluation`` persisting
+        it and ``create_recovery_link`` confirming an outcome (a crash, not
+        just a caught ``ProviderActionUncertain`` - see ``run()``). Its due
+        work item is already consumed, so nothing will ever revisit it on its
+        own. Whether the provider call actually completed is unknowable from
+        local state alone; this never guesses either way - it marks every
+        still-``pending`` intent found ``uncertain`` (same safe stop as the
+        in-run path) so it surfaces for manual review instead of staying
+        silently stuck. Idempotent - a second call finds nothing left to do.
+        Returns the number of intents reconciled.
+        """
+        led = self._ledger
+        n = 0
+        for case_id in led.case_ids():
+            proj = led.case_projection(case_id=case_id)
+            for intent in proj.action_intents:
+                if intent.action != "CREATE_RECOVERY_LINK" or intent.status != "pending":
+                    continue
+                led.apply_action_intent_uncertain(
+                    ActionIntentUncertainCommand(
+                        intent_id=intent.intent_id, case_id=case_id,
+                        now=self._clock, reason="restart_found_pending_intent",
+                    )
+                )
+                n += 1
+        return n
 
     # -- inspect -------------------------------------------------
 

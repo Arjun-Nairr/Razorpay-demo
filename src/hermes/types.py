@@ -53,6 +53,13 @@ class RazorpayWebhook:
     # BEFORE this webhook is built - never the payment id. Threads through to
     # attribution correlation (see ``CaptureCommand.link_id``). Always ``None``
     # for SIMULATED events.
+    pre_verified_capture: "CaptureInfo | None" = None  # REAL_TEST_MODE only: a
+    # capture ALREADY independently confirmed against the provider (both the
+    # payment AND its owning link) before this webhook was built. When set,
+    # the engine uses this evidence directly instead of calling
+    # ``record_capture``/``verify_capture`` again - one provider fetch, not
+    # two - while still running every ledger validation/finalization step
+    # unchanged. Always ``None`` for SIMULATED events.
 
 
 @dataclass(frozen=True)
@@ -160,6 +167,21 @@ class StrategyProposal:
 
 class InvalidProposal(Exception):
     """Raised when strategist output is not a usable typed proposal."""
+
+
+class ProviderActionUncertain(Exception):
+    """Raised by a ``PaymentProvider`` action (e.g. ``create_recovery_link``)
+    whose completion could not be confirmed - an ambiguous network failure, a
+    malformed response, or anything else where success and failure are both
+    genuinely unknown. The engine must never treat this as an ordinary
+    failure to retry (that risks a duplicate effect) nor as success (that
+    risks a phantom recovery) - it persists an explicit, safe stop and never
+    re-attempts automatically. Not Razorpay-specific: any ``PaymentProvider``
+    may raise it."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 # --- Deterministic policy ----------------------------------------------------
@@ -466,6 +488,22 @@ class ActionIntentOutcomeCommand:
     reference: str  # the executor's deterministic, uniquely correlated id
     message_sent: bool
     url: str | None = None  # REAL_TEST_MODE only: the Payment Link checkout URL
+
+
+@dataclass(frozen=True)
+class ActionIntentUncertainCommand:
+    """Marks an already-persisted, still-``pending`` action intent as
+    ``uncertain`` (a ``ProviderActionUncertain`` was raised, or this intent
+    was found still pending at startup after an interrupted attempt) and
+    moves its case to the safe, explicit ``escalated`` stop - never
+    ``recovered``, never a fresh replacement attempt. Idempotent: an intent
+    already ``executed`` or already ``uncertain`` is left alone.
+    """
+
+    intent_id: str
+    case_id: str
+    now: int
+    reason: str
 
 
 # --- engine results ------------------------------------------------------
