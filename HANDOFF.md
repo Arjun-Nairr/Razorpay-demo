@@ -232,10 +232,13 @@ version) - no write happened after shutdown.
 .\scripts\run_demo.ps1 -Mode hermes
 ```
 
-Payment provider defaults to `fake` (unchanged). To wire the hybrid provider
-once credentials + one live test are authorized, set `RAZORPAY_PROVIDER=
-hybrid_test_mode` (+ the three `RAZORPAY_*` secrets) before launch; leave
-`RAZORPAY_TEST_MODE_ENABLED` unset/`0` until Codex has reviewed this slice.
+Payment provider defaults to `fake` (unchanged). Hybrid Test Mode setup
+(credentials, webhook, `.env` flags) was **completed** for the Iteration 18
+run against `case-18` - see that section above. The API, relay, and tunnel
+from that run are **stopped**; no further live run is currently authorized.
+`/health` now reports `payment_provider` / `payment_provider_test_mode_enabled`
+so `scripts/run_one_hybrid_case.py` fails closed if a future run isn't
+actually wired to `hermes-runtime` + `hybrid_test_mode` + enabled.
 
 ## Blockers
 

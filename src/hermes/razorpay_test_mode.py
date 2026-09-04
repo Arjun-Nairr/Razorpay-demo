@@ -187,6 +187,13 @@ class RazorpayTestModeAdapter:
                 "(RAZORPAY_TEST_MODE_ENABLED=1) to allow real API calls"
             )
 
+    @property
+    def enabled(self) -> bool:
+        """Non-secret capability flag - never a credential - safe to surface
+        on ``/health`` so a caller (e.g. ``scripts/run_one_hybrid_case.py``)
+        can fail closed before attempting a real action."""
+        return self._enabled
+
     # -- PaymentProvider protocol -----------------------------------------
 
     def retry_eligibility(self, obligation_id: str):
@@ -372,6 +379,7 @@ class HybridPaymentProvider:
         self._simulated = simulated
         self._real = real
         self.message_delivery_capable = real.message_delivery_capable
+        self.test_mode_enabled = real.enabled  # non-secret capability flag
 
     def retry_eligibility(self, obligation_id: str):
         return self._simulated.retry_eligibility(obligation_id)

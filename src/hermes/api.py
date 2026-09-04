@@ -366,10 +366,18 @@ def create_app(
 
     @app.get("/health")
     def health() -> dict:
+        # Non-secret provider CAPABILITY flags only - never a key, secret, or
+        # DSN. ``HybridPaymentProvider`` is duck-typed (has verify_link_payment);
+        # the fake simulated adapter does not, so callers can fail closed
+        # before attempting a real action (see scripts/run_one_hybrid_case.py).
+        provider = app.state.razorpay
+        payment_provider = "hybrid_test_mode" if hasattr(provider, "verify_link_payment") else "fake"
         return {
             "status": "ok",
             "evidence_mode": config.evidence_mode,
             "mode": app.state.mode_label,
+            "payment_provider": payment_provider,
+            "payment_provider_test_mode_enabled": bool(getattr(provider, "test_mode_enabled", False)),
         }
 
     # -- public webhook: signature over raw bytes BEFORE any parsing ----

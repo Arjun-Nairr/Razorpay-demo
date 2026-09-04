@@ -5,6 +5,13 @@ Razorpay webhook (see scripts/webhook_relay.py + the /webhooks/razorpay-test
 route). Talks only to the already-running local API (existing endpoints); it
 does not open the DB, hold credentials, or force an outcome.
 
+Fails closed before any write: refuses to even open a case unless ``/health``
+confirms real Hermes/Gemini mode, the hybrid Razorpay Test Mode provider, and
+real Test Mode actions enabled (see ``_require_ready``). The opened case's own
+``evidence_mode`` stays ``SIMULATED`` - that is the correct, honest label for
+its synthetic failure/retry intake; only the recovery-link creation and its
+eventual payment confirmation are real. This script never relabels the case.
+
     python scripts/run_one_hybrid_case.py
 
 Env: HERMES_API_BASE (default http://127.0.0.1:8000).
@@ -42,6 +49,31 @@ def _case(cid: str) -> dict:
     return _req("GET", f"/demo/case/{cid}")
 
 
+def _require_ready(health: dict) -> None:
+    """Fail closed before ANY write (including ``POST /demo/case``) unless
+    ``/health`` explicitly confirms all three: real Hermes/Gemini strategist
+    mode, the hybrid Razorpay Test Mode provider, and real Test Mode actions
+    actually enabled. A missing, fake, disabled, or mismatched field refuses -
+    it never assumes readiness from partial or absent evidence."""
+    problems = []
+    if health.get("mode") != "hermes-runtime":
+        problems.append(
+            f"strategist mode is {health.get('mode')!r}, need 'hermes-runtime'")
+    if health.get("payment_provider") != "hybrid_test_mode":
+        problems.append(
+            f"payment provider is {health.get('payment_provider')!r}, "
+            "need 'hybrid_test_mode'")
+    if health.get("payment_provider_test_mode_enabled") is not True:
+        problems.append(
+            "real Test Mode actions are not enabled "
+            "(payment_provider_test_mode_enabled is not true)")
+    if problems:
+        print("  ! refusing to run - preflight failed:", file=sys.stderr)
+        for p in problems:
+            print(f"    - {p}", file=sys.stderr)
+        raise SystemExit(2)
+
+
 def _report(cid: str) -> dict:
     view = _case(cid)
     case = view["case"]
@@ -57,12 +89,10 @@ def _report(cid: str) -> dict:
 
 def main() -> int:
     health = _req("GET", "/health")
-    mode = health.get("mode")
-    print(f"API: {BASE}  evidence_mode={health.get('evidence_mode')}  mode={mode}")
-    if mode != "hermes-runtime":
-        print(f"  ! expected mode 'hermes-runtime' (got {mode!r}). Refusing to run.",
-              file=sys.stderr)
-        return 2
+    print(f"API: {BASE}  evidence_mode={health.get('evidence_mode')}  "
+          f"mode={health.get('mode')}  payment_provider={health.get('payment_provider')}  "
+          f"test_mode_enabled={health.get('payment_provider_test_mode_enabled')}")
+    _require_ready(health)
 
     opened = _req("POST", "/demo/case")
     cid, obl = opened["case_id"], opened["obligation_id"]

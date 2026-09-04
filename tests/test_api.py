@@ -97,6 +97,43 @@ def test_health():
     assert "mode" in body  # scripted-offline / live-gemini, shown honestly
 
 
+def test_health_reports_fake_provider_by_default():
+    """No ``razorpay=`` provider passed (or a plain FakeRazorpayAdapter) must
+    report the fake/disabled capability flags - never claim hybrid Test Mode
+    readiness that isn't actually wired up."""
+    tc, _ = make_client()
+    body = tc.get("/health").json()
+    assert body["payment_provider"] == "fake"
+    assert body["payment_provider_test_mode_enabled"] is False
+
+
+def test_health_reports_hybrid_provider_and_test_mode_flag():
+    """Non-secret capability flags only - no key/secret/DSN value ever
+    appears here (see scripts/run_one_hybrid_case.py, which fails closed on
+    these exact fields before opening any case)."""
+    from hermes.razorpay_test_mode import HybridPaymentProvider, RazorpayTestModeAdapter
+
+    real = RazorpayTestModeAdapter("rzp_test_x", "secret", enabled=True)
+    provider = HybridPaymentProvider(FakeRazorpayAdapter(), real)
+    eng = RecoveryEngine(InMemoryLedger(), ScriptedStrategist(), provider)
+    app = create_app(engine=eng, config=ApiConfig(webhook_secret=SECRET), razorpay=provider)
+    body = TestClient(app).get("/health").json()
+    assert body["payment_provider"] == "hybrid_test_mode"
+    assert body["payment_provider_test_mode_enabled"] is True
+
+
+def test_health_reports_hybrid_provider_disabled():
+    from hermes.razorpay_test_mode import HybridPaymentProvider, RazorpayTestModeAdapter
+
+    real = RazorpayTestModeAdapter("rzp_test_x", "secret", enabled=False)
+    provider = HybridPaymentProvider(FakeRazorpayAdapter(), real)
+    eng = RecoveryEngine(InMemoryLedger(), ScriptedStrategist(), provider)
+    app = create_app(engine=eng, config=ApiConfig(webhook_secret=SECRET), razorpay=provider)
+    body = TestClient(app).get("/health").json()
+    assert body["payment_provider"] == "hybrid_test_mode"
+    assert body["payment_provider_test_mode_enabled"] is False
+
+
 # --- valid signed payload ---------------------------------------------
 
 

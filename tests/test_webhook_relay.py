@@ -8,7 +8,9 @@ from __future__ import annotations
 import http.server
 import importlib.util
 import json
+import socket
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -166,3 +168,125 @@ def test_relay_module_has_no_engine_db_or_credential_references():
                 "GEMINI_API_KEY", "PgLedger", "RazorpayTestModeAdapter")
     for term in forbidden:
         assert term not in source, f"webhook_relay.py must not reference {term!r}"
+
+
+# --- Content-Length hardening: missing/malformed/negative/oversized -------
+
+
+def _raw_request(port: int, request_bytes: bytes, timeout: float = 5.0) -> bytes:
+    with socket.create_connection(("127.0.0.1", port), timeout=timeout) as s:
+        s.sendall(request_bytes)
+        s.settimeout(timeout)
+        chunks = []
+        try:
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        except (TimeoutError, socket.timeout):
+            pass
+        return b"".join(chunks)
+
+
+def _status_of(response: bytes) -> int:
+    return int(response.split(b"\r\n", 1)[0].split(b" ")[1])
+
+
+def test_missing_content_length_is_rejected(relay, upstream):
+    port = relay.server_address[1]
+    req = (b"POST /webhooks/razorpay-test HTTP/1.1\r\n"
+           b"Host: 127.0.0.1\r\nConnection: close\r\n\r\n")
+    assert _status_of(_raw_request(port, req)) == 411
+    assert _UpstreamStub.seen == []
+
+
+def test_malformed_content_length_is_rejected(relay, upstream):
+    port = relay.server_address[1]
+    req = (b"POST /webhooks/razorpay-test HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+           b"Content-Length: not-a-number\r\nConnection: close\r\n\r\n")
+    assert _status_of(_raw_request(port, req)) == 400
+    assert _UpstreamStub.seen == []
+
+
+def test_negative_content_length_is_rejected(relay, upstream):
+    port = relay.server_address[1]
+    req = (b"POST /webhooks/razorpay-test HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+           b"Content-Length: -5\r\nConnection: close\r\n\r\n")
+    assert _status_of(_raw_request(port, req)) == 400
+    assert _UpstreamStub.seen == []
+
+
+def test_oversized_content_length_is_rejected(relay, upstream):
+    port = relay.server_address[1]
+    too_big = relay_mod.MAX_BODY_BYTES + 1
+    req = (f"POST /webhooks/razorpay-test HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+           f"Content-Length: {too_big}\r\nConnection: close\r\n\r\n").encode()
+    assert _status_of(_raw_request(port, req)) == 413
+    assert _UpstreamStub.seen == []
+
+
+def test_content_length_at_the_limit_is_accepted(relay, upstream):
+    """The ceiling itself, not just past it, must still forward normally."""
+    port = relay.server_address[1]
+    body = b"x" * relay_mod.MAX_BODY_BYTES
+    req = (f"POST /webhooks/razorpay-test HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+           f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode() + body
+    assert _status_of(_raw_request(port, req)) == 401  # the stub's fixed reply
+    assert len(_UpstreamStub.seen) == 1
+    assert _UpstreamStub.seen[0]["body"] == body
+
+
+# --- bounded body-read deadline --------------------------------------------
+
+
+def test_slow_body_read_times_out(monkeypatch, relay, upstream):
+    monkeypatch.setattr(relay_mod, "BODY_READ_TIMEOUT_S", 0.3)
+    port = relay.server_address[1]
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+        s.sendall(
+            b"POST /webhooks/razorpay-test HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            b"Content-Length: 20\r\nConnection: close\r\n\r\n"
+            b"12345"  # only 5 of the declared 20 bytes - never completes
+        )
+        s.settimeout(5)
+        chunks = []
+        try:
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        except (TimeoutError, socket.timeout):
+            pass
+    assert _status_of(b"".join(chunks)) == 408
+    assert _UpstreamStub.seen == []  # never forwarded a partial body
+
+
+# --- sanitized logging: no raw path, query string, headers, or body -------
+
+
+def test_query_string_is_never_logged(relay, upstream, capsys):
+    status, _ = _get(_url(relay, "/webhooks/razorpay-test?secret=SUPERSECRETVALUE"))
+    assert status == 404  # exact-path match only
+    time.sleep(0.05)  # let the background handler thread's print land
+    out = capsys.readouterr().out
+    assert "SUPERSECRETVALUE" not in out
+    assert "secret=" not in out
+    assert "?" not in out
+
+
+def test_signature_header_is_never_logged(relay, upstream, capsys):
+    _post(_url(relay, "/webhooks/razorpay-test"), body=b"{}",
+          headers={"X-Razorpay-Signature": "deadbeef" * 8})
+    time.sleep(0.05)
+    out = capsys.readouterr().out
+    assert "deadbeef" not in out
+
+
+def test_log_output_is_method_status_and_fixed_category_only(relay, upstream, capsys):
+    _post(_url(relay, "/webhooks/razorpay-test"), body=b"{}")
+    time.sleep(0.05)
+    out = capsys.readouterr().out
+    assert "webhook" in out and "401" in out and "POST" in out
+    assert "{" not in out  # never the body
