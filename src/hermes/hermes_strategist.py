@@ -38,15 +38,23 @@ from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
 from .message_templates import APPROVED_MESSAGE_INTENT_LIST, is_approved_message_intent
-from .types import InvalidProposal, ProposalAction, StrategyProposal, StrategySnapshot
+from .types import (
+    MAX_HUMAN_REVIEW_REASON_CHARS,
+    NO_REVIEW_INTERVENTIONS,
+    InvalidProposal,
+    ProposalAction,
+    RecommendedIntervention,
+    StrategyProposal,
+    StrategySnapshot,
+)
 
 DEFAULT_MODEL = "gemini-3.7-flash"
 DEFAULT_TIMEOUT_S = 60.0
 DEFAULT_API_KEY_ENV = "GEMINI_API_KEY"
-# Bumped: the prompt now hands Gemini the exact approved message strings and
-# includes wait_hours_remaining; message choice is validated in-adapter within
-# the one-repair boundary.
-PROMPT_VERSION = "hermes-strategist/2026-09-04.1"
+# Bumped: the prompt/schema now require an explicit non-executable advisory
+# (recommended_intervention + human_review_recommended + human_review_reason),
+# validated structurally here within the one-repair boundary.
+PROMPT_VERSION = "hermes-strategist/2026-09-05.1"
 _MAX_RAW_CHARS = 4000  # bounded raw-response capture for run metadata
 
 # The model must return a JSON object with EXACTLY these keys - no more, no less.
@@ -56,8 +64,14 @@ REQUIRED_KEYS: tuple[str, ...] = (
     "rationale",
     "confidence",
     "proposed_wait_hours",
+    "recommended_intervention",
+    "human_review_recommended",
+    "human_review_reason",
     "message_intent",
 )
+
+_ALL_INTERVENTIONS: frozenset[str] = frozenset(r.value for r in RecommendedIntervention)
+_NO_REVIEW_VALUES: frozenset[str] = frozenset(r.value for r in NO_REVIEW_INTERVENTIONS)
 
 # The isolation settings the Hermes-Agent path WOULD have applied to every
 # fresh ``AIAgent``. Asserted verbatim by the offline tests so a later swap to
@@ -127,6 +141,19 @@ Return ONLY a single JSON object, no prose, with exactly these keys:
                          when action is WAIT_FOR_PROVIDER_RETRY it MUST be an
                          integer >= 1 and MUST NOT exceed "wait_hours_remaining"
                          from the snapshot)
+  "recommended_intervention": a SEPARATE, non-executable advisory - one of
+                         NONE, UPDATE_PAYMENT_METHOD, MANDATE_REAUTH_REVIEW,
+                         PAYMENT_PLAN_REVIEW, BILLING_SUPPORT_REVIEW,
+                         HUMAN_FOLLOW_UP. It never authorizes anything and
+                         never recommends a discount, access change,
+                         suspension, or freeze.
+  "human_review_recommended": true/false. MUST be false for NONE and
+                         UPDATE_PAYMENT_METHOD; MUST be true for every other
+                         recommended_intervention.
+  "human_review_reason": null for NONE/UPDATE_PAYMENT_METHOD; otherwise a
+                         short (<= {MAX_HUMAN_REVIEW_REASON_CHARS} char),
+                         evidence-based reason - never a URL, amount, or
+                         payment/provider identifier, never an invented fact.
   "message_intent": EITHER null, OR one of these approved strings COPIED VERBATIM
                     (no other text is accepted; pick the closest fit):
 {_APPROVED_MESSAGES_BLOCK}
@@ -233,6 +260,37 @@ def parse_proposal(raw: str) -> StrategyProposal:
             "message_intent must be null or one of the approved templates verbatim"
         )
 
+    ri_raw = obj["recommended_intervention"]
+    if ri_raw not in _ALL_INTERVENTIONS:
+        raise InvalidProposal(f"unknown recommended_intervention: {ri_raw!r}")
+    recommended_intervention = RecommendedIntervention(ri_raw)
+
+    hrr = obj["human_review_recommended"]
+    if not isinstance(hrr, bool):
+        raise InvalidProposal(f"human_review_recommended must be a real boolean: {hrr!r}")
+
+    reason = obj["human_review_reason"]
+    if reason is not None:
+        if not isinstance(reason, str) or not reason.strip():
+            raise InvalidProposal("human_review_reason must be null or a nonblank string")
+        if len(reason) > MAX_HUMAN_REVIEW_REASON_CHARS:
+            raise InvalidProposal(
+                f"human_review_reason exceeds {MAX_HUMAN_REVIEW_REASON_CHARS} characters"
+            )
+        reason = reason.strip()
+
+    if ri_raw in _NO_REVIEW_VALUES:
+        if hrr is not False or reason is not None:
+            raise InvalidProposal(
+                f"{ri_raw} must not set human_review_recommended or human_review_reason"
+            )
+    else:
+        if hrr is not True or not reason:
+            raise InvalidProposal(
+                f"{ri_raw} requires human_review_recommended=true and a nonblank "
+                "human_review_reason"
+            )
+
     return StrategyProposal(
         action=action,
         diagnosis=diagnosis.strip(),
@@ -240,6 +298,9 @@ def parse_proposal(raw: str) -> StrategyProposal:
         confidence=float(conf),
         proposed_wait_hours=int(wait),
         message_intent=message_intent,
+        recommended_intervention=recommended_intervention,
+        human_review_recommended=hrr,
+        human_review_reason=reason,
     )
 
 

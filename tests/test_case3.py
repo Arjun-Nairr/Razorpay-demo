@@ -25,6 +25,7 @@ from hermes.engine import (
     authorize,
 )
 from hermes.types import (
+    ActionIntentOutcomeCommand,
     AuditQuery,
     BatchQuery,
     CaptureCommand,
@@ -33,6 +34,7 @@ from hermes.types import (
     ProposalAction,
     ProviderRetryFact,
     RazorpayWebhook,
+    RecommendedIntervention,
     StrategyProposal,
     WebhookType,
 )
@@ -227,7 +229,13 @@ def test_message_intent_authorized_when_merchant_owns_communication(engine, razo
 
     cv = case_view(engine, case_id=cid)
     assert cv.communication_owner == "merchant"
-    assert cv.messages_sent == 1
+    # Authorized -> staged as a DRAFTED template draft, never actually sent -
+    # no messaging adapter exists yet (see engine.py's message_delivery_capable).
+    assert cv.messages_sent == 0
+    intent = cv.action_intents[0]
+    assert intent.message_status == "DRAFTED"
+    assert intent.message_draft == intent.message_intent
+    assert intent.message_sent is False
     reasons = policy_reasons(engine, cid)
     assert "recovery_link_authorized_message_authorized" in reasons
 
@@ -241,6 +249,7 @@ def test_razorpay_owned_communication_suppresses_merchant_contact(engine, razorp
     assert cv.communication_owner == "razorpay"
     assert cv.links_created == 1  # the link itself is still authorized
     assert cv.messages_sent == 0  # but the merchant message path is suppressed
+    assert cv.action_intents[0].message_status == "SUPPRESSED"
     reasons = policy_reasons(engine, cid)
     assert "recovery_link_authorized_message_suppressed_provider_owned" in reasons
 
@@ -425,3 +434,90 @@ def test_invalid_message_intent_with_url_executes_no_action(razorpay):
     cv = case_view(engine, case_id=r.case_id)
     assert cv.links_created == 0 and len(cv.action_intents) == 0
     assert "AI_PROPOSAL" not in audit_kinds(engine, cv.case_id)
+
+
+# --- typed advisory contract: persisted, never authorizing anything --------
+
+
+class _AdvisoryStrategist:
+    """Proposes the same safe WAIT decision every ScriptedStrategist would,
+    but attaches a non-NONE advisory - proves the advisory rides along
+    without changing what gets authorized."""
+
+    def __init__(self, **advisory):
+        self._advisory = advisory
+
+    def propose(self, snapshot):
+        return StrategyProposal(
+            action=ProposalAction.WAIT_FOR_PROVIDER_RETRY, diagnosis="d", rationale="r",
+            confidence=0.5, proposed_wait_hours=24, **self._advisory,
+        )
+
+
+def test_advisory_is_persisted_in_ai_proposal_audit_event(razorpay):
+    eligible(razorpay)
+    ledger = InMemoryLedger()
+    engine = RecoveryEngine(ledger, _AdvisoryStrategist(
+        recommended_intervention=RecommendedIntervention.HUMAN_FOLLOW_UP,
+        human_review_recommended=True,
+        human_review_reason="evidence is thin; a human should look",
+    ), razorpay)
+    r = engine.receive(failed_event("evt_advisory"))
+    engine.run(until=1)
+
+    proposals = [rec.detail for rec in engine.inspect(AuditQuery(case_id=r.case_id)).records
+                 if rec.kind == "AI_PROPOSAL"]
+    assert proposals[-1]["recommended_intervention"] == "HUMAN_FOLLOW_UP"
+    assert proposals[-1]["human_review_recommended"] is True
+    assert proposals[-1]["human_review_reason"] == "evidence is thin; a human should look"
+
+
+def test_advisory_never_changes_authorization_or_executes_an_effect():
+    """A HUMAN_FOLLOW_UP advisory alongside an otherwise-identical WAIT
+    proposal must authorize/schedule EXACTLY as a NONE advisory would - the
+    advisory is evidence only, never authority."""
+    rp1, rp2 = FakeRazorpayAdapter(), FakeRazorpayAdapter()
+    eligible(rp1, obligation="sub_plain")
+    eligible(rp2, obligation="sub_advised")
+    plain = RecoveryEngine(InMemoryLedger(), _AdvisoryStrategist(), rp1)
+    advised = RecoveryEngine(InMemoryLedger(), _AdvisoryStrategist(
+        recommended_intervention=RecommendedIntervention.HUMAN_FOLLOW_UP,
+        human_review_recommended=True, human_review_reason="a reason",
+    ), rp2)
+
+    r1 = plain.receive(failed_event("evt_plain", obligation="sub_plain"))
+    report1 = plain.run(until=1)
+    r2 = advised.receive(failed_event("evt_advised", obligation="sub_advised"))
+    report2 = advised.run(until=1)
+
+    assert report1.proposals == report2.proposals == 1
+    assert report1.scheduled == report2.scheduled == 1
+    cv1, cv2 = case_view(plain, case_id=r1.case_id), case_view(advised, case_id=r2.case_id)
+    assert cv1.state == cv2.state == "waiting"
+    assert cv1.links_created == cv2.links_created == 0
+    assert cv1.actions_taken == cv2.actions_taken == 0
+
+
+def test_replayed_action_outcome_never_duplicates_message_drafted(razorpay):
+    ledger = InMemoryLedger()
+    engine = RecoveryEngine(ledger, ScriptedStrategist(), razorpay)
+    cid = wait_then_fail_retry(engine, razorpay, customer_notify=False)
+    engine.run(until=1)  # authorizes + executes the link -> stages exactly one draft
+
+    intent = case_view(engine, case_id=cid).action_intents[0]
+    assert intent.message_status == "DRAFTED"
+    drafted_before = [r for r in engine.inspect(AuditQuery(case_id=cid)).records
+                      if r.kind == "MESSAGE_DRAFTED"]
+    assert len(drafted_before) == 1
+
+    result = ledger.apply_action_outcome(  # replay the SAME already-executed outcome
+        ActionIntentOutcomeCommand(
+            intent_id=intent.intent_id, case_id=cid, now=2,
+            reference=intent.reference, message_sent=False,
+        )
+    )
+    assert result.reason == "already_executed"
+
+    drafted_after = [r for r in engine.inspect(AuditQuery(case_id=cid)).records
+                     if r.kind == "MESSAGE_DRAFTED"]
+    assert len(drafted_after) == 1  # never duplicated

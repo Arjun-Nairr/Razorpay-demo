@@ -2442,3 +2442,41 @@ Verified: offline focused python -m pytest -q tests/test_hermes_agent.py went
 33 -> 37 (wiring) -> 41 (corrections) passed; full offline suite steady at
 373 passed, 3 skipped throughout. compileall + git diff --check clean both
 times; no live service called in either sub-iteration.
+
+---
+
+## Iteration 22 archived detail (moved from HANDOFF.md during Iteration 23)
+
+One live consistent-history exemplar, persisted to Neon - first real run of
+the SOUL + Rule 1 wiring against live Gemini. One new trusted demo case
+(case-25, obligation sub_demo_0005_e2c073a9) created via the existing POST
+/demo/case -> POST /demo/step {"step":"advance"} path, advanced exactly once,
+then stopped - no retry-failed, no recovery link, no capture, no second case.
+Local FastAPI only (hermes.asgi:app, 127.0.0.1:8000, HERMES_MODE=hermes); no
+Streamlit, tunnel, relay, or Docker. Preflight: clean tree at c43234c,
+installed Hermes revision matched EXPECTED_HERMES_REVISION, GEMINI_API_KEY/
+DATABASE_URL present via .env (values never printed), all five Neon views
+present. .env still carried RAZORPAY_PROVIDER=hybrid_test_mode from Iteration
+18 - overridden to fake via a process-only shell env var (.env untouched;
+load_dotenv uses override=False) so /health reported payment_provider=fake /
+payment_provider_test_mode_enabled=false before the case was created.
+
+Result - every expected condition passed, verified, none forced:
+action=WAIT_FOR_PROVIDER_RETRY, policy_outcome=ALLOW
+(provider_retry_permitted), state=waiting, confidence=0.55 (medium band), one
+tool call (get_payment_retry_facts only, no get_payment_history,
+history_expansion_requested=false), zero recovery links/messages/Razorpay
+calls, human_review_required=false. Rationale cited the two prior on-time
+payments within the three-month window, its limited coverage, verified
+simulated-provider retry eligibility, and the remaining uncertainty - unedited
+model output.
+
+Neon readback (hermes_demo, scoped to case-25): case_summary 1 row
+(display_status=WAITING_FOR_PROVIDER_RETRY); hermes_decisions 1 row
+(gemini-3.7-flash, prompt_version=hermes-agent/2026-09-05.2, revision
+e02d1e41f..., 1 tool call/6 budget, 2 model iterations/8 budget, ~17.1s);
+recovery_actions 0 rows (correct - WAIT creates no link); hermes_evidence 1
+row (get_payment_retry_facts/SIMULATED_PROVIDER); audit_timeline 6 rows
+(INPUT_EVENT, DEMO_CASE_PROVENANCE, AI_MODEL_RUN, AI_PROPOSAL,
+POLICY_DECISION, SCHEDULED_ACTION). No source code changed; no code-change
+rule invoked. API process stopped and port confirmed free after readback.

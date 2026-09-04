@@ -15,6 +15,7 @@ from .types import (
     AUDIT_ACTION_OUTCOME,
     AUDIT_AI_PROPOSAL,
     AUDIT_INPUT_EVENT,
+    AUDIT_MESSAGE_DRAFTED,
     AUDIT_PAYMENT_CONFIRMATION,
     AUDIT_PENDING_WORK_CANCELLED,
     AUDIT_POLICY_DECISION,
@@ -42,6 +43,7 @@ from .types import (
     EvaluationCommand,
     IntakeCommand,
     IntakeResult,
+    MessageStatus,
     NoteEventCommand,
     PolicyOutcome,
     ProposalAction,
@@ -52,6 +54,7 @@ from .types import (
     StrategySnapshot,
     TERMINAL_STATES,
     WorkClaim,
+    compute_message_status,
     valid_payment_id,
 )
 
@@ -301,6 +304,8 @@ class InMemoryLedger:
                 ActionIntentProjection(
                     intent_id=i.intent_id, action=i.action, status=i.status,
                     reference=i.reference, message_sent=i.message_sent, url=i.url,
+                    message_intent=i.message_intent, message_draft=i.message_draft,
+                    message_status=i.message_status,
                 )
                 for i in self._action_intents.values()
                 if i.case_id == c.case_id
@@ -458,6 +463,9 @@ class InMemoryLedger:
                 "rationale": proposal.rationale,
                 "confidence": proposal.confidence,
                 "proposed_wait_hours": proposal.proposed_wait_hours,
+                "recommended_intervention": proposal.recommended_intervention.value,
+                "human_review_recommended": proposal.human_review_recommended,
+                "human_review_reason": proposal.human_review_reason,
             },
         )
         self._append(
@@ -538,10 +546,12 @@ class InMemoryLedger:
                 idempotency_key=idempotency_key, should_execute=False,
             )
         intent_id = self._next_id("intent")
+        message_status = compute_message_status(proposal.message_intent, decision.message_authorized)
         self._action_intents[intent_id] = ActionIntent(
             intent_id=intent_id, case_id=case.case_id,
             action=proposal.action.value, idempotency_key=idempotency_key,
             created_time=now,
+            message_intent=proposal.message_intent, message_status=message_status,
         )
         self._intents_by_key[(case.case_id, idempotency_key)] = intent_id
         case.links_created += 1
@@ -773,6 +783,16 @@ class InMemoryLedger:
         if cmd.message_sent:
             case.messages_sent += 1
             case.last_contact_time = cmd.now
+        # A message already AUTHORIZED by policy is only DRAFTED once the link
+        # creation this draft rides on is CONFIRMED (this call). Deterministic
+        # rendering is the identity function - the approved template already IS
+        # the safe draft text, never interpolated with a model-echoed URL/
+        # amount/id. Idempotent: an already-``executed`` intent returns above,
+        # before this ever runs twice for the same intent.
+        drafted = intent.message_status == MessageStatus.AUTHORIZED.value
+        if drafted:
+            intent.message_draft = intent.message_intent
+            intent.message_status = MessageStatus.DRAFTED.value
         case.version += 1
         self._append(
             cmd.now, case.case_id, AUDIT_ACTION_OUTCOME,
@@ -784,6 +804,17 @@ class InMemoryLedger:
                 **({"url": cmd.url} if cmd.url else {}),
             },
         )
+        if drafted:
+            self._append(
+                cmd.now, case.case_id, AUDIT_MESSAGE_DRAFTED,
+                {
+                    "intent_id": intent.intent_id,
+                    "case_id": case.case_id,
+                    "message_intent": intent.message_intent,
+                    "message_draft": intent.message_draft,
+                    "status": intent.message_status,
+                },
+            )
         return ApplyResult(ok=True, terminal=False)
 
     def apply_action_intent_uncertain(self, cmd: ActionIntentUncertainCommand) -> ApplyResult:

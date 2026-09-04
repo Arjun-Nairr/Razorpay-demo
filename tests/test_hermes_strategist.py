@@ -9,6 +9,7 @@ suite passes whether or not the optional ``google-genai`` SDK is installed.
 from __future__ import annotations
 
 import builtins
+import dataclasses
 import json
 import pathlib
 import time
@@ -38,6 +39,9 @@ def _valid_obj(**over) -> dict:
         "rationale": "wait is spent; offer an alternate collection path",
         "confidence": 0.71,
         "proposed_wait_hours": 0,
+        "recommended_intervention": "NONE",
+        "human_review_recommended": False,
+        "human_review_reason": None,
         "message_intent": None,  # structural tests; message-choice tests set it explicitly
     }
     obj.update(over)
@@ -100,7 +104,7 @@ def strategist(*responses, sleep_s=0.0, **kw):
     return HermesStrategist(transport_factory=lambda: stub, **kw), stub
 
 
-# --- schema validation: exactly six keys ---------------------------------
+# --- schema validation: exactly nine keys ---------------------------------
 
 
 def test_valid_json_becomes_typed_proposal():
@@ -118,10 +122,11 @@ def test_valid_json_becomes_typed_proposal():
     assert meta.latency_ms >= 0.0
 
 
-def test_required_keys_are_the_documented_six():
+def test_required_keys_are_the_documented_nine():
     assert set(REQUIRED_KEYS) == {
         "action", "diagnosis", "rationale", "confidence",
-        "proposed_wait_hours", "message_intent",
+        "proposed_wait_hours", "recommended_intervention",
+        "human_review_recommended", "human_review_reason", "message_intent",
     }
 
 
@@ -179,6 +184,94 @@ def test_type_enum_and_range_faults_still_rejected(obj):
 def test_blank_message_intent_is_normalised_to_none():
     assert parse_proposal(json.dumps(_valid_obj(message_intent="   "))).message_intent is None
     assert parse_proposal(json.dumps(_valid_obj(message_intent=None))).message_intent is None
+
+
+# --- typed advisory contract (recommended_intervention / human_review_*) ---
+
+
+@pytest.mark.parametrize("value", [
+    "NONE", "UPDATE_PAYMENT_METHOD", "MANDATE_REAUTH_REVIEW",
+    "PAYMENT_PLAN_REVIEW", "BILLING_SUPPORT_REVIEW", "HUMAN_FOLLOW_UP",
+])
+def test_every_valid_advisory_enum_is_accepted(value):
+    over = {"recommended_intervention": value}
+    if value in ("NONE", "UPDATE_PAYMENT_METHOD"):
+        over.update(human_review_recommended=False, human_review_reason=None)
+    else:
+        over.update(human_review_recommended=True, human_review_reason="evidence-based reason")
+    proposal = parse_proposal(json.dumps(_valid_obj(**over)))
+    assert proposal.recommended_intervention.value == value
+
+
+def test_unknown_advisory_value_is_rejected():
+    with pytest.raises(InvalidProposal):
+        parse_proposal(json.dumps(_valid_obj(recommended_intervention="OFFER_DISCOUNT")))
+
+
+@pytest.mark.parametrize("bad_bool", [1, 0, "true", "false", None])
+def test_human_review_recommended_rejects_non_boolean_truthiness(bad_bool):
+    with pytest.raises(InvalidProposal):
+        parse_proposal(json.dumps(_valid_obj(human_review_recommended=bad_bool)))
+
+
+@pytest.mark.parametrize("intervention,hrr,reason", [
+    ("NONE", True, None),                                    # must be false
+    ("NONE", False, "some reason"),                          # reason must be null
+    ("UPDATE_PAYMENT_METHOD", True, "some reason"),
+    ("MANDATE_REAUTH_REVIEW", False, "some reason"),          # must be true
+    ("MANDATE_REAUTH_REVIEW", True, None),                    # reason required
+    ("PAYMENT_PLAN_REVIEW", True, "   "),                     # blank reason
+    ("BILLING_SUPPORT_REVIEW", True, "x" * 301),              # oversized reason
+])
+def test_every_invalid_advisory_combination_is_rejected(intervention, hrr, reason):
+    with pytest.raises(InvalidProposal):
+        parse_proposal(json.dumps(_valid_obj(
+            recommended_intervention=intervention,
+            human_review_recommended=hrr,
+            human_review_reason=reason,
+        )))
+
+
+@pytest.mark.parametrize("reason", [
+    "call http://example.com/pay",       # URL
+    "see reference plink_abc123",        # provider/payment identifier
+])
+def test_engine_rejects_unsafe_human_review_reason_content(reason):
+    """Content rules (URL / provider-identifier detection) live with the
+    engine's ``_validate_proposal`` - the same layering as ``message_intent``
+    (see parse_proposal's own docstring) - not the local schema check."""
+    from hermes.engine import _validate_proposal
+
+    proposal = parse_proposal(json.dumps(_valid_obj(
+        recommended_intervention="HUMAN_FOLLOW_UP", human_review_recommended=True,
+        human_review_reason="a safe placeholder reason",
+    )))
+    unsafe = dataclasses.replace(proposal, human_review_reason=reason)
+    with pytest.raises(InvalidProposal):
+        _validate_proposal(unsafe)
+
+
+def test_advisory_never_changes_the_engine_authorization_path():
+    """The advisory is evidence only - authorize() never even looks at it."""
+    from hermes.engine import authorize
+    from hermes.types import CaseSnapshot, ProviderRetryFact
+
+    snap = CaseSnapshot(
+        case_id="c1", obligation_id="sub_x", amount_minor=1_000_000, currency="INR",
+        state="active", failure_reason="insufficient_funds", version=1,
+        retry_outcome_recorded=True,
+    )
+    fact = ProviderRetryFact("sub_x", True, "provider_retry_signal")
+    p_none = parse_proposal(json.dumps(_valid_obj(action="WAIT_FOR_PROVIDER_RETRY",
+                                                  proposed_wait_hours=1)))
+    p_review = parse_proposal(json.dumps(_valid_obj(
+        action="WAIT_FOR_PROVIDER_RETRY", proposed_wait_hours=1,
+        recommended_intervention="HUMAN_FOLLOW_UP", human_review_recommended=True,
+        human_review_reason="evidence-based reason",
+    )))
+    d_none = authorize(p_none, snap, 10, fact)
+    d_review = authorize(p_review, snap, 10, fact)
+    assert d_none.outcome == d_review.outcome and d_none.reason_code == d_review.reason_code
 
 
 # --- repair behaviour ---------------------------------------------------
@@ -402,7 +495,9 @@ def test_setup_failure_does_not_leak_prior_run_metadata():
 
 def _obj(**over):
     o = {"action": "CREATE_RECOVERY_LINK", "diagnosis": "d", "rationale": "r",
-         "confidence": 0.6, "proposed_wait_hours": 0, "message_intent": None}
+         "confidence": 0.6, "proposed_wait_hours": 0,
+         "recommended_intervention": "NONE", "human_review_recommended": False,
+         "human_review_reason": None, "message_intent": None}
     o.update(over)
     return json.dumps(o)
 

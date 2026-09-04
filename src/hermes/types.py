@@ -107,6 +107,55 @@ class ProposalAction(StrEnum):
     ESCALATE = "ESCALATE"
 
 
+class RecommendedIntervention(StrEnum):
+    """A non-executable advisory the strategist may attach to its proposal -
+    never an action, never a change to money/terms/access. Deterministic
+    policy has no notion of these values; they exist purely as evidence for a
+    human, surfaced via audit/Neon only. No enum value exists for a discount,
+    access change, suspension, or freeze - those can never be recommended."""
+
+    NONE = "NONE"
+    UPDATE_PAYMENT_METHOD = "UPDATE_PAYMENT_METHOD"
+    MANDATE_REAUTH_REVIEW = "MANDATE_REAUTH_REVIEW"
+    PAYMENT_PLAN_REVIEW = "PAYMENT_PLAN_REVIEW"
+    BILLING_SUPPORT_REVIEW = "BILLING_SUPPORT_REVIEW"
+    HUMAN_FOLLOW_UP = "HUMAN_FOLLOW_UP"
+
+
+# Interventions that must NEVER carry a human-review recommendation/reason.
+NO_REVIEW_INTERVENTIONS: frozenset[RecommendedIntervention] = frozenset({
+    RecommendedIntervention.NONE, RecommendedIntervention.UPDATE_PAYMENT_METHOD,
+})
+# Interventions that MUST carry human_review_recommended=True + a nonblank reason.
+REVIEW_REQUIRED_INTERVENTIONS: frozenset[RecommendedIntervention] = frozenset({
+    RecommendedIntervention.MANDATE_REAUTH_REVIEW, RecommendedIntervention.PAYMENT_PLAN_REVIEW,
+    RecommendedIntervention.BILLING_SUPPORT_REVIEW, RecommendedIntervention.HUMAN_FOLLOW_UP,
+})
+MAX_HUMAN_REVIEW_REASON_CHARS = 300
+
+
+class MessageStatus(StrEnum):
+    """Lifecycle of a CREATE_RECOVERY_LINK's bundled ``message_intent`` draft -
+    distinct from ``PolicyDecision.message_authorized`` (a pre-effect policy
+    fact) and from actual delivery (no adapter exists yet; see engine.run's
+    ``message_delivery_capable`` handling)."""
+
+    NOT_REQUESTED = "NOT_REQUESTED"  # no message_intent was proposed
+    SUPPRESSED = "SUPPRESSED"        # proposed, but policy would not authorize it
+    AUTHORIZED = "AUTHORIZED"        # policy cleared it, before the link executes
+    DRAFTED = "DRAFTED"              # link creation confirmed; deterministic draft rendered
+    SENT = "SENT"                    # reserved for a future real messaging adapter - never set here
+
+
+def compute_message_status(message_intent: str | None, message_authorized: bool) -> str:
+    """The message-draft lifecycle value at ACTION_INTENT persistence time -
+    a pure function of what was proposed and what policy authorized, before
+    any effect runs."""
+    if not message_intent:
+        return MessageStatus.NOT_REQUESTED.value
+    return (MessageStatus.AUTHORIZED if message_authorized else MessageStatus.SUPPRESSED).value
+
+
 @dataclass(frozen=True)
 class StrategySnapshot:
     """Immutable, source-labelled case view handed to the strategist.
@@ -163,6 +212,10 @@ class StrategyProposal:
     confidence: float
     proposed_wait_hours: int = 0  # relative, only meaningful for WAIT_FOR_PROVIDER_RETRY
     message_intent: str | None = None  # optional reminder copy, CREATE_RECOVERY_LINK/SEND_REMINDER only
+    # --- non-executable advisory (evidence only; never authorizes anything) --
+    recommended_intervention: RecommendedIntervention = RecommendedIntervention.NONE
+    human_review_recommended: bool = False
+    human_review_reason: str | None = None
 
 
 class InvalidProposal(Exception):
@@ -309,6 +362,10 @@ class ActionIntent:
     message_sent: bool = False
     url: str | None = None  # the real Payment Link's checkout URL, when known
     # (REAL_TEST_MODE only; distinct from ``reference``, the provider's link id)
+    message_intent: str | None = None  # the exact approved template proposed, if any
+    message_draft: str | None = None  # deterministic rendering (== message_intent
+    # verbatim; never a model-generated URL/amount/id) - set only once DRAFTED
+    message_status: str = MessageStatus.NOT_REQUESTED.value
 
 
 # Audit event kinds (append-only trail).
@@ -324,6 +381,7 @@ AUDIT_RETRY_OUTCOME = "RETRY_OUTCOME_RECORDED"  # a failed provider-retry outcom
 AUDIT_ACTION_INTENT = "ACTION_INTENT"  # a durable action intent was persisted, pre-effect
 AUDIT_ACTION_OUTCOME = "ACTION_OUTCOME"  # the fake effect executed; intent marked complete
 AUDIT_AI_MODEL_RUN = "AI_MODEL_RUN"  # decision-linked model metadata (model, latency, validation)
+AUDIT_MESSAGE_DRAFTED = "MESSAGE_DRAFTED"  # a deterministic draft was rendered + staged (never sent)
 
 
 # --- ledger reads: frozen snapshots ---------------------------------------
@@ -557,6 +615,9 @@ class ActionIntentProjection:
     reference: str | None
     message_sent: bool
     url: str | None = None  # REAL_TEST_MODE only: the Payment Link checkout URL
+    message_intent: str | None = None
+    message_draft: str | None = None
+    message_status: str = MessageStatus.NOT_REQUESTED.value
 
 
 @dataclass(frozen=True)

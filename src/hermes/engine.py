@@ -15,12 +15,16 @@ another runner has since won is rejected as stale with no effect.
 
 from __future__ import annotations
 
+import re
+
 from .message_templates import is_approved_message_intent
 from .protocols import Ledger, PaymentProvider, Strategist
 from .types import (
     AUDIT_AI_MODEL_RUN,
     AUDIT_INPUT_EVENT,
     AUDIT_POLICY_DECISION,
+    MAX_HUMAN_REVIEW_REASON_CHARS,
+    NO_REVIEW_INTERVENTIONS,
     ActionIntentOutcomeCommand,
     ActionIntentUncertainCommand,
     AuditQuery,
@@ -40,6 +44,7 @@ from .types import (
     ProviderRetryFact,
     RazorpayWebhook,
     ReceiveResult,
+    RecommendedIntervention,
     RecoveryQuery,
     RecoveryView,
     RunReport,
@@ -70,6 +75,13 @@ MAX_TOTAL_WAIT_HOURS = 72
 # Substrings a strategist must never put in message_intent - it may propose
 # reminder copy, never a URL, amount, provider id, discount, or commercial term.
 _MESSAGE_INTENT_FORBIDDEN = ("http://", "https://", "₹", "$")
+# Same rule for human_review_reason - free text, so also checked for provider/
+# payment identifier prefixes this codebase actually mints (never proof the
+# reason is otherwise honest/non-invented; that is SOUL/SKILL's job).
+_REASON_FORBIDDEN = ("http://", "https://", "₹", "$")
+_REASON_ID_PATTERN = re.compile(
+    r"\b(pay|plink|rlnk|sub|evt|cus|case)[_-][a-z0-9]", re.IGNORECASE
+)
 
 
 def _validate_proposal(obj: object) -> StrategyProposal:
@@ -101,6 +113,41 @@ def _validate_proposal(obj: object) -> StrategyProposal:
         # is on the allowlist, so offline behaviour is unchanged.)
         if not is_approved_message_intent(obj.message_intent):
             raise InvalidProposal("message_intent is not an approved template")
+    if not isinstance(obj.recommended_intervention, RecommendedIntervention):
+        raise InvalidProposal(
+            f"unknown recommended_intervention: {obj.recommended_intervention!r}"
+        )
+    if not isinstance(obj.human_review_recommended, bool):
+        raise InvalidProposal("human_review_recommended must be a real boolean")
+    reason = obj.human_review_reason
+    if reason is not None:
+        if not isinstance(reason, str) or not reason.strip():
+            raise InvalidProposal("human_review_reason must be null or a nonblank string")
+        if len(reason) > MAX_HUMAN_REVIEW_REASON_CHARS:
+            raise InvalidProposal(
+                f"human_review_reason exceeds {MAX_HUMAN_REVIEW_REASON_CHARS} characters"
+            )
+        lowered = reason.lower()
+        if any(bad in lowered for bad in _REASON_FORBIDDEN):
+            raise InvalidProposal(
+                "human_review_reason must not contain a URL or amount marker"
+            )
+        if _REASON_ID_PATTERN.search(reason):
+            raise InvalidProposal(
+                "human_review_reason must not contain a payment/provider/case identifier"
+            )
+    if obj.recommended_intervention in NO_REVIEW_INTERVENTIONS:
+        if obj.human_review_recommended or obj.human_review_reason is not None:
+            raise InvalidProposal(
+                f"{obj.recommended_intervention} must not set human_review_recommended "
+                "or human_review_reason"
+            )
+    else:
+        if not obj.human_review_recommended or not (reason and reason.strip()):
+            raise InvalidProposal(
+                f"{obj.recommended_intervention} requires human_review_recommended=true "
+                "and a nonblank human_review_reason"
+            )
     return obj
 
 
@@ -451,14 +498,15 @@ class RecoveryEngine:
                 link_url = getattr(self._razorpay, "link_url", None)
                 url = link_url(claim.case_id) if callable(link_url) else None
                 # message_sent is ACTUAL delivery, never merely what policy
-                # AUTHORIZED (``result.message_authorized``): a provider that
-                # cannot deliver messages itself (no messaging adapter exists
-                # for this hybrid slice - see ``message_delivery_capable``)
-                # must report False regardless of authorization, and the
-                # ledger's own message/contact counters are gated on this
-                # value. The simulated fake executor is unaffected - it has no
-                # such attribute, so it keeps its existing, tested behavior.
-                capable = getattr(self._razorpay, "message_delivery_capable", True)
+                # AUTHORIZED (``result.message_authorized``): NO provider in
+                # this build - fake or hybrid - has a real messaging adapter,
+                # so this defaults to False regardless of authorization; only
+                # a future adapter that sets ``message_delivery_capable = True``
+                # (and genuinely sends) may ever report True. A message that
+                # DOES get authorized is instead staged as a DRAFTED template
+                # draft (see ``compute_message_status``/``apply_action_outcome``)
+                # for the later real messaging adapter to actually send.
+                capable = getattr(self._razorpay, "message_delivery_capable", False)
                 message_sent = bool(result.message_authorized) and bool(capable)
                 led.apply_action_outcome(
                     ActionIntentOutcomeCommand(

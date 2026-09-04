@@ -24,11 +24,19 @@
 --    hermes_demo.hermes_decisions  - one row per AI_PROPOSAL, joined to its
 --                                    OWN decision cycle's nearest AI_MODEL_RUN
 --                                    and POLICY_DECISION (never a global
---                                    first/last)
+--                                    first/last); `recommended_intervention` /
+--                                    `model_human_review_recommended` /
+--                                    `model_human_review_reason` are the
+--                                    model's non-executable advisory -
+--                                    'NOT_RECORDED'/null on a pre-milestone row
 --    hermes_demo.recovery_actions  - one row per durable action intent;
 --                                    `checkout_url_present` only, never the
 --                                    full URL; `message_authorized` vs
---                                    `message_sent` kept separate
+--                                    `message_sent` kept separate;
+--                                    `message_status` is the draft lifecycle
+--                                    (NOT_REQUESTED/SUPPRESSED/AUTHORIZED/
+--                                    DRAFTED/SENT - 'LEGACY_NOT_STAGED' on a
+--                                    pre-milestone row, never DRAFTED/SENT)
 --    hermes_demo.hermes_evidence   - one row per evidence tool call, with its
 --                                    requested reason alongside what came back
 --    hermes_demo.audit_timeline    - one row per raw audit event (bounded
@@ -64,6 +72,7 @@ ORDER  BY created_logical_time;
 -- 2. every real Test Mode recovery action (any case) ------------------------
 SELECT case_id, intent_id, proposed_action, execution_status, provider_reference,
        checkout_url_present, action_evidence_mode, message_authorized, message_sent,
+       message_intent, message_draft, message_status,
        case_state, human_review_required, uncertain_reason
 FROM   hermes_demo.recovery_actions
 ORDER  BY created_logical_time;
@@ -71,7 +80,9 @@ ORDER  BY created_logical_time;
 -- 3. every Hermes/Gemini decision (any case), most recent first -------------
 SELECT case_id, decision_number, logical_time, model, hermes_runtime_revision,
        execution_duration_seconds, latency_ms, validation_result, repair_used,
-       confidence, confidence_band, proposed_action, policy_outcome, authorized
+       confidence, confidence_band, proposed_action, recommended_intervention,
+       model_human_review_recommended, model_human_review_reason,
+       policy_outcome, authorized
 FROM   hermes_demo.hermes_decisions
 ORDER  BY logical_time DESC;
 

@@ -74,7 +74,9 @@ class _Stub(BaseHTTPRequestHandler):
                 type(self).seen_tool_results.append(m.get("content", ""))
         resp = type(self).queue.pop(0) if type(self).queue else _text(
             '{"action":"ESCALATE","diagnosis":"d","rationale":"fallback","confidence":0.2,'
-            '"proposed_wait_hours":0,"message_intent":null}')
+            '"proposed_wait_hours":0,"recommended_intervention":"NONE",'
+            '"human_review_recommended":false,"human_review_reason":null,'
+            '"message_intent":null}')
         msg = resp["choices"][0]["message"]
         if req.get("stream") is True:
             self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
@@ -115,7 +117,9 @@ def _text(t):
 
 _VALID = ('{"action":"WAIT_FOR_PROVIDER_RETRY","diagnosis":"insufficient funds, retry eligible",'
           '"rationale":"one provider retry may still clear","confidence":0.62,'
-          '"proposed_wait_hours":24,"message_intent":null}')
+          '"proposed_wait_hours":24,"recommended_intervention":"NONE",'
+          '"human_review_recommended":false,"human_review_reason":null,'
+          '"message_intent":null}')
 
 
 @pytest.fixture()
@@ -355,7 +359,9 @@ def test_unapproved_message_then_approved_repair_succeeds(stub, tmp_path):
     bad = ('{"action":"CREATE_RECOVERY_LINK","diagnosis":"retry failed","rationale":"link now",'
            '"confidence":0.6,"proposed_wait_hours":0,"message_intent":"totally made up copy"}')
     good = ('{"action":"CREATE_RECOVERY_LINK","diagnosis":"retry failed","rationale":"link now",'
-            f'"confidence":0.6,"proposed_wait_hours":0,"message_intent":{json.dumps(_APPROVED_MSG)}}}')
+            '"confidence":0.6,"proposed_wait_hours":0,"recommended_intervention":"NONE",'
+            '"human_review_recommended":false,"human_review_reason":null,'
+            f'"message_intent":{json.dumps(_APPROVED_MSG)}}}')
     S.queue = [_text(bad), _text(good)]
     strat = _strat(stub, tmp_path)
     p = strat.propose(_snap(retry_outcome_recorded=True))
@@ -504,7 +510,10 @@ def test_soul_and_skill_reach_child_job_as_distinct_exact_fields(monkeypatch, tm
         return _fake_proc(_SENTINEL + json.dumps({
             "ok": True,
             "proposal": {"action": "ESCALATE", "diagnosis": "d", "rationale": "r",
-                         "confidence": 0.3, "proposed_wait_hours": 0, "message_intent": None},
+                         "confidence": 0.3, "proposed_wait_hours": 0,
+                         "recommended_intervention": "NONE",
+                         "human_review_recommended": False, "human_review_reason": None,
+                         "message_intent": None},
             "audit": {"validation_result": "valid"},
         }), rc=0)
 
@@ -522,8 +531,9 @@ def test_soul_and_skill_reach_child_job_as_distinct_exact_fields(monkeypatch, tm
 
 
 def test_system_prompt_orders_soul_before_skill_before_case_context():
-    """Prove the exact order the child builds the system prompt in:
-    SOUL identity/scope, then SKILL judgment rules, then case context."""
+    """Prove the exact order the child builds the system prompt in: SOUL
+    identity/scope, then SKILL judgment rules, then case context, then tool
+    descriptions, then the output contract."""
     from hermes.hermes_agent import child_main
 
     prompt = child_main._system_prompt(
@@ -533,7 +543,85 @@ def test_system_prompt_orders_soul_before_skill_before_case_context():
     i_soul = prompt.index("SOUL-MARKER-IDENTITY")
     i_skill = prompt.index("SKILL-MARKER-JUDGMENT")
     i_case = prompt.index("CASE-CONTEXT-MARKER")
-    assert i_soul < i_skill < i_case
+    i_tools = prompt.index("Tools you may call")
+    i_contract = prompt.index("Return EXACTLY one JSON object")
+    assert i_soul < i_skill < i_case < i_tools < i_contract
+
+
+# === child_main._validate: typed advisory contract (offline, no runtime) ===
+
+
+def _child_obj(**over) -> dict:
+    o = {
+        "action": "WAIT_FOR_PROVIDER_RETRY", "diagnosis": "d", "rationale": "r",
+        "confidence": 0.5, "proposed_wait_hours": 24,
+        "recommended_intervention": "NONE", "human_review_recommended": False,
+        "human_review_reason": None, "message_intent": None,
+    }
+    o.update(over)
+    return o
+
+
+def test_child_validate_accepts_every_valid_advisory_enum():
+    from hermes.hermes_agent import child_main
+
+    for value in ("NONE", "UPDATE_PAYMENT_METHOD", "MANDATE_REAUTH_REVIEW",
+                  "PAYMENT_PLAN_REVIEW", "BILLING_SUPPORT_REVIEW", "HUMAN_FOLLOW_UP"):
+        over = {"recommended_intervention": value}
+        if value in ("NONE", "UPDATE_PAYMENT_METHOD"):
+            over.update(human_review_recommended=False, human_review_reason=None)
+        else:
+            over.update(human_review_recommended=True, human_review_reason="a reason")
+        obj, verdict = child_main._validate(_child_obj(**over), set())
+        assert verdict == "valid", value
+
+
+def test_child_validate_rejects_unknown_advisory():
+    from hermes.hermes_agent import child_main
+
+    obj, verdict = child_main._validate(
+        _child_obj(recommended_intervention="OFFER_DISCOUNT"), set()
+    )
+    assert obj is None and verdict == "unknown_intervention"
+
+
+@pytest.mark.parametrize("bad_bool", [1, 0, "true", None])
+def test_child_validate_rejects_non_boolean_human_review_recommended(bad_bool):
+    from hermes.hermes_agent import child_main
+
+    obj, verdict = child_main._validate(
+        _child_obj(human_review_recommended=bad_bool), set()
+    )
+    assert obj is None and verdict == "human_review_type"
+
+
+@pytest.mark.parametrize("reason", ["", "   ", "x" * 301])
+def test_child_validate_rejects_blank_or_oversized_reason(reason):
+    from hermes.hermes_agent import child_main
+
+    obj, verdict = child_main._validate(
+        _child_obj(recommended_intervention="HUMAN_FOLLOW_UP",
+                   human_review_recommended=True, human_review_reason=reason),
+        set(),
+    )
+    assert obj is None and verdict == "human_review_reason_invalid"
+
+
+@pytest.mark.parametrize("intervention,hrr,reason", [
+    ("NONE", True, None),
+    ("NONE", False, "unexpected reason"),
+    ("MANDATE_REAUTH_REVIEW", False, "a reason"),
+    ("MANDATE_REAUTH_REVIEW", True, None),
+])
+def test_child_validate_rejects_every_invalid_combination(intervention, hrr, reason):
+    from hermes.hermes_agent import child_main
+
+    obj, verdict = child_main._validate(
+        _child_obj(recommended_intervention=intervention,
+                   human_review_recommended=hrr, human_review_reason=reason),
+        set(),
+    )
+    assert obj is None and verdict == "human_review_mismatch"
 
 
 def test_invalid_utf8_soul_fails_closed(tmp_path):
@@ -560,6 +648,32 @@ def test_invalid_utf8_skill_fails_closed(tmp_path):
         )
 
 
+@pytest.mark.parametrize("blank", ["", "   ", "\n\n\t  \n"])
+def test_blank_soul_file_fails_closed(tmp_path, blank):
+    blank_soul = tmp_path / "soul_blank.md"
+    blank_soul.write_text(blank, encoding="utf-8")
+    good_skill = tmp_path / "skill.md"
+    good_skill.write_text("skill", encoding="utf-8")
+    with pytest.raises(HermesRuntimeUnavailable, match="soul"):
+        HermesAgentStrategist(
+            home=tmp_path / "h", checkout=_fake_checkout(tmp_path), verify_revision=False,
+            soul_path=blank_soul, skill_path=good_skill,
+        )
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n\n\t  \n"])
+def test_blank_skill_file_fails_closed(tmp_path, blank):
+    good_soul = tmp_path / "soul.md"
+    good_soul.write_text("soul", encoding="utf-8")
+    blank_skill = tmp_path / "skill_blank.md"
+    blank_skill.write_text(blank, encoding="utf-8")
+    with pytest.raises(HermesRuntimeUnavailable, match="skill"):
+        HermesAgentStrategist(
+            home=tmp_path / "h", checkout=_fake_checkout(tmp_path), verify_revision=False,
+            soul_path=good_soul, skill_path=blank_skill,
+        )
+
+
 def test_stale_run_meta_not_leaked_after_instruction_load_failure(monkeypatch, tmp_path):
     """A successful decision followed by a removed instruction file must not
     leave the previous successful run's metadata on the new failure."""
@@ -571,7 +685,10 @@ def test_stale_run_meta_not_leaked_after_instruction_load_failure(monkeypatch, t
     ok_payload = _SENTINEL + json.dumps({
         "ok": True,
         "proposal": {"action": "WAIT_FOR_PROVIDER_RETRY", "diagnosis": "d", "rationale": "r",
-                     "confidence": 0.6, "proposed_wait_hours": 24, "message_intent": None},
+                     "confidence": 0.6, "proposed_wait_hours": 24,
+                     "recommended_intervention": "NONE",
+                     "human_review_recommended": False, "human_review_reason": None,
+                     "message_intent": None},
         "audit": {"validation_result": "valid", "tool_calls_used": 2, "confidence_band": "medium"},
     })
     monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: _fake_proc(ok_payload, rc=0))

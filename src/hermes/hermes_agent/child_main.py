@@ -40,12 +40,21 @@ import time
 RESULT_SENTINEL = "HERMES_CHILD_RESULT "
 TOOL_NAMES = ("get_payment_retry_facts", "get_payment_history", "get_recovery_actions")
 REQUIRED_KEYS = ("action", "diagnosis", "rationale", "confidence",
-                 "proposed_wait_hours", "message_intent")
+                 "proposed_wait_hours", "recommended_intervention",
+                 "human_review_recommended", "human_review_reason", "message_intent")
 _ALL_ACTIONS = {
     "WAIT_FOR_PROVIDER_RETRY", "SEND_REMINDER", "REQUEST_PAYMENT_METHOD_UPDATE",
     "CREATE_RECOVERY_LINK", "RECOMMEND_STRUCTURAL_CHANGE", "TAKE_NO_ACTION",
     "STOP", "ESCALATE",
 }
+# A separate, non-executable advisory - never authorizes anything and never
+# offers a discount / access-change / suspension / freeze (no enum for those).
+_ALL_INTERVENTIONS = {
+    "NONE", "UPDATE_PAYMENT_METHOD", "MANDATE_REAUTH_REVIEW",
+    "PAYMENT_PLAN_REVIEW", "BILLING_SUPPORT_REVIEW", "HUMAN_FOLLOW_UP",
+}
+_NO_REVIEW_INTERVENTIONS = {"NONE", "UPDATE_PAYMENT_METHOD"}
+_MAX_HUMAN_REVIEW_REASON_CHARS = 300
 # Only the actions deterministic policy can actually authorize/execute today.
 # STOP and a standalone SEND_REMINDER are deliberately NOT offered as executable
 # (policy would only BLOCK them). Reminder copy still rides along with an
@@ -225,6 +234,24 @@ def _validate(obj, approved_messages: set):
         return None, "message_type"
     if mi is not None and mi not in approved_messages:
         return None, "message_not_approved"
+    ri = obj["recommended_intervention"]
+    if ri not in _ALL_INTERVENTIONS:
+        return None, "unknown_intervention"
+    hrr = obj["human_review_recommended"]
+    if not isinstance(hrr, bool):
+        return None, "human_review_type"
+    reason = obj["human_review_reason"]
+    if reason is not None and (
+        not isinstance(reason, str) or not reason.strip()
+        or len(reason) > _MAX_HUMAN_REVIEW_REASON_CHARS
+    ):
+        return None, "human_review_reason_invalid"
+    if ri in _NO_REVIEW_INTERVENTIONS:
+        if hrr is not False or reason is not None:
+            return None, "human_review_mismatch"
+    else:
+        if hrr is not True or not reason:
+            return None, "human_review_mismatch"
     return obj, "valid"
 
 
@@ -254,7 +281,16 @@ def _system_prompt(soul_text: str, skill_text: str, ctx: dict, approved_messages
           "- confidence: your own UNCALIBRATED estimate in [0,1], justified by "
           "completeness, freshness/reliability, consistency and relevance of the "
           "evidence - not record count. It never grants a permission.\n"
-          "- rationale: your reasoning, including any doubt that remains."
+          "- rationale: your reasoning, including any doubt that remains.\n"
+          "- recommended_intervention: a SEPARATE non-executable advisory, one of: "
+        + ", ".join(sorted(_ALL_INTERVENTIONS))
+        + ". Never authorizes anything; never a discount, access change, "
+          "suspension, or freeze.\n"
+          "- human_review_recommended must be false with human_review_reason null "
+          "for NONE/UPDATE_PAYMENT_METHOD, and true with a nonblank "
+          f"human_review_reason (<= {_MAX_HUMAN_REVIEW_REASON_CHARS} chars, no URL/"
+          "amount/payment identifier, no invented fact) for every other "
+          "recommended_intervention."
     )
 
 

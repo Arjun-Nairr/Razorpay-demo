@@ -49,13 +49,16 @@ EXPECTED_COLUMNS = {
         "evidence_requests", "evidence_returned", "history_expansion_requested",
         "history_expansion_reason", "confidence", "confidence_band",
         "confidence_basis", "diagnosis", "rationale", "proposed_action",
-        "proposed_wait_hours", "policy_outcome", "policy_reason", "authorized",
+        "proposed_wait_hours", "recommended_intervention",
+        "model_human_review_recommended", "model_human_review_reason",
+        "policy_outcome", "policy_reason", "authorized",
         "failure_category", "failure_stage",
     ],
     "recovery_actions": [
         "case_id", "intent_id", "created_logical_time", "proposed_action",
         "execution_status", "provider_reference", "checkout_url_present",
         "action_evidence_mode", "message_authorized", "message_sent",
+        "message_intent", "message_draft", "message_status",
         "case_state", "human_review_required", "uncertain_reason",
     ],
     "hermes_evidence": [
@@ -224,6 +227,35 @@ def test_message_authorized_and_message_sent_are_independent_fields():
     message_sent = bool(intent.get("message_sent", False))
     assert message_authorized is True and message_sent is False
     assert message_authorized != message_sent
+
+
+def test_historical_row_missing_advisory_fields_reads_not_recorded_never_none():
+    """A pre-milestone AI_PROPOSAL detail lacking the new advisory keys must
+    surface a fixed 'NOT_RECORDED' label for recommended_intervention (never
+    the real 'NONE' value) and null (never false) for the boolean/reason -
+    never silently rewritten as if a real decision was recorded."""
+    sql = VIEWS["hermes_decisions"]
+    assert "NOT_RECORDED" in sql
+    assert "COALESCE(p->'detail'->>'recommended_intervention', 'NOT_RECORDED')" in sql
+    # the boolean/reason columns must NOT be coalesced to a false-y default -
+    # a missing key must read back as SQL NULL, distinguishable from a real False.
+    assert "COALESCE((p->'detail'->>'human_review_recommended')" not in sql
+
+
+def test_historical_row_missing_message_status_reads_legacy_label_never_drafted():
+    """A pre-milestone action_intent lacking message_status must read back as
+    the fixed 'LEGACY_NOT_STAGED' label - never 'DRAFTED' or 'SENT', which
+    would falsely claim a draft that was never actually staged."""
+    sql = VIEWS["recovery_actions"]
+    assert "COALESCE(i.value->>'message_status', 'LEGACY_NOT_STAGED')" in sql
+
+
+def test_message_draft_column_never_selects_a_url():
+    """recovery_actions.message_draft is the deterministic template text only -
+    never the checkout URL, which stays checkout_url_present-only."""
+    sql = VIEWS["recovery_actions"]
+    assert "message_draft" in sql
+    assert not re.search(r"->>'url'\s+AS\s+message_draft\b", sql)
 
 
 def test_checkout_url_present_not_the_url_itself():

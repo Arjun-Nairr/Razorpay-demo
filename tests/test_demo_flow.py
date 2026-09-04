@@ -84,7 +84,12 @@ def test_case3_end_to_end_hermes_assisted_recovery():
     case, timeline = view["case"], view["timeline"]
     assert case["state"] in ("active", "waiting")  # link authorized, not yet captured
     assert case["links_created"] == 1
-    assert case["messages_sent"] == 1  # merchant owns comms + consent -> authorized
+    # Authorized (merchant owns comms + consent) -> staged as a DRAFTED
+    # template draft; messages_sent stays 0 - no messaging adapter exists yet.
+    assert case["messages_sent"] == 0
+    intent = case["action_intents"][0]
+    assert intent["message_status"] == "DRAFTED"
+    assert intent["message_draft"] == intent["message_intent"]
 
     cap = tc.post("/demo/step", json={"case_id": cid, "step": "capture"}).json()
     assert cap["capture"]["accepted"] is True and cap["capture"]["evidence_mode"] == "SIMULATED"
@@ -98,7 +103,8 @@ def test_case3_end_to_end_hermes_assisted_recovery():
     kinds = _kinds(tc.get(f"/demo/case/{cid}").json()["timeline"])
     for required in ("INPUT_EVENT", "AI_MODEL_RUN", "AI_PROPOSAL", "POLICY_DECISION",
                      "SCHEDULED_ACTION", "RETRY_OUTCOME_RECORDED", "ACTION_INTENT",
-                     "ACTION_OUTCOME", "PAYMENT_CONFIRMATION", "TERMINAL_TRANSITION"):
+                     "ACTION_OUTCOME", "MESSAGE_DRAFTED", "PAYMENT_CONFIRMATION",
+                     "TERMINAL_TRANSITION"):
         assert required in kinds, f"missing audit kind {required}"
     assert kinds.index("ACTION_INTENT") < kinds.index("ACTION_OUTCOME")
 

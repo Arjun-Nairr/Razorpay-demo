@@ -868,12 +868,14 @@ def test_real_provider_never_reports_a_message_as_sent():
     assert intent.status == "executed"
     assert intent.message_sent is False  # even though the scripted proposal's
     # message_intent WAS authorized by policy (consent/reachable_channel default true)
+    assert intent.message_status == "DRAFTED"  # staged for the future real adapter
     assert proj.messages_sent == 0  # the contact counter must not have moved
 
 
-def test_simulated_flow_message_sent_behaviour_is_unchanged():
+def test_simulated_flow_never_reports_a_message_as_sent_either():
     """The existing FakeRazorpayAdapter path has no ``message_delivery_capable``
-    attribute and keeps its original, tested behaviour."""
+    attribute either - it now defaults to False like every other provider (the
+    fix for defect 5): an authorized message is staged DRAFTED, never SENT."""
     from hermes.adapters import FakeRazorpayAdapter as Fake
 
     rp = Fake()
@@ -887,8 +889,11 @@ def test_simulated_flow_message_sent_behaviour_is_unchanged():
     rp.set_retry_eligibility(OBL, False)
     engine.run(until=2)
     proj = engine.inspect(__import__("hermes.types", fromlist=["CaseQuery"]).CaseQuery(case_id=r.case_id))
-    assert proj.action_intents[0].message_sent is True  # unchanged simulated behaviour
-    assert proj.messages_sent == 1
+    intent = proj.action_intents[0]
+    assert intent.message_sent is False
+    assert intent.message_status == "DRAFTED"
+    assert intent.message_draft == intent.message_intent
+    assert proj.messages_sent == 0
 
 
 # === full hybrid engine harness ============================================

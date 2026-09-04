@@ -154,7 +154,13 @@ SELECT
   pd.detail->>'reason_code'                                 AS policy_reason,
   (pd.detail->>'outcome' = 'ALLOW')                         AS authorized,
   mr.detail->'hermes'->>'failure_category'                  AS failure_category,
-  mr.detail->'hermes'->>'failure_stage'                     AS failure_stage
+  mr.detail->'hermes'->>'failure_stage'                     AS failure_stage,
+  -- appended at the end - CREATE OR REPLACE VIEW cannot change/reposition an
+  -- EXISTING view's existing output columns, only append new ones.
+  COALESCE(p->'detail'->>'recommended_intervention', 'NOT_RECORDED')
+                                                             AS recommended_intervention,
+  (p->'detail'->>'human_review_recommended')::boolean       AS model_human_review_recommended,
+  p->'detail'->>'human_review_reason'                       AS model_human_review_reason
 FROM {schema}.ledger_state s,
      jsonb_array_elements(s.data->'audit') AS p
 LEFT JOIN LATERAL (
@@ -192,7 +198,12 @@ SELECT
   COALESCE((i.value->>'message_sent')::boolean, false)      AS message_sent,
   cs.state                                                  AS case_state,
   COALESCE(cs.human_review_required, false)                 AS human_review_required,
-  uncertain_evt.detail->>'reason'                           AS uncertain_reason
+  uncertain_evt.detail->>'reason'                           AS uncertain_reason,
+  -- appended at the end - CREATE OR REPLACE VIEW cannot change/reposition an
+  -- EXISTING view's existing output columns, only append new ones.
+  i.value->>'message_intent'                                AS message_intent,
+  i.value->>'message_draft'                                 AS message_draft,
+  COALESCE(i.value->>'message_status', 'LEGACY_NOT_STAGED') AS message_status
 FROM {schema}.ledger_state s,
      jsonb_each(s.data->'action_intents') AS i(intent_id, value)
 LEFT JOIN LATERAL (

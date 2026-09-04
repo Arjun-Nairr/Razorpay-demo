@@ -39,13 +39,18 @@ from .hermes_agent import (
     TOOL_NAMES,
 )
 from .message_templates import APPROVED_MESSAGE_INTENT_LIST
-from .types import InvalidProposal, ProposalAction, StrategyProposal, StrategySnapshot
+from .types import (
+    InvalidProposal,
+    ProposalAction,
+    RecommendedIntervention,
+    StrategyProposal,
+    StrategySnapshot,
+)
 
-# Bumped: the child now receives the approved message templates explicitly and
-# validates message choice + strict field types inside the one-repair boundary;
-# get_payment_history is a single 12-month expansion; get_recovery_actions
-# returns the real per-case audit projection.
-PROMPT_VERSION = "hermes-agent/2026-09-05.2"
+# Bumped: the child's contract now requires an explicit non-executable
+# advisory (recommended_intervention + human_review_recommended +
+# human_review_reason) on every proposal.
+PROMPT_VERSION = "hermes-agent/2026-09-05.3"
 
 # Bump to invalidate any previously-cached CA bundle on disk (e.g. the earlier
 # fix imported every OS root indiscriminately, ignoring trust purpose and
@@ -120,13 +125,17 @@ class HermesRunMeta:
 
 def _read_utf8(path: Path, label: str) -> str:
     """Read a project instruction file as UTF-8, failing closed. Never surfaces
-    the path or file content - only the fixed label and exception type."""
+    the path or file content - only the fixed label and exception type (or a
+    fixed "empty" reason for a blank file)."""
     try:
-        return path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise HermesRuntimeUnavailable(
             f"project {label} file unreadable: {type(exc).__name__}"
         ) from exc
+    if not text.strip():
+        raise HermesRuntimeUnavailable(f"project {label} file is empty or blank")
+    return text
 
 
 def _verify_revision(checkout: Path) -> str:
@@ -524,6 +533,9 @@ def _sanitize_audit(raw: Any) -> dict:
     return out
 
 
+_INTERVENTION_MAP = {r.value: r for r in RecommendedIntervention}
+
+
 def _to_proposal(obj: Any, audit: dict) -> StrategyProposal:
     """Map the child's already-validated proposal dict to a typed proposal. The
     child guarantees exact keys + types; this only builds the object. The
@@ -538,6 +550,13 @@ def _to_proposal(obj: Any, audit: dict) -> StrategyProposal:
             or isinstance(obj.get("proposed_wait_hours"), bool):
         audit["failure_category"] = _PARENT_FAIL_PROPOSAL_SHAPE
         raise InvalidProposal("Hermes proposal fields failed the parent shape check")
+    intervention = _INTERVENTION_MAP.get(str(obj.get("recommended_intervention")))
+    human_review_recommended = obj.get("human_review_recommended")
+    human_review_reason = obj.get("human_review_reason")
+    if intervention is None or not isinstance(human_review_recommended, bool) \
+            or (human_review_reason is not None and not isinstance(human_review_reason, str)):
+        audit["failure_category"] = _PARENT_FAIL_PROPOSAL_SHAPE
+        raise InvalidProposal("Hermes proposal advisory fields failed the parent shape check")
     mi = obj.get("message_intent")
     return StrategyProposal(
         action=action,
@@ -546,4 +565,8 @@ def _to_proposal(obj: Any, audit: dict) -> StrategyProposal:
         confidence=float(obj["confidence"]),
         proposed_wait_hours=int(obj["proposed_wait_hours"]),
         message_intent=mi if isinstance(mi, str) and mi.strip() else None,
+        recommended_intervention=intervention,
+        human_review_recommended=human_review_recommended,
+        human_review_reason=human_review_reason.strip()
+        if isinstance(human_review_reason, str) and human_review_reason.strip() else None,
     )
