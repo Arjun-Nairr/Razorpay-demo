@@ -111,7 +111,8 @@ def _verify_revision(checkout: Path) -> str:
     try:
         head = subprocess.run(
             ["git", "-C", str(checkout), "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=15,
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError) as exc:
         raise HermesRuntimeUnavailable(f"cannot read Hermes revision: {type(exc).__name__}") from None
@@ -275,6 +276,41 @@ class HermesAgentStrategist:
             encoding="utf-8",
         )
 
+    def _ca_bundle(self) -> str | None:
+        """Path to a CA bundle the child should trust for outbound HTTPS: the
+        ``certifi`` roots PLUS whatever the OS trust store holds. On machines
+        with a TLS-inspecting proxy/AV (e.g. Avast Web Shield re-signs
+        ``generativelanguage.googleapis.com`` with a local root), the child's
+        ``certifi``-only client otherwise fails verification even though the OS
+        trusts the chain. This does NOT weaken verification - it makes the
+        isolated venv trust exactly what the machine already trusts. Written
+        once into the gitignored isolated home; refreshed if stale."""
+        try:
+            import ssl  # noqa: PLC0415
+
+            out = self._home / "ca-bundle.pem"
+            if out.exists() and (time.time() - out.stat().st_mtime) < 86400:
+                return str(out)
+            parts: list[bytes] = []
+            try:
+                import certifi  # noqa: PLC0415
+
+                parts.append(Path(certifi.where()).read_bytes())
+            except Exception:  # noqa: BLE001
+                pass
+            for store in ("ROOT", "CA"):
+                try:
+                    for der, _enc, _trust in ssl.enum_certificates(store):
+                        parts.append(ssl.DER_cert_to_PEM_cert(der).encode())
+                except Exception:  # noqa: BLE001 - non-Windows / unavailable
+                    pass
+            if not parts:
+                return None
+            out.write_bytes(b"\n".join(parts))
+            return str(out)
+        except Exception:  # noqa: BLE001 - never block startup on this
+            return None
+
     def _child_env(self) -> dict[str, str]:
         """Only what the child needs. No DATABASE_URL / Razorpay / unrelated keys."""
         keep = {}
@@ -293,6 +329,13 @@ class HermesAgentStrategist:
                 raise HermesRuntimeUnavailable("live Hermes needs GEMINI_API_KEY in the environment")
             keep["GEMINI_API_KEY"] = key
             keep["GOOGLE_API_KEY"] = key
+            # Trust exactly what the OS trusts for the live Gemini HTTPS call
+            # (covers a TLS-inspecting AV/proxy root that certifi lacks).
+            ca = os.environ.get("HERMES_CA_BUNDLE") or self._ca_bundle()
+            if ca:
+                for var in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE",
+                            "CURL_CA_BUNDLE", "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH"):
+                    keep[var] = ca
         return keep
 
     # -- the Strategist protocol ----------------------------------------
@@ -329,7 +372,12 @@ class HermesAgentStrategist:
             proc = subprocess.run(
                 [str(self._python), CHILD_MAIN],
                 cwd=str(self._checkout), env=self._child_env(),
-                input=json.dumps(job), capture_output=True, text=True,
+                input=json.dumps(job), capture_output=True,
+                # Decode the child's streams as UTF-8 regardless of the parent's
+                # locale (Windows cp1252 would choke on the Hermes runtime's
+                # box-drawing / unicode console output and drop the whole
+                # result line -> a spurious "no_result_line" failure).
+                text=True, encoding="utf-8", errors="replace",
                 timeout=self._deadline_s,
             )
         except subprocess.TimeoutExpired:

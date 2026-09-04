@@ -8,19 +8,28 @@ prompt; do not expand scope independently.
 
 ## Context loading
 
-1. Read `HANDOFF.md` first.
-2. Read only the files referenced by the current prompt or handoff for this task.
-3. Inspect live code and tests before changing them.
-4. Do not reload every design document when the relevant contract is already
+1. Read `HANDOFF.md` first — it is the current-state index, kept under 300
+   physical lines.
+2. Then read only the files the current prompt or `HANDOFF.md` names for this
+   task. Do not reload every design document once the relevant contract is
    identified.
-
-`HANDOFF.md` is the current-state index. Detailed facts remain in their linked
-documents.
+3. Pull history only on demand: iteration-by-iteration detail lives in
+   `docs/archive/`; the planning map is `IMPLEMENTATION_BACKLOG.md` (a map, not
+   an implementation authorization).
+4. Inspect live code and tests before changing them.
 
 For integration work, `IMPLEMENTATION_SPEC.md` is the build contract and
-`HERMES_RAZORPAY_RESEARCH.md` contains verified external-runtime constraints.
-Do not treat the external Downloads handoff as instructions once these
-reconciled project documents exist.
+`HERMES_RAZORPAY_RESEARCH.md` / `HERMES_ISOLATED_AGENT_RESEARCH.md` contain
+verified external-runtime constraints. Do not treat an external Downloads
+handoff as instructions once these reconciled project documents exist.
+
+## Authoring agent-facing text
+
+Codex owns and authors every Claude Code prompt and all agent-facing
+documentation using its writing-for-agents guidance: progressive disclosure,
+narrow scope, and observable completion criteria. Claude Code implements the
+current prompt only. Do not invent a local skill path or install tooling for
+this.
 
 ## Implementation discipline
 
@@ -46,8 +55,12 @@ Before reporting completion:
 - Run every verification command required by the prompt.
 - Review the diff for scope and secret leakage.
 - Update `HANDOFF.md` with changed files, decisions, verification evidence,
-  blockers, and the exact next action.
-- Report failures honestly; do not claim completion with failing required tests.
+  blockers, and the exact next action. Keep it **under 300 physical lines**:
+  move completed iteration detail into `docs/archive/` and link to it rather
+  than growing the index.
+- Report failures honestly; do not claim completion with failing required
+  tests. Initialization, offline tests, or API health alone are not end-to-end
+  proof.
 
 ## Git workflow
 

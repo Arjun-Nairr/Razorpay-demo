@@ -462,3 +462,28 @@ def test_no_result_line_is_a_bounded_failure(monkeypatch, tmp_path):
 def test_wrong_revision_refuses_to_launch(tmp_path):
     with pytest.raises(HermesRuntimeUnavailable):
         HermesAgentStrategist(home=tmp_path / "h", verify_revision=True, checkout=tmp_path)
+
+
+def test_child_stream_decoded_as_utf8_not_locale(tmp_path):
+    """Regression: the child's result line must be recovered even when the
+    Hermes runtime writes non-cp1252 bytes to its streams. A real tiny child
+    prints box-drawing output to stderr AND a valid result line to stdout;
+    the parent's subprocess decode must not drop the result."""
+    import subprocess as sp
+    import sys
+
+    child = tmp_path / "noisy_child.py"
+    child.write_text(
+        "import sys\n"
+        "sys.stderr.buffer.write('\\u2500\\u2502 hermes banner \\u258f\\n'.encode('utf-8'))\n"
+        "print('HERMES_CHILD_RESULT ' + '{\"ok\": true, \"proposal\": "
+        "{\"action\": \"ESCALATE\", \"diagnosis\": \"d\", \"rationale\": \"r\", "
+        "\"confidence\": 0.3, \"proposed_wait_hours\": 0, \"message_intent\": null}, "
+        "\"audit\": {\"validation_result\": \"valid\"}}')\n",
+        encoding="utf-8",
+    )
+    proc = sp.run([sys.executable, str(child)], capture_output=True,
+                  text=True, encoding="utf-8", errors="replace", timeout=30)
+    payload = mod._parse_result(proc.stdout)
+    assert payload is not None and payload["ok"] is True
+    assert payload["proposal"]["action"] == "ESCALATE"

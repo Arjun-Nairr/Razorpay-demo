@@ -290,7 +290,7 @@ def _empty_dump():
 def _store(conn):
     from hermes.pg_ledger import PostgresSnapshotStore
 
-    return PostgresSnapshotStore("postgresql://x", "hermes_demo_t", _psycopg=_FakePsycopg(conn))
+    return PostgresSnapshotStore("postgresql://localhost/x", "hermes_demo_t", _psycopg=_FakePsycopg(conn))
 
 
 def test_postgres_store_rolls_back_and_stays_usable_after_a_write_error():
@@ -323,10 +323,11 @@ def test_close_releases_the_advisory_lock():
     assert conn.closed is True
 
 
-# --- bounded DB connect (Iteration 12 startup fix) ------------------------
-#     Neon serverless can take ~25-30s to resume; an unbounded psycopg.connect
-#     hung the whole app import. _connect_bounded caps it and raises a
-#     sanitised RuntimeError instead.
+# --- bounded, IPv4-preferring startup (Iteration 13) ---------------------
+#   Real cause of the "silent stall": an IPv6 black hole - getaddrinfo returns
+#   AAAA first and each dead IPv6 SYN cost ~21s before libpq fell through to
+#   IPv4. Fix: hand libpq an IPv4 hostaddr, and bound connect + the
+#   post-connect writer-lock probe within ONE startup budget.
 
 
 def test_connect_that_hangs_is_bounded_not_infinite():
@@ -334,24 +335,24 @@ def test_connect_that_hangs_is_bounded_not_infinite():
 
     slow = _FakePsycopg(_FakeConn(row=_empty_dump()), delay_s=20)
     t0 = time.monotonic()
-    with pytest.raises(RuntimeError, match=r"did not succeed in 3s"):
-        PostgresSnapshotStore("postgresql://x", "hermes_demo_t",
+    with pytest.raises(RuntimeError, match=r"within the 3s startup budget"):
+        PostgresSnapshotStore("postgresql://localhost/x", "hermes_demo_t",
                               _psycopg=slow, connect_timeout_s=3)
     assert time.monotonic() - t0 < 6  # returned promptly, did not wait 20s
 
 
-def test_connect_failure_retries_then_gives_up_sanitised_no_dsn():
+def test_connect_failure_is_sanitised_no_dsn_and_total_bounded():
     from hermes.pg_ledger import PostgresSnapshotStore
 
     boom = _FakePsycopg(_FakeConn(), raises=OSError("connection refused to secret-host:5432"))
     t0 = time.monotonic()
     with pytest.raises(RuntimeError) as ei:
-        PostgresSnapshotStore("postgresql://user:pw@secret-host/db", "hermes_demo_t",
-                              _psycopg=boom, connect_timeout_s=10)
+        PostgresSnapshotStore("postgresql://user:pw@localhost/db", "hermes_demo_t",
+                              _psycopg=boom, connect_timeout_s=8)
     msg = str(ei.value)
-    assert "OSError" in msg  # type only
+    assert "OSError" in msg and "startup budget" in msg  # type + budget only
     assert "secret-host" not in msg and "pw@" not in msg and "postgresql://" not in msg
-    assert time.monotonic() - t0 < 12  # bounded total, not per-attempt x attempts unbounded
+    assert time.monotonic() - t0 < 10  # total-bounded, not attempts x per-attempt
 
 
 def test_transient_failure_then_success_on_retry():
@@ -370,28 +371,77 @@ def test_transient_failure_then_success_on_retry():
             return self._conn
 
     fp = _Flaky()
-    store = PostgresSnapshotStore("postgresql://x", "hermes_demo_t",
+    store = PostgresSnapshotStore("postgresql://localhost/x", "hermes_demo_t",
                                   _psycopg=fp, connect_timeout_s=30)
     assert fp.n == 2 and store.read() == _empty_dump()
     store.close()
 
 
-def test_fast_connect_still_works_and_passes_libpq_timeout():
+def test_fast_connect_still_works_and_forwards_libpq_timeout():
     fp = _FakePsycopg(_FakeConn(row=_empty_dump(), lock_grants=[True]))
     from hermes.pg_ledger import PostgresSnapshotStore
 
-    store = PostgresSnapshotStore("postgresql://x", "hermes_demo_t",
+    store = PostgresSnapshotStore("postgresql://localhost/x", "hermes_demo_t",
                                   _psycopg=fp, connect_timeout_s=30)
     assert store.read() == _empty_dump()
-    assert fp.connect_kwargs.get("connect_timeout")  # a TCP-phase bound was forwarded
+    assert fp.connect_kwargs.get("connect_timeout")  # per-address TCP bound forwarded
     store.close()
 
 
-def test_env_var_overrides_connect_timeout(monkeypatch):
-    from hermes.pg_ledger import PostgresSnapshotStore
+def test_env_var_sets_the_single_startup_budget(monkeypatch):
+    from hermes.pg_ledger import PostgresSnapshotStore, _startup_budget_s
 
     monkeypatch.setenv("HERMES_DB_CONNECT_TIMEOUT_S", "3")
     monkeypatch.setenv("HERMES_DB_CONNECT_ATTEMPTS", "1")
+    assert _startup_budget_s() == 3.0
     slow = _FakePsycopg(_FakeConn(row=_empty_dump()), delay_s=20)
-    with pytest.raises(RuntimeError, match=r"in 3s across 1 attempt"):
-        PostgresSnapshotStore("postgresql://x", "hermes_demo_t", _psycopg=slow)
+    with pytest.raises(RuntimeError, match=r"within the 3s startup budget across 1 attempt"):
+        PostgresSnapshotStore("postgresql://localhost/x", "hermes_demo_t", _psycopg=slow)
+
+
+def test_ipv4_hostaddr_is_used_when_resolvable(monkeypatch):
+    import hermes.pg_ledger as pg
+    from hermes.pg_ledger import PostgresSnapshotStore
+
+    monkeypatch.setattr(pg, "_ipv4_hostaddr", lambda dsn: "203.0.113.7")
+    fp = _FakePsycopg(_FakeConn(row=_empty_dump(), lock_grants=[True]))
+    store = PostgresSnapshotStore("postgresql://localhost/x", "hermes_demo_t",
+                                  _psycopg=fp, connect_timeout_s=10)
+    assert fp.connect_kwargs.get("hostaddr") == "203.0.113.7"  # cert still verified vs host
+    store.close()
+
+
+def test_post_connect_lock_probe_is_inside_the_budget():
+    """A connection that opens fast but then never answers the writer-lock probe
+    must still fail within the startup budget, not hang."""
+    from hermes.pg_ledger import PostgresSnapshotStore
+
+    class _SlowCursor(_FakeCursor):
+        def execute(self, sql, params=None):
+            if "pg_try_advisory_lock" in sql:
+                time.sleep(20)
+            return super().execute(sql, params)
+
+    class _SlowConn(_FakeConn):
+        def cursor(self):
+            return _SlowCursor(self)
+
+    fp = _FakePsycopg(_SlowConn(row=_empty_dump(), lock_grants=[True]))
+    t0 = time.monotonic()
+    with pytest.raises(RuntimeError, match=r"writer-lock probe within the 3s startup budget"):
+        PostgresSnapshotStore("postgresql://localhost/x", "hermes_demo_t",
+                              _psycopg=fp, connect_timeout_s=3)
+    assert time.monotonic() - t0 < 8
+
+
+def test_late_successful_connection_after_timeout_is_closed_not_leaked():
+    """If a bounded attempt times out but the connection lands afterwards, the
+    orphan thread closes it rather than leaking a Neon session."""
+    from hermes.pg_ledger import _connect_once
+
+    conn = _FakeConn(row=_empty_dump())
+    fp = _FakePsycopg(conn, delay_s=1.5)
+    got, err = _connect_once(fp, "postgresql://localhost/x", per_attempt_s=0.3, hostaddr=None)
+    assert got is None and err == "timeout"
+    time.sleep(2.0)  # let the orphan thread finish and self-close
+    assert conn.closed is True

@@ -44,48 +44,88 @@ _SNAPSHOT_VERSION = 1
 _DEFAULT_SCHEMA = "hermes_demo"
 _SCHEMA_RE = re.compile(r"\A[a-z_][a-z0-9_]{0,62}\Z")
 
-# Bounds on opening the database connection. Neon serverless holds the
-# connection open while it *resumes* suspended compute; measured resume latency
-# on this project's endpoint was ~25s warm-ish and 45s to >75s from fully cold,
-# and it is variable (one attempt can stall past the ceiling while the next
-# succeeds once resume has kicked in). libpq's ``connect_timeout`` only covers
-# the pure-TCP phase, so an unbounded ``psycopg.connect`` hangs the whole app
-# import (uvicorn never prints its banner). We therefore bound EACH attempt and
-# retry a few times within a finite total. Once connected Neon stays warm for
-# minutes, so this cost is paid at most once per demo session. Both knobs are
-# overridable (HERMES_DB_CONNECT_TIMEOUT_S = total; HERMES_DB_CONNECT_ATTEMPTS).
-_DEFAULT_CONNECT_TIMEOUT_S = 150.0
-_DEFAULT_CONNECT_ATTEMPTS = 3
-_PER_ATTEMPT_CEILING_S = 55.0
+# ONE bounded budget for the whole hermes/live startup DB phase: connect +
+# advisory-lock probe + the initial snapshot read. The dominant historical cost
+# was an IPv6 black hole - ``getaddrinfo`` returns AAAA records first and each
+# dead IPv6 SYN cost ~21s before libpq fell through to IPv4 (which connects in
+# ~0.1s). We now hand libpq an IPv4 ``hostaddr`` (TLS still verifies the cert
+# against ``host``; ``sslmode``/``channel_binding`` from the DSN are untouched),
+# so a genuine Neon pooler resume is the only remaining variable and it is
+# small. 30s covers that with margin; override with HERMES_DB_CONNECT_TIMEOUT_S.
+# The launcher waits this budget + a fixed margin, so its ceiling is always the
+# looser one (see scripts/run_demo.ps1).
+_DEFAULT_STARTUP_BUDGET_S = 30.0
+_DEFAULT_CONNECT_ATTEMPTS = 2
 _RETRY_BACKOFF_S = 2.0
 
 
-def _connect_once(psycopg: Any, dsn: str, per_attempt_s: float):
+def _startup_budget_s() -> float:
+    try:
+        return float(os.environ.get("HERMES_DB_CONNECT_TIMEOUT_S",
+                                    _DEFAULT_STARTUP_BUDGET_S))
+    except (TypeError, ValueError):
+        return _DEFAULT_STARTUP_BUDGET_S
+
+
+def _ipv4_hostaddr(dsn: str) -> str | None:
+    """First IPv4 address for the DSN host, or None. Used as libpq ``hostaddr``
+    so a black-holed IPv6 route cannot stall the connect. Best-effort: any
+    failure just falls back to name resolution (dual-stack)."""
+    try:
+        import socket  # noqa: PLC0415
+        import urllib.parse as up  # noqa: PLC0415
+
+        host = up.urlparse(dsn).hostname
+        if not host:
+            return None
+        for info in socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM):
+            return info[4][0]
+    except Exception:  # noqa: BLE001 - diagnostics only
+        return None
+    return None
+
+
+def _connect_once(psycopg: Any, dsn: str, per_attempt_s: float, hostaddr: str | None):
+    """One bounded ``psycopg.connect`` on a daemon thread. If the join times
+    out, a late-successful connection on the orphan thread is closed rather than
+    leaked."""
     box: dict[str, Any] = {}
+    abandoned = threading.Event()
 
     def _work() -> None:
         try:
-            box["conn"] = psycopg.connect(dsn, connect_timeout=max(5, int(per_attempt_s)))
+            kw = {"connect_timeout": max(5, int(per_attempt_s))}
+            if hostaddr:
+                kw["hostaddr"] = hostaddr  # cert still verified against host
+            conn = psycopg.connect(dsn, **kw)
         except BaseException as exc:  # noqa: BLE001 - reported by type only
             box["err"] = exc
+            return
+        if abandoned.is_set():
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+            box["late_closed"] = True
+            return
+        box["conn"] = conn
 
     th = threading.Thread(target=_work, name="pg-connect", daemon=True)
     th.start()
     th.join(per_attempt_s)
     if th.is_alive():
-        # Orphaned daemon thread; it dies with the process (which exits via a
-        # sanitised SystemExit on the failure path).
+        abandoned.set()  # a connection that lands after this is closed by _work
         return None, "timeout"
     if "err" in box:
         return None, type(box["err"]).__name__
-    return box["conn"], None
+    return box.get("conn"), None
 
 
 def _connect_bounded(psycopg: Any, dsn: str, total_timeout_s: float,
                      attempts: int | None = None):
-    """``psycopg.connect`` with a bounded per-attempt timeout, retried within a
-    finite total. Raises ``RuntimeError`` (never the DSN) so the ASGI
-    entrypoint reports a sanitised startup failure instead of stalling."""
+    """Open the connection within ``total_timeout_s`` total (a couple of bounded
+    attempts). Raises ``RuntimeError`` - never the DSN - so the ASGI entrypoint
+    reports a sanitised startup failure instead of stalling."""
     if attempts is None:
         try:
             attempts = int(os.environ.get("HERMES_DB_CONNECT_ATTEMPTS",
@@ -93,24 +133,47 @@ def _connect_bounded(psycopg: Any, dsn: str, total_timeout_s: float,
         except (TypeError, ValueError):
             attempts = _DEFAULT_CONNECT_ATTEMPTS
     attempts = max(1, attempts)
+    hostaddr = _ipv4_hostaddr(dsn)
     deadline = time.monotonic() + total_timeout_s
     last = "timeout"
     for i in range(attempts):
         remaining = deadline - time.monotonic()
         if remaining <= 1:
             break
-        conn, err = _connect_once(psycopg, dsn, min(remaining, _PER_ATTEMPT_CEILING_S))
+        conn, err = _connect_once(psycopg, dsn, remaining, hostaddr)
         if conn is not None:
             return conn
         last = err or "unknown"
         if i + 1 < attempts and deadline - time.monotonic() > _RETRY_BACKOFF_S + 1:
             time.sleep(_RETRY_BACKOFF_S)
     raise RuntimeError(
-        f"database connection did not succeed in {int(total_timeout_s)}s "
-        f"across {attempts} attempt(s) (last: {last}). Neon compute may be "
-        "resuming - retry, or raise HERMES_DB_CONNECT_TIMEOUT_S / "
-        "HERMES_DB_CONNECT_ATTEMPTS."
+        f"database connection did not succeed within the {int(total_timeout_s)}s "
+        f"startup budget across {attempts} attempt(s) (last: {last}). Check "
+        "network/DNS to the DB host; raise HERMES_DB_CONNECT_TIMEOUT_S only if a "
+        "genuine cold resume needs longer."
     )
+
+
+def _run_bounded(fn, seconds: float, on_timeout_msg: str):
+    """Run ``fn()`` on a daemon thread; raise ``RuntimeError(on_timeout_msg)``
+    if it does not finish within ``seconds`` (keeps post-connect init inside the
+    same startup budget). Propagates ``fn``'s own exception if it raises."""
+    box: dict[str, Any] = {}
+
+    def _w() -> None:
+        try:
+            box["v"] = fn()
+        except BaseException as exc:  # noqa: BLE001
+            box["e"] = exc
+
+    th = threading.Thread(target=_w, name="pg-init", daemon=True)
+    th.start()
+    th.join(seconds)
+    if th.is_alive():
+        raise RuntimeError(on_timeout_msg)
+    if "e" in box:
+        raise box["e"]
+    return box.get("v")
 
 
 # --- (de)serialisation of the whole in-memory ledger ----------------------
@@ -231,20 +294,32 @@ class PostgresSnapshotStore:
 
         self._schema = _validate_schema(schema)
         self._key = _advisory_key(self._schema)
-        if connect_timeout_s is None:
-            try:
-                connect_timeout_s = float(os.environ.get(
-                    "HERMES_DB_CONNECT_TIMEOUT_S", _DEFAULT_CONNECT_TIMEOUT_S))
-            except (TypeError, ValueError):
-                connect_timeout_s = _DEFAULT_CONNECT_TIMEOUT_S
-        self._conn = _connect_bounded(psycopg, dsn, connect_timeout_s)
-        try:
+        budget = connect_timeout_s if connect_timeout_s is not None else _startup_budget_s()
+
+        start = time.monotonic()
+        self._conn = _connect_bounded(psycopg, dsn, budget)
+        # The advisory-lock probe runs inside the SAME budget so a hung
+        # post-connect query cannot blow past it.
+        remaining = max(2.0, budget - (time.monotonic() - start))
+
+        def _take_lock() -> bool:
             with self._conn.cursor() as cur:
                 cur.execute("SELECT pg_try_advisory_lock(%s)", (self._key,))
-                got = bool(cur.fetchone()[0])
+                v = bool(cur.fetchone()[0])
             self._conn.commit()
+            return v
+
+        try:
+            got = _run_bounded(
+                _take_lock, remaining,
+                f"database did not respond to the writer-lock probe within the "
+                f"{int(budget)}s startup budget",
+            )
         except Exception:
-            self._conn.rollback()
+            try:
+                self._conn.rollback()
+            except Exception:  # noqa: BLE001
+                pass
             self._conn.close()
             raise
         if not got:

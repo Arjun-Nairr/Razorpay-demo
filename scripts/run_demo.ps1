@@ -45,22 +45,26 @@ if (-not $py) {
 & $py -c "import hermes" 2>$null
 if ($LASTEXITCODE -ne 0 -and -not $env:PYTHONPATH) { $env:PYTHONPATH = "$repo\src" }
 
+# --- one consistent bounded startup budget -----------------------------------
+# The app's DB phase (connect + advisory lock + first read) is bounded by
+# HERMES_DB_CONNECT_TIMEOUT_S (default 30s in hermes/live modes). The launcher's
+# health wait is ALWAYS that budget + a fixed margin for process spawn + uvicorn
+# bind, so the launcher ceiling is never tighter than the DB ceiling. It still
+# breaks immediately when the job dies (a sanitised SystemExit).
+$dbBudget = if ($env:HERMES_DB_CONNECT_TIMEOUT_S) { [int]$env:HERMES_DB_CONNECT_TIMEOUT_S } else { 30 }
+if ($Mode -eq "offline") { $maxWaitSec = 20 } else { $maxWaitSec = $dbBudget + 30 }
+
 Write-Host "Interpreter: $py" -ForegroundColor DarkGray
-Write-Host "Starting FastAPI (uvicorn) on 127.0.0.1:$ApiPort  [mode=$Mode]" -ForegroundColor Cyan
+Write-Host ("Starting FastAPI (uvicorn) on 127.0.0.1:{0}  [mode={1}]  (startup budget {2}s, health wait {3}s)" -f `
+    $ApiPort, $Mode, $dbBudget, $maxWaitSec) -ForegroundColor Cyan
 $api = Start-Job -Name hermes-api -ScriptBlock {
-    param($repo, $port, $mode, $py, $pp)
+    param($repo, $port, $mode, $py, $pp, $dbb)
     Set-Location $repo
     $env:HERMES_MODE = $mode
     if ($pp) { $env:PYTHONPATH = $pp }
+    if ($dbb) { $env:HERMES_DB_CONNECT_TIMEOUT_S = $dbb }
     & $py -m uvicorn hermes.asgi:app --host 127.0.0.1 --port $port
-} -ArgumentList $repo, $ApiPort, $Mode, $py, $env:PYTHONPATH
-
-# --- wait for the API to become healthy; abort (do NOT open the UI) on failure ---
-# Bounded wait. `hermes`/`live` open a Neon connection during app import; Neon
-# serverless can take ~25-30s to resume suspended compute, so allow more time
-# for those modes. The loop still exits IMMEDIATELY when the job dies (a
-# sanitised SystemExit), so a real failure is not delayed by the ceiling.
-$maxWaitSec = if ($Mode -eq "offline") { 20 } else { 100 }
+} -ArgumentList $repo, $ApiPort, $Mode, $py, $env:PYTHONPATH, $env:HERMES_DB_CONNECT_TIMEOUT_S
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 $healthy = $false
 $r = $null
