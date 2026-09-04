@@ -70,8 +70,8 @@ class Settings:
 
     @classmethod
     def load(cls, *, mode: str = "offline", load_env: bool = True) -> "Settings":
-        if mode not in ("offline", "live"):
-            raise ValueError("mode must be 'offline' or 'live'")
+        if mode not in ("offline", "live", "hermes"):
+            raise ValueError("mode must be 'offline', 'live', or 'hermes'")
         if load_env:
             _load_dotenv()
         gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
@@ -82,7 +82,7 @@ class Settings:
         if not re.match(r"\A[a-z_][a-z0-9_]{0,62}\Z", schema):
             raise ValueError("HERMES_DEMO_SCHEMA must be a simple lowercase identifier")
 
-        if mode == "live":
+        if mode in ("live", "hermes"):
             missing = [
                 name for name, val in
                 (("GEMINI_API_KEY", gemini_key), ("DATABASE_URL", database_url))
@@ -90,7 +90,7 @@ class Settings:
             ]
             if missing:
                 raise RuntimeError(
-                    "live mode requires " + ", ".join(missing)
+                    f"{mode} mode requires " + ", ".join(missing)
                     + " in the environment or root .env (values are never printed)"
                 )
 
@@ -119,16 +119,23 @@ class Settings:
 def build_ledger(settings: Settings):
     from .pg_ledger import InMemorySnapshotStore, PgLedger, PostgresSnapshotStore
 
-    if settings.mode == "live":
+    if settings.mode in ("live", "hermes"):
         return PgLedger(PostgresSnapshotStore(settings._database_url or "",
                                               settings.demo_schema))
     return PgLedger(InMemorySnapshotStore())
 
 
 def build_strategist(settings: Settings):
+    if settings.mode == "hermes":
+        # The ACTUAL Nous Hermes runtime, isolated subprocess. Verifies the
+        # installed revision on construction; raises HermesRuntimeUnavailable
+        # (a RuntimeError) if the runtime is missing / wrong - never a silent
+        # fall back to the direct-Gemini adapter.
+        from .hermes_agent_strategist import HermesAgentStrategist
+
+        return HermesAgentStrategist(gemini_model=settings.gemini_model)
     if settings.mode == "live":
-        # Real Gemini. The client is built now so a bad key surfaces at startup;
-        # the HTTP call is still lazy.
+        # Direct google-genai (kept for comparison / tests only).
         from .hermes_strategist import HermesStrategist
 
         return HermesStrategist(model=settings.gemini_model, max_in_flight=2)
@@ -202,6 +209,7 @@ def build_app(settings: Settings):
     return create_app(
         engine=engine, config=config, razorpay=razorpay,
         merchant_context=merchant_context, demo_serial_start=next_serial,
-        mode_label=("live-gemini" if settings.mode == "live" else "scripted-offline"),
+        mode_label={"hermes": "hermes-runtime", "live": "live-gemini"}.get(
+            settings.mode, "scripted-offline"),
         on_shutdown=ledger.close, ledger=ledger,
     )

@@ -16,7 +16,7 @@
 #     the window; if a stray job is left:  Get-Job | Stop-Job ; Get-Job | Remove-Job
 
 param(
-    [ValidateSet("live", "offline")]
+    [ValidateSet("live", "offline", "hermes")]
     [string]$Mode = "live",
     [int]$ApiPort = 8000,
     [int]$UiPort = 8501

@@ -14,13 +14,31 @@ financial authority.
 
 Hermes is the merchant-side recovery operator above Razorpay. A deterministic
 context builder gives the strategist a minimized, source-labelled snapshot per
-decision. **The strategist is a direct Gemini 3.7 Flash adapter** (`google-genai`)
-behind the `Strategist` protocol - the Nous Hermes Agent runtime was evaluated
-and not adopted (Iteration 06); a fresh client, no tools, no memory, one call,
-strict local schema validation, at most one repair, an application timeout, and
-bounded in-flight calls. Gemini returns one candidate strategy. Deterministic
-policy authorizes, replaces, blocks, stops, escalates, or exhausts that
-proposal. Only verified, unique payments change recovered-value metrics.
+decision.
+
+**Two strategist modes exist behind the same `Strategist` protocol:**
+
+- **`hermes` mode (Iteration 10, current target): the ACTUAL Nous Hermes
+  runtime.** One `propose` call spawns a throwaway `run_agent.AIAgent` decision
+  in an isolated subprocess run by the installed Hermes interpreter, in a
+  project-local gitignored `HERMES_HOME` (state isolation, not an OS sandbox),
+  with the tool-search bridge off and exactly three case-scoped read tools
+  (`get_payment_retry_facts`, `get_payment_history`, `get_recovery_actions`)
+  backed by a bounded immutable evidence bundle. The agent receives limited
+  initial context (failure, policy limits, three months of history), chooses
+  whether and which tools to call (history: 6 or 12 months only, needs an
+  uncertainty reason, at most two requests, no duplicate/no-progress repeats),
+  and returns one JSON proposal. Bounds: 6 tool executions, 8 model iterations,
+  one 90 s subprocess deadline, at most one schema repair, one in-flight
+  decision; a timed-out child is reaped. No silent fallback to direct Gemini.
+- **`live` mode: the direct Gemini 3.7 Flash adapter** (`google-genai`),
+  retained for comparison and tests - a fresh client, no tools, one call.
+
+Either mode returns one candidate strategy. Deterministic policy authorizes,
+replaces, blocks, stops, escalates, or exhausts that proposal. Only verified,
+unique payments change recovered-value metrics. Model-reported `confidence` is
+an explicitly *uncalibrated* estimate displayed as low/medium/high; it never
+grants a permission and is never required to rise after more evidence.
 
 The demo keeps five golden scenarios, but only one flow needs real or hybrid
 Razorpay Test Mode evidence. All accelerated multi-day outcomes are explicitly
@@ -63,10 +81,17 @@ simulated.
 - `RecoveryEngine.run` builds context deterministically, calls one
   `Strategist`, applies deterministic policy, and persists action intent before
   executing an effect.
-- `HermesStrategist` implements the existing `Strategist` protocol using a
-  direct `google-genai` (Gemini 3.7 Flash) client - a fresh client per
-  decision, no tools, no memory, one `generate_content` call. (The Nous Hermes
-  `AIAgent` runtime is *not* used; see Iteration 06.)
+- `HermesAgentStrategist` (`hermes` mode) implements the `Strategist` protocol
+  by driving the **actual** installed Nous Hermes `run_agent.AIAgent` in an
+  isolated subprocess (parent prepares an immutable evidence bundle; child
+  registers exactly three case-bound tools, asserts the exposed names, rejects
+  any other dispatch; `skip_context_files` / `skip_memory` /
+  `skip_background_review`, positive one-toolset allowlist, no terminal /
+  browser / file / delegation / cron / code-exec tools, MCP + plugins + skill
+  discovery inert in the throwaway home). It verifies the installed Hermes git
+  revision on construction and refuses to launch on mismatch (no auto-upgrade).
+  `HermesStrategist` (`live` mode) keeps the direct `google-genai` client for
+  comparison and tests. Neither mode ever substitutes for the other silently.
 - Model output is parsed and validated locally with a strict hand-rolled
   structural check; invalid output executes nothing and receives at most one
   bounded repair attempt. An application-level timeout plus a bounded
@@ -142,9 +167,20 @@ reactivate the original subscription.
    templates, and a minimal Streamlit-through-FastAPI interface for one
    operable insufficient-funds case that survives restart. SQLite only if Neon
    blocks the deadline.
-5. **Razorpay Test Mode hybrid slice** — ingest at least one real signed event,
+5. **Isolated real Hermes, one-case path** *(done, Iteration 10)* — an explicit
+   `hermes` execution mode driving the actual `run_agent.AIAgent` in an isolated
+   subprocess for one manually-controlled Case 3 decision (three case-scoped
+   evidence tools, bounded iterations/tool-calls/deadline, one repair, one
+   in-flight decision), with bounded redacted audit metadata (evidence requests
+   + reasons, returned source/coverage, uncalibrated confidence band, unresolved
+   uncertainty, stop reason, runtime revision, duration, tokens) on the existing
+   ledger and dashboard. Scripted-offline mode is retained for tests; `live`
+   (direct Gemini) is retained for comparison. Automatic queue wake-ups,
+   periodic sweeps, and broader batch evaluation are deferred until this path is
+   proven live.
+6. **Razorpay Test Mode hybrid slice** — ingest at least one real signed event,
    reconcile provider truth, and label every real/simulated event explicitly.
-6. **Five-case dashboard slice** — run all five golden cases, show timelines,
+7. **Five-case dashboard slice** — run all five golden cases, show timelines,
    policy outcomes, attribution, recovered value, unnecessary intervention,
    escalation/exhaustion, and a repeatable five-minute demo control.
 

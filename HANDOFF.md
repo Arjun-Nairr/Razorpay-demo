@@ -40,9 +40,43 @@ requirements in `PROJECT_BRIEF.md`.
   expected-state capture guard is closed, the wait -> failed-retry -> changed-
   strategy -> recovery-link -> `hermes_assisted` path is proven end to end
   through `receive`/`run`/`inspect`, and Case 1's 36-test suite remains green.
-- Status: **Iteration 09 - reviewed-demo-blocker corrections + first user-run
-  end-to-end test prep** on `fix/runnable-demo-boundaries` (branched from
-  `d2e6572`). Six review blockers fixed: (1) full demo state survives an
+- Status: **Iteration 10 - isolated REAL Nous Hermes runtime for one Case 3
+  decision** on `feat/isolated-hermes-agent` (branched from `f9b640e`). A new
+  explicit `hermes` execution mode drives the actual `run_agent.AIAgent` (Hermes
+  checkout `e02d1e41`, pkg 0.20.4, Python 3.11.15) in a subprocess run by the
+  installed Hermes interpreter, in a project-local gitignored `HERMES_HOME`
+  (state isolation, not an OS sandbox): tool-search bridge off, positive
+  one-toolset allowlist, `skip_context_files` / `skip_memory` /
+  `skip_background_review`, no terminal/browser/file/delegation/cron/code-exec
+  tools, MCP + plugins + skill discovery inert. Exactly three case-scoped read
+  tools backed by a bounded immutable evidence bundle:
+  `get_payment_retry_facts`, `get_payment_history(6|12, reason)` (>=3-char
+  reason, <=2 requests, no duplicate/no-progress repeats, unavailable ->
+  "unavailable" not invented), `get_recovery_actions`. The agent gets limited
+  initial context (failure + policy limits + 3 months history), chooses whether
+  and which tools to call, and returns one JSON proposal that the deterministic
+  engine still validates and authorizes. Bounds: 6 tool executions, 8 model
+  iterations, one 90 s subprocess deadline (timed-out child reaped), <=1 schema
+  repair (budget not reset), one in-flight decision. Bounded redacted audit
+  metadata (`AI_MODEL_RUN.detail.hermes`): runtime revision, evidence requests
+  + reasons, returned source/coverage, uncalibrated confidence band + estimate,
+  unresolved uncertainty, stop reason, duration, tokens - short explanations
+  and tool evidence only, no transcripts/chain-of-thought. Confidence is
+  displayed low/medium/high as an explicitly uncalibrated model estimate; it
+  never grants a permission and is never required to rise after more data.
+  **No silent fallback to direct Gemini** (`live` mode keeps the direct-Gemini
+  adapter for comparison/tests; `hermes` refuses to launch on a Hermes revision
+  mismatch). FastAPI, Neon, attribution, pending-work persistence, single-runner
+  protections, and the existing UI are unchanged; the dashboard gains a "Actual
+  Hermes runtime" panel. Manual demo controls only - automatic queue wake-ups,
+  periodic sweeps, and broader batch evaluation are deferred until this path is
+  proven live. Offline harness verified (real `AIAgent` + tool loop with a
+  stubbed OpenAI-compat transport, no live Gemini/Neon/Razorpay). **Live
+  end-to-end NOT verified** - the user runs `scripts/hermes_agent_smoke.py`
+  (actual Hermes + Gemini) and `scripts/run_demo.ps1 -Mode hermes` (Neon-backed).
+- Prior status: **Iteration 09 - reviewed-demo-blocker corrections + first
+  user-run end-to-end test prep** on `fix/runnable-demo-boundaries` (branched
+  from `d2e6572`). Six review blockers fixed: (1) full demo state survives an
   app restart by deterministic reconstruction from the durable ledger
   (merchant context, provider retry eligibility, next serial) plus
   collision-safe case/event IDs - the DB is never reset; (2) zero-hour waits
@@ -113,6 +147,102 @@ requirements in `PROJECT_BRIEF.md`.
   For the smoke script the user now keeps a **replacement** `GEMINI_API_KEY` in
   a local gitignored `.env` (the previously used key was disclosed in chat and
   must stay revoked); the key is never requested in or pasted into chat.
+
+## Iteration 10 — Isolated real Nous Hermes runtime, one Case 3 decision
+
+Branch `feat/isolated-hermes-agent` from `f9b640e`. Codex's untracked
+`HERMES_ISOLATED_AGENT_RESEARCH.md` is preserved and committed with this
+milestone's docs.
+
+### What was built
+
+- **`src/hermes/hermes_agent/child_main.py`** - runs INSIDE the installed
+  Hermes venv as a subprocess. Reads one JSON job on stdin, registers exactly
+  three case-bound tools under a custom `revenue_recovery` toolset, asserts
+  `agent.valid_tool_names == {those three}` (any other dispatch is rejected by
+  the real loop), builds a fresh `run_agent.AIAgent` (`openai-compat` + a
+  caller-supplied stub base_url for the offline harness, or native `gemini`
+  provider for live), drives `run_conversation` with `max_iterations=8`, does
+  at most one schema-repair turn on the *remaining* budget, and prints
+  `HERMES_CHILD_RESULT {json}` (proposal + bounded audit, or error + audit).
+  Only stdlib + Hermes runtime imports - never the `hermes` project package.
+- **`src/hermes/hermes_agent_strategist.py`** - `HermesAgentStrategist`
+  (`Strategist` seam, parent side). Verifies `git -C <checkout> rev-parse HEAD`
+  == `e02d1e41...` on construction (`HermesRuntimeUnavailable` otherwise);
+  prepares the gitignored `HERMES_HOME` (writes `config.yaml` with
+  `tools.tool_search: false` so the three tools are exposed directly);
+  builds the immutable evidence bundle (coherent synthetic 12-month history for
+  the demo customer, shorter windows are trailing subsets, 3-month subset in the
+  initial context); spawns the child with `cwd=<checkout>`, a minimal env (no
+  `DATABASE_URL` / Razorpay / unrelated keys; `GEMINI_API_KEY` only in live
+  mode), `timeout=90` (reaps a timed-out child), one-in-flight
+  `BoundedSemaphore`. Maps the child result to `StrategyProposal` or raises
+  `InvalidProposal` / `TimeoutError` (engine's existing bounded-failure path).
+  `last_run_meta` is a `HermesRunMeta` whose `.extra` carries the child audit.
+- **`config/hermes_agent/SKILL.md`** - tracked project skill (evidence-gathering
+  + safe-proposal rules), passed explicitly as `skill_text`, never via skill
+  discovery.
+- **`engine.py`** - `_note_model_run` merges `meta.extra` into
+  `AI_MODEL_RUN.detail["hermes"]` (bounded redacted fields only).
+- **`runtime.py`** - `Settings` mode is `offline | live | hermes`; `hermes`
+  requires `GEMINI_API_KEY` + `DATABASE_URL`; `build_strategist` ->
+  `HermesAgentStrategist` for `hermes` (no silent Gemini fallback);
+  `build_ledger` uses Postgres for `live` and `hermes`; `mode_label`
+  `hermes-runtime`.
+- **`scripts/demo_ui.py`** - "Actual Hermes runtime" panel (model, revision,
+  decision time, uncalibrated confidence band + disclaimer, evidence
+  requests + reasons, returned source/coverage, unresolved uncertainty, stop
+  reason, tokens). **`scripts/run_demo.ps1`** - `-Mode hermes`.
+- **`scripts/hermes_agent_smoke.py`** - user-run: one real Case 3 decision
+  through actual Hermes + real Gemini, prints sanitized run evidence. No DB /
+  Razorpay / messages / charges / links.
+
+### Bounds and contract
+
+6 tool executions, 8 model iterations, one 90 s subprocess deadline, <=1 schema
+repair (budget not reset), one in-flight decision. `get_payment_history` takes
+only 6 or 12 months, needs a >=3-char uncertainty reason, at most two requests,
+rejects duplicate windows and no-progress repeats, returns `available:false`
+(not invented rows) when the window is unavailable, and never overrides current
+provider facts or consent. The engine's `_validate_proposal` + deterministic
+policy remain the final authority; confidence never grants a permission and is
+never required to rise after more evidence.
+
+### Verification
+
+- **Offline harness (this machine):** `tests/test_hermes_agent.py` - each test
+  spawns the ACTUAL child (`run_agent.AIAgent` + its real tool loop) against a
+  local OpenAI-compatible **stub transport**; skipped (not failed) when the
+  installed runtime is absent or != the proven revision. Covers: real
+  AIAgent import/instantiation + tool loop returning a validated proposal;
+  legitimate no-extra-lookup path; coherent 6/12-month windows +
+  duplicate/no-progress rejection; unavailable history not invented;
+  unauthorized-tool-call rejection; forged `case_id`/SQL argument ignored; one
+  repair then success; repeated invalid -> bounded `InvalidProposal` with
+  `stop_reason=schema_repair_failed`; single-decision-in-flight -> `TimeoutError`;
+  short subprocess deadline reaps the child; wrong-revision refusal.
+  Result: **11 passed in ~7.6 min** (each test spawns the real runtime).
+- **Full offline suite unaffected:** `python -m pytest -q --ignore=tests/test_hermes_agent.py`
+  -> **223 passed, 3 skipped**.
+- **NOT verified live:** no live Gemini/Neon/Razorpay call was made here.
+  Live proof is user-run (`scripts/hermes_agent_smoke.py`, then
+  `scripts/run_demo.ps1 -Mode hermes` against Neon).
+
+### Limitations
+
+- The offline harness proves the real Hermes tool loop and every bound with a
+  stub transport; it does not prove live Gemini semantics or Neon persistence
+  under `hermes` mode - user-run.
+- Each child spawn pays the Hermes import cost (~7-15 s); the 90 s deadline
+  accommodates it. Manual demo controls only this milestone.
+- `iterations_used` / `tokens` are surfaced only if the installed runtime
+  returns them in the `run_conversation` result dict; absent -> `null`.
+
+### Exact next action
+
+User runs the two live commands below; then Codex review of Iteration 10; then
+automatic scheduling (queue wake-ups, sweeps, batch) and the remaining golden
+cases.
 
 ## Iteration 09 — Reviewed-demo-blocker corrections + user-run test prep
 

@@ -52,8 +52,11 @@ try:
     st.sidebar.success(
         f"API up · evidence_mode = {health.get('evidence_mode')} · mode = {mode}"
     )
-    if mode == "live-gemini":
-        st.sidebar.info("Proposals are real Gemini output. Payments/links are SIMULATED.")
+    if mode == "hermes-runtime":
+        st.sidebar.info("Proposals come from the actual isolated Nous Hermes runtime. "
+                        "Payments/links are SIMULATED.")
+    elif mode == "live-gemini":
+        st.sidebar.info("Proposals are direct Gemini output. Payments/links are SIMULATED.")
     else:
         st.sidebar.warning("Offline: proposals are scripted, not a model call. Payments/links are SIMULATED.")
 except Exception:
@@ -104,10 +107,34 @@ if ss.case_id:
         proposals = [r for r in timeline if r["kind"] == "AI_PROPOSAL"]
         policies = [r for r in timeline if r["kind"] == "POLICY_DECISION"]
         model_runs = [r for r in timeline if r["kind"] == "AI_MODEL_RUN"]
+
+        if model_runs and mode == "hermes-runtime":
+            h = model_runs[-1]["detail"].get("hermes", {})
+            st.subheader("Actual Hermes runtime")
+            hc1, hc2, hc3 = st.columns(3)
+            hc1.metric("Model", model_runs[-1]["detail"].get("model") or "-")
+            hc2.metric("Runtime revision", (h.get("runtime_revision") or "-")[:12])
+            hc3.metric("Decision time (ms)", h.get("duration_ms") or "-")
+            band = h.get("confidence_band") or "-"
+            st.caption(f"Model confidence estimate: **{band}** "
+                       f"({h.get('model_confidence')}) — an explicitly *uncalibrated* "
+                       "model self-estimate, not a probability of correctness; it never "
+                       "grants a permission.")
+            if h.get("evidence_requests"):
+                st.write("**Evidence the model requested**")
+                st.table(h["evidence_requests"])
+            if h.get("evidence_returned"):
+                st.write("**Evidence returned (source / coverage)**")
+                st.table(h["evidence_returned"])
+            st.write(f"**Unresolved uncertainty:** {h.get('unresolved_uncertainty') or 'none stated'}")
+            st.write(f"**Stop reason:** {h.get('stop_reason') or '-'}  ·  "
+                     f"**tokens:** {h.get('tokens') or 'n/a'}")
+
         if proposals:
-            label = ("Latest AI proposal (actual Gemini output)"
-                     if mode == "live-gemini"
-                     else "Latest proposal (scripted offline reasoning, no model call)")
+            label = {
+                "hermes-runtime": "Latest proposal (actual Nous Hermes agent output)",
+                "live-gemini": "Latest AI proposal (direct Gemini output)",
+            }.get(mode, "Latest proposal (scripted offline reasoning, no model call)")
             st.subheader(label)
             st.json(proposals[-1]["detail"])
         if policies:

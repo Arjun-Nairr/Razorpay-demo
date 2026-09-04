@@ -487,6 +487,14 @@ class RecoveryEngine:
             "validation_result": meta.validation_result,
             "usage": meta.usage,
         }
+        # A real-Hermes strategist attaches bounded, redacted agent-decision
+        # metadata (runtime revision, evidence requests + reasons, returned
+        # source/coverage, confidence band, unresolved uncertainty, stop
+        # reason, duration, tokens) - short explanations and tool evidence,
+        # never raw transcripts or chain-of-thought.
+        extra = getattr(meta, "extra", None)
+        if isinstance(extra, dict) and extra:
+            detail["hermes"] = extra
         if error is not None:
             detail["engine_error"] = error
         self._ledger.note_event(

@@ -24,6 +24,9 @@ htmlcov/
 # Hermes runtime-spike: isolated agent profile/home (never committed)
 .hermes_profile/
 .hermes_home/
+# Isolated real-Hermes agent: generated runtime home, sessions, logs, caches
+.hermes_home/isolated/
+runtime_home/
 
 # Editors / OS
 .vscode/
