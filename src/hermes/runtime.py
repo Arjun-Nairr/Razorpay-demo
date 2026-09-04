@@ -35,9 +35,15 @@ from dataclasses import dataclass, field
 
 from .adapters import FakeRazorpayAdapter, ScriptedStrategist
 from .api import ApiConfig, create_app
-from .demo_fixtures import DEMO_SIGNING_SECRET_ENV, case3_merchant_context, demo_serial_of, new_demo_signing_secret
+from .demo_fixtures import (
+    DEMO_PROVENANCE_KIND,
+    DEMO_SIGNING_SECRET_ENV,
+    MerchantContext,
+    demo_serial_of,
+    new_demo_signing_secret,
+)
 from .engine import RecoveryEngine
-from .types import CaseQuery
+from .types import AuditQuery, CaseQuery
 
 
 def _load_dotenv() -> None:
@@ -139,16 +145,42 @@ def build_engine(
     )
 
 
+def _demo_provenance(engine: RecoveryEngine, case_id: str) -> dict | None:
+    """The trusted ``DEMO_CASE_PROVENANCE`` detail for a case, or ``None`` if the
+    case was not opened by ``/demo/case`` (e.g. an externally ingested webhook)."""
+    for rec in engine.inspect(AuditQuery(case_id=case_id)).records:
+        if rec.kind == DEMO_PROVENANCE_KIND:
+            return rec.detail
+    return None
+
+
 def _bootstrap_demo_state(engine: RecoveryEngine, ledger, razorpay: FakeRazorpayAdapter):
-    """From the persisted ledger, rebuild: the trusted synthetic merchant-context
-    registry (every demo case is a Case 3 fixture), the simulated provider's
-    current retry eligibility per obligation, and the next serial."""
+    """From the persisted ledger, rebuild - ONLY for cases carrying trusted demo
+    provenance - the synthetic merchant-context registry and the simulated
+    provider's current retry eligibility, plus the next serial.
+
+    A case with no ``DEMO_CASE_PROVENANCE`` record (any externally ingested
+    obligation, whatever its id looks like) is left alone: no merchant context,
+    so contact stays denied, and no provider retry signal is invented (the
+    adapter is fail-closed). Existing cases and payment accounting are untouched;
+    the database is not reset.
+    """
     merchant_context: dict = {}
     max_serial = 0
     for case_id in ledger.case_ids():
+        prov = _demo_provenance(engine, case_id)
+        if prov is None:
+            continue  # not a trusted demo case - do not fabricate any facts
         proj = engine.inspect(CaseQuery(case_id=case_id))
         obl = proj.obligation_id
-        merchant_context[obl] = case3_merchant_context(obl)
+        merchant_context[obl] = MerchantContext(
+            obligation_id=obl,
+            consent=bool(prov.get("consent")),
+            reachable_channel=bool(prov.get("reachable_channel")),
+            customer_notify=bool(prov.get("customer_notify")),
+            source=str(prov.get("source", "SYNTHETIC_DEMO_FIXTURE:restored")),
+            payment_history=str(prov.get("payment_history", "ordinary")),
+        )
         # deterministic: before a recorded failed retry the provider is
         # currently eligible; after one it currently reports no further retry.
         razorpay.set_retry_eligibility(obl, not proj.retry_outcome_recorded)
@@ -171,5 +203,5 @@ def build_app(settings: Settings):
         engine=engine, config=config, razorpay=razorpay,
         merchant_context=merchant_context, demo_serial_start=next_serial,
         mode_label=("live-gemini" if settings.mode == "live" else "scripted-offline"),
-        on_shutdown=ledger.close,
+        on_shutdown=ledger.close, ledger=ledger,
     )

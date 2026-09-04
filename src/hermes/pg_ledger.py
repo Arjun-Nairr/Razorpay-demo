@@ -255,17 +255,20 @@ class PgLedger:
     # -- delegation --------------------------------------------------
 
     def _delegate(self, name: str) -> Callable[..., Any]:
-        method = getattr(self._mem, name)
+        # The bound method is resolved INSIDE the lock, not here: a rollback in
+        # another operation replaces ``self._mem`` wholesale, so a call that
+        # bound ``getattr(self._mem, name)`` before waiting on the lock would
+        # otherwise read from / mutate the discarded object.
         if name in self._READS:
             def _read(*args: Any, **kwargs: Any) -> Any:
                 with self._lock:
-                    return method(*args, **kwargs)
+                    return getattr(self._mem, name)(*args, **kwargs)
             return _read
         if name in self._WRITES:
             def _committed(*args: Any, **kwargs: Any) -> Any:
                 with self._lock:
                     try:
-                        result = method(*args, **kwargs)
+                        result = getattr(self._mem, name)(*args, **kwargs)
                         new_json = json.dumps(dump_ledger(self._mem))
                         self._store.write(json.loads(new_json))
                         self._last_json = new_json

@@ -164,6 +164,33 @@ def test_write_failure_rolls_the_in_memory_state_back():
     assert reloaded.logical_clock() == before_clock
 
 
+# --- fix 1: a callable bound before a rollback must act on the CURRENT ledger --
+
+
+def test_callable_bound_before_rollback_operates_on_the_replaced_ledger():
+    """``_delegate`` must resolve ``getattr(self._mem, name)`` inside the locked
+    call, not when the callable is handed out: a rollback swaps ``self._mem`` for
+    a fresh object, and a stale binding would read from / mutate the discarded
+    one."""
+    store = _FailOnNthWrite(fail_on=2)
+    led = PgLedger(store)
+
+    led.advance_clock(2)                       # write 1: committed, clock == 2
+    queued_read = getattr(led, "logical_clock")   # bound BEFORE the rollback
+    queued_write = getattr(led, "advance_clock")
+
+    with pytest.raises(RuntimeError):
+        led.advance_clock(5)                   # write 2 fails -> in-memory rollback
+
+    # the discarded object reached clock 5; the live one is back at 2
+    assert led.logical_clock() == 2
+    assert queued_read() == 2                  # reads the CURRENT ledger, not the discard
+
+    queued_write(7)                            # write 3: mutates the CURRENT ledger
+    assert led.logical_clock() == 7
+    assert PgLedger(store).logical_clock() == 7   # and it was the state that got persisted
+
+
 # --- clock monotonicity ------------------------------------------
 
 

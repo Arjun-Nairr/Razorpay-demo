@@ -57,7 +57,12 @@ requirements in `PROJECT_BRIEF.md`.
   on the raw bytes before any `json.loads`; (6) blocking `engine.run` /
   Gemini / Postgres work runs off the event loop via `run_in_threadpool`
   with one non-blocking recovery-runner lock (409 if busy) and a per-op
-  ledger `RLock`. **219 tests pass, 3 skipped** (opt-in real-Postgres).
+  ledger `RLock`. A follow-up commit adds four more review fixes (ledger
+  callable resolved post-rollback; restart no longer fabricates permissions
+  for externally ingested cases - trusted `DEMO_CASE_PROVENANCE` gates
+  reconstruction; sanitised startup-failure exit with no original message or
+  traceback; a same-case in-flight-decision/capture regression). **223 tests
+  pass, 3 skipped** (opt-in real-Postgres).
   Offline launch verified locally: FastAPI `/health` ok
   (`mode: scripted-offline`), full Case 3 flow to
   `state=recovered attribution=hermes_assisted`, Streamlit headless serves
@@ -206,9 +211,10 @@ scenarios. Six review blockers fixed; existing tests were not weakened.
 
 ### Verification (offline, this machine)
 
-- `python -m pytest -q` -> **219 passed, 3 skipped** (all 3 skips are the
-  opt-in real-Postgres tests in `test_pg_integration.py`, gated on
-  `HERMES_PG_TEST_DSN`).
+- `python -m pytest -q` -> **219 passed, 3 skipped** at first commit;
+  **223 passed, 3 skipped** after the follow-up corrections below. All 3 skips
+  are the opt-in real-Postgres tests in `test_pg_integration.py`, gated on
+  `HERMES_PG_TEST_DSN`.
 - `python -m compileall -q src tests scripts` -> clean.
 - `git diff --check` -> clean (only LF->CRLF advisories).
 - Secret scan of the full diff + new files -> no keys, DSNs, or `.env`
@@ -271,8 +277,62 @@ Opt-in real-Neon tests:
   this cosmetic (no double-count, no backward time write - `run` raises
   `ValueError` -> 409). Documented, not fixed.
 - **Next action: the user runs the live demo above** (Neon init + live
-  Gemini), then Codex review of Iteration 09, then the Razorpay Test Mode
-  hybrid slice.
+  Gemini), then Codex review of Iteration 09, then actual Nous Hermes
+  integration (the current runtime remains **direct Gemini**), then the
+  Razorpay Test Mode hybrid slice.
+
+### Follow-up corrections (second commit on `fix/runnable-demo-boundaries`)
+
+Four review items on the Iteration 09 code. Offline only; no Gemini/Neon/
+Razorpay calls; the unrelated `HERMES_ISOLATED_AGENT_RESEARCH.md` note was
+left untracked and unstaged.
+
+1. **Queued ledger op after a rollback.** `PgLedger._delegate` bound
+   `getattr(self._mem, name)` when the callable was handed out; a rollback
+   replaces `self._mem`, so a call still waiting on the lock would read/mutate
+   the discarded object. Now the method is resolved *inside* the locked
+   invocation for both reads and writes.
+   Test: `tests/test_pg_ledger.py::test_callable_bound_before_rollback_operates_on_the_replaced_ledger`
+   - bind a read + a write callable, fail the next write to force a rollback,
+     then invoke them: the read sees the live state and the write lands in it
+     and survives reload.
+2. **Unknown merchant permissions on restart.** `/demo/case` now stamps one
+   trusted `DEMO_CASE_PROVENANCE` audit record (consent / reachable_channel /
+   customer_notify / source / history) when it opens a case;
+   `runtime._bootstrap_demo_state` reconstructs merchant context and provider
+   retry eligibility **only** for cases carrying that record. An externally
+   ingested obligation - even one whose id mimics `sub_demo_*` - gets nothing:
+   contact stays denied, no provider eligibility is invented. Existing cases
+   and payment accounting are untouched; the DB is not reset.
+   Test: `tests/test_demo_restart.py::test_unknown_case_stays_contact_denied_with_no_fabricated_retry_after_restart`
+   plus the existing demo-restart tests still pass.
+3. **Startup-failure sanitisation.** `asgi.py` no longer re-raises the original
+   exception (its traceback could carry a DSN/host/key). It prints one
+   controlled line - mode, exception *type*, and the config field names to
+   check - then `raise SystemExit(1) from None`: no original message, no
+   chained traceback, nonzero exit.
+   Test: `tests/test_asgi_startup.py` - a child process makes `build_app` raise
+   `RuntimeError` containing a synthetic secret marker + a fake DSN; neither
+   the marker, `postgresql://`, nor `Traceback` appears in stdout/stderr, and
+   the exit code is nonzero.
+4. **Same-case concurrency regression.**
+   `tests/test_api_concurrency.py::test_same_case_capture_during_in_flight_decision`
+   - runtime `PgLedger` over an offline snapshot store + a 2s `DelayedStrategist`.
+   While `/demo/step advance` is inside the model call, a valid capture for the
+   **same** case is delivered: intake returns in < 1s, the case becomes
+   `recovered`, the resumed model result is rejected as a stale claim
+   (`proposals == 0`, `stale_claims >= 1`, no `AI_PROPOSAL` / `ACTION_INTENT`),
+   a duplicate capture does not double-count, and a fresh `PgLedger` over the
+   same store still reads `recovered` / 1,000,000 with no action intents. No
+   engine change was needed - the existing claim-token / expected-version
+   guards already covered it.
+
+Verification: `python -m pytest -q` -> **223 passed, 3 skipped**;
+`python -m compileall -q src tests scripts` clean; `git diff --check` clean.
+Remaining limitations unchanged from Iteration 09 (demo-grade snapshot ledger;
+`merchant_manual` unreachable; Cases 2/4/5 and real Test Mode untouched;
+cosmetic `_clock` refresh race). Actual Nous Hermes integration is the next
+planned task; the runtime still uses direct Gemini.
 
 ## Iteration 06 — Runtime spike: isolated Gemini strategist (fallback path)
 

@@ -46,6 +46,7 @@ from fastapi.concurrency import run_in_threadpool
 
 from .demo_fixtures import (
     CASE3_STEP_HOURS,
+    DEMO_PROVENANCE_KIND,
     MerchantContext,
     capture_envelope,
     case3_merchant_context,
@@ -54,7 +55,7 @@ from .demo_fixtures import (
     mint_demo_ids,
 )
 from .engine import RecoveryEngine
-from .types import AuditQuery, CaseQuery, RazorpayWebhook, WebhookType
+from .types import AuditQuery, CaseQuery, NoteEventCommand, RazorpayWebhook, WebhookType
 
 _SUPPORTED_EVENTS: dict[str, WebhookType] = {
     "payment.failed": WebhookType.PAYMENT_FAILED,
@@ -281,6 +282,7 @@ def create_app(
     demo_serial_start: int = 1,
     mode_label: str = "scripted-offline",
     on_shutdown: "Callable[[], None] | None" = None,
+    ledger: Any | None = None,
 ) -> FastAPI:
     """Build the ingress app around an injected engine and config.
 
@@ -293,6 +295,10 @@ def create_app(
     cases usable and mints genuinely-new ones. ``mode_label`` is reported by
     ``/health`` so the UI can show live-Gemini vs scripted honestly.
     ``on_shutdown`` (e.g. ``ledger.close``) is called when the app stops.
+    ``ledger`` (when supplied) lets ``/demo/case`` stamp a trusted
+    ``DEMO_CASE_PROVENANCE`` audit record that restart reconstruction keys on;
+    without it a demo case still works for this process but is not
+    reconstructable after a restart.
 
     Concurrency: the ledger serialises its own operations; a slow model call in
     ``engine.run`` happens between ledger ops and holds no lock, so webhook
@@ -316,6 +322,7 @@ def create_app(
     app.state.engine = engine
     app.state.config = config
     app.state.razorpay = razorpay
+    app.state.ledger = ledger
     app.state.mode_label = mode_label
     app.state.merchant_context = dict(merchant_context or {})
     app.state.demo_serial = max(1, int(demo_serial_start)) - 1
@@ -378,6 +385,24 @@ def create_app(
                 failure_envelope(obligation_id, payment_id=f"pay_{obligation_id}_f0"),
                 event_id=f"evt_{obligation_id}_f0",
             )
+            if ledger is not None:
+                # Trusted provenance + the facts needed to rebuild this case's
+                # merchant context and provider retry eligibility after a full
+                # app restart. Only cases with this record are reconstructed.
+                ledger.note_event(NoteEventCommand(
+                    case_id=body["case_id"], event_id=None,
+                    kind=DEMO_PROVENANCE_KIND,
+                    detail={
+                        "obligation_id": obligation_id,
+                        "consent": ctx.consent,
+                        "reachable_channel": ctx.reachable_channel,
+                        "customer_notify": ctx.customer_notify,
+                        "source": ctx.source,
+                        "payment_history": ctx.payment_history,
+                        "provider_retry_eligible_at_open": True,
+                    },
+                    now=engine.logical_time,
+                ))
             return {
                 "case_id": body["case_id"],
                 "obligation_id": obligation_id,

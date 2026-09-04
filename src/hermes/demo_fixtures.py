@@ -17,6 +17,13 @@ from dataclasses import dataclass
 DEMO_SIGNING_SECRET_ENV = "HERMES_DEMO_SIGNING_SECRET"
 CASE3_STEP_HOURS = 24  # logical hours each "advance time" step moves the clock
 
+# Audit kind stamped once, server-side, when ``/demo/case`` opens a demo case.
+# It is the ONLY proof that a persisted case was created by the trusted demo
+# path: restart reconstruction rebuilds merchant context / provider retry facts
+# only for cases carrying this record. An obligation-name prefix is never
+# trusted - an external payload can invent ``sub_demo_...`` identifiers.
+DEMO_PROVENANCE_KIND = "DEMO_CASE_PROVENANCE"
+
 
 def new_demo_signing_secret() -> str:
     """A fresh local secret for signing *simulated* ingress. Explicitly not the
