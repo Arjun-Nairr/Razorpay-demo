@@ -84,12 +84,40 @@ These values are configuration, not prompt instructions:
 | Recovery links per case | 1 |
 | Payment-method update requests per case | 1 |
 | Maximum AI schema/timeout retry | 1 |
-| Maximum proposed wait | 72 logical hours |
+| Maximum proposed wait (single) | 72 logical hours |
+| Maximum cumulative wait per case | 72 logical hours |
+| Bounded model calls in flight | 2 |
 | Grace before access-hold recommendation | 72 logical hours after confirmed nonpayment |
 | Work-loop steps per `run` call | 50 |
 
 Provider-native retry eligibility and limits remain authoritative. Hermes does
 not invent or bypass a Razorpay retry.
+
+### Retry eligibility vs. prior failures (clarification)
+
+`provider_retry_eligible` (a live provider fact) and `retry_outcome_recorded`
+(history: at least one prior retry outcome exists) are independent. A prior
+failed retry does **not** mean provider retries are exhausted - both can be
+true at once. So:
+
+- A `WAIT_FOR_PROVIDER_RETRY` proposal is allowed whenever the provider
+  *currently* reports eligible **and** the case's cumulative authorized wait is
+  under the 72-hour ceiling. `retry_outcome_recorded` alone never blocks a wait.
+- Once cumulative wait reaches the ceiling, further waits are `BLOCK`
+  `total_wait_bound_reached` regardless of eligibility - this is the
+  deterministic stop for an endless wait loop.
+- A future real provider integration must read current eligibility, the prior
+  attempt count/outcomes, and the next scheduled retry from retrievable
+  provider evidence, and must not synthesise a "retries remaining" number
+  Razorpay does not expose.
+
+### Customer message copy
+
+Real model output may only reuse a **deterministic approved template** for
+`message_intent` (see `src/hermes/message_templates.py`). The engine rejects
+any other `message_intent` as invalid strategist output. No customer message is
+actually sent in this build; the recovery intervention is simulated and
+labelled `SIMULATED`.
 
 ## Policy evaluation order
 

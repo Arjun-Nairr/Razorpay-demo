@@ -183,8 +183,19 @@ class InMemoryLedger:
         self._recovered_minor: int = 0
         self._action_intents: dict[str, ActionIntent] = {}
         self._intents_by_key: dict[tuple[str, str], str] = {}  # (case_id, key) -> intent_id
+        self._clock: int = 0  # persisted logical hour
         self._seq = 0
         self._id_seq = 0
+
+    # -- persisted logical clock -----------------------------------------
+
+    def logical_clock(self) -> int:
+        return self._clock
+
+    def advance_clock(self, now: int) -> None:
+        if now < self._clock:
+            raise ValueError(f"logical time cannot move backward: {now} < {self._clock}")
+        self._clock = now
 
     # -- reads ---------------------------------------------------------
 
@@ -206,6 +217,7 @@ class InMemoryLedger:
             messages_sent=c.messages_sent,
             links_created=c.links_created,
             actions_taken=c.actions_taken,
+            total_wait_hours=c.total_wait_hours,
             last_contact_time=c.last_contact_time,
             attribution=c.attribution,
             prior_action=c.last_proposal_action,
@@ -269,6 +281,7 @@ class InMemoryLedger:
             messages_sent=c.messages_sent,
             links_created=c.links_created,
             actions_taken=c.actions_taken,
+            total_wait_hours=c.total_wait_hours,
             attribution=c.attribution,
             recovered_minor=c.amount_minor if c.counted else 0,
             action_intents=tuple(
@@ -457,6 +470,7 @@ class InMemoryLedger:
             case.state = CaseState.WAITING
             case.version += 1
             due = decision.scheduled_time if decision.scheduled_time is not None else cmd.now
+            case.total_wait_hours += max(0, due - cmd.now)  # cumulative wait budget spent
             wid = self._next_id("work")
             self._work[wid] = ScheduledWork(
                 work_id=wid, case_id=case.case_id, due_time=due, attempts=0

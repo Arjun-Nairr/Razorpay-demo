@@ -252,6 +252,7 @@ class HermesStrategist:
         max_repair_attempts: int = 1,
         api_key_env: str = DEFAULT_API_KEY_ENV,
         transport_factory: Callable[[], _Transport] | None = None,
+        max_in_flight: int = 2,
     ) -> None:
         self._model = model
         self._timeout_s = float(timeout_s)
@@ -259,6 +260,12 @@ class HermesStrategist:
         self._max_repair_attempts = 1 if int(max_repair_attempts) >= 1 else 0
         self._api_key_env = api_key_env
         self._transport_factory = transport_factory
+        # Caps the number of model-call worker threads alive at once. A slot is
+        # held until the worker thread *finishes* (even one abandoned after a
+        # timeout), so repeated timeouts cannot pile up unbounded live threads;
+        # a call that cannot get a slot within the timeout budget raises
+        # TimeoutError like any other overrun.
+        self._slots = threading.BoundedSemaphore(max(1, int(max_in_flight)))
         self._last_run_meta: StrategistRunMeta | None = None
 
     @property
@@ -343,6 +350,9 @@ class HermesStrategist:
         eventual result or exception is discarded. No executor, so no
         ``shutdown(wait=True)`` and no ``atexit`` join.
         """
+        if not self._slots.acquire(timeout=self._timeout_s):
+            raise TimeoutError("strategist concurrency limit reached")
+
         box: dict[str, Any] = {}
 
         def _worker() -> None:
@@ -350,6 +360,8 @@ class HermesStrategist:
                 box["result"] = transport.generate(system=_SYSTEM_PROMPT, user=user_prompt)
             except BaseException as exc:  # noqa: BLE001  captured, surfaced below
                 box["error"] = exc
+            finally:
+                self._slots.release()  # frees the slot only when THIS thread ends
 
         worker = threading.Thread(
             target=_worker, name="hermes-strategist-call", daemon=True

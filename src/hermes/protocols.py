@@ -50,6 +50,14 @@ class PaymentProvider(Protocol):
 
 
 class Ledger(Protocol):
+    # -- persisted logical clock -----------------------------------------
+    def logical_clock(self) -> int: ...
+    # The last advanced logical hour. Survives process restart for a durable
+    # ledger; the engine reads this at construction so demo time is not lost.
+
+    def advance_clock(self, now: int) -> None: ...
+    # Monotonic: `now` must be >= the current value. Persisted atomically.
+
     # -- reads --------------------------------------------------------------
     def has_seen_event(self, event_id: str) -> bool: ...
 

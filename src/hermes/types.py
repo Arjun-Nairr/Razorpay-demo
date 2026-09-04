@@ -120,6 +120,7 @@ class StrategySnapshot:
     messages_remaining: int = 0
     links_remaining: int = 0
     actions_remaining: int = 0
+    wait_hours_remaining: int = 0  # cumulative wait budget left before the total bound
     prior_action: str | None = None  # last proposal's action, across cycles
     prior_policy_outcome: str | None = None  # last policy decision's outcome
 
@@ -221,6 +222,7 @@ class Case:
     messages_sent: int = 0
     links_created: int = 0
     actions_taken: int = 0
+    total_wait_hours: int = 0  # cumulative logical hours authorized across all waits
     last_contact_time: int | None = None  # logical hour of the last authorized message
     link_references: frozenset[str] = field(default_factory=frozenset)
     attribution: str | None = None  # one Attribution value, set at termination
@@ -281,6 +283,7 @@ AUDIT_TERMINAL_TRANSITION = "TERMINAL_TRANSITION"
 AUDIT_RETRY_OUTCOME = "RETRY_OUTCOME_RECORDED"  # a failed provider-retry outcome woke the case
 AUDIT_ACTION_INTENT = "ACTION_INTENT"  # a durable action intent was persisted, pre-effect
 AUDIT_ACTION_OUTCOME = "ACTION_OUTCOME"  # the fake effect executed; intent marked complete
+AUDIT_AI_MODEL_RUN = "AI_MODEL_RUN"  # decision-linked model metadata (model, latency, validation)
 
 
 # --- ledger reads: frozen snapshots ---------------------------------------
@@ -302,6 +305,7 @@ class CaseSnapshot:
     messages_sent: int = 0
     links_created: int = 0
     actions_taken: int = 0
+    total_wait_hours: int = 0
     last_contact_time: int | None = None
     attribution: str | None = None
     prior_action: str | None = None
@@ -510,6 +514,7 @@ class CaseProjection:
     messages_sent: int = 0
     links_created: int = 0
     actions_taken: int = 0
+    total_wait_hours: int = 0
     attribution: str | None = None
     recovered_minor: int = 0  # this case's own contribution; amount_minor iff counted
     action_intents: tuple[ActionIntentProjection, ...] = ()

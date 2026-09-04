@@ -15,8 +15,10 @@ another runner has since won is rejected as stale with no effect.
 
 from __future__ import annotations
 
+from .message_templates import is_approved_message_intent
 from .protocols import Ledger, PaymentProvider, Strategist
 from .types import (
+    AUDIT_AI_MODEL_RUN,
     AUDIT_INPUT_EVENT,
     AUDIT_POLICY_DECISION,
     ActionIntentOutcomeCommand,
@@ -49,13 +51,20 @@ from .types import (
 )
 
 WORK_LOOP_LIMIT = 50  # steps per run() call
-MAX_WAIT_HOURS = 72
+MAX_WAIT_HOURS = 72  # ceiling on a SINGLE proposed wait
 
 # POLICY_SPEC.md default deterministic limits (configuration, not prompt text).
 MAX_ACTIONS_PER_CASE = 3
 MAX_MESSAGES_PER_CASE = 2
 MESSAGE_COOLDOWN_HOURS = 24
 MAX_LINKS_PER_CASE = 1
+# Deterministic ceiling on the CUMULATIVE wait a single case may accrue across
+# every authorized WAIT_FOR_PROVIDER_RETRY. Current provider retry eligibility
+# stays the primary gate; a recorded prior failed retry does NOT by itself mean
+# retries are exhausted (see POLICY_SPEC.md "Wait for provider retry"). This
+# bound is what stops an endless wait loop if the model keeps proposing waits
+# while the provider keeps reporting eligible.
+MAX_TOTAL_WAIT_HOURS = 72
 # Substrings a strategist must never put in message_intent - it may propose
 # reminder copy, never a URL, amount, provider id, discount, or commercial term.
 _MESSAGE_INTENT_FORBIDDEN = ("http://", "https://", "₹", "$")
@@ -80,6 +89,11 @@ def _validate_proposal(obj: object) -> StrategyProposal:
                 "message_intent must not contain a URL, amount, or provider "
                 f"identifier: {obj.message_intent!r}"
             )
+        # Real model output may only reuse a deterministic approved template -
+        # never free-form customer copy. (The scripted strategist's own message
+        # is on the allowlist, so offline behaviour is unchanged.)
+        if not is_approved_message_intent(obj.message_intent):
+            raise InvalidProposal("message_intent is not an approved template")
     return obj
 
 
@@ -108,7 +122,10 @@ def authorize(
     if proposal.action is ProposalAction.WAIT_FOR_PROVIDER_RETRY:
         if not retry_fact.retry_eligible or retry_fact.evidence is None:
             return PolicyDecision(PolicyOutcome.BLOCK, "provider_retry_ineligible")
-        wait = max(0, min(proposal.proposed_wait_hours, MAX_WAIT_HOURS))
+        remaining = MAX_TOTAL_WAIT_HOURS - case.total_wait_hours
+        if remaining <= 0:
+            return PolicyDecision(PolicyOutcome.BLOCK, "total_wait_bound_reached")
+        wait = max(0, min(proposal.proposed_wait_hours, MAX_WAIT_HOURS, remaining))
         return PolicyDecision(
             PolicyOutcome.ALLOW, "provider_retry_permitted", scheduled_time=now + wait
         )
@@ -176,7 +193,13 @@ class RecoveryEngine:
         self._ledger = ledger
         self._strategist = strategist
         self._razorpay = razorpay
-        self._clock = 0  # monotonic logical hour
+        # Resume the persisted logical clock so a restarted demo does not lose time.
+        self._clock = ledger.logical_clock()
+
+    @property
+    def logical_time(self) -> int:
+        """The current logical hour (resumed from the ledger, advanced by run)."""
+        return self._clock
 
     # -- receive ---------------------------------------------------------
 
@@ -303,6 +326,7 @@ class RecoveryEngine:
             )
         self._clock = until
         led = self._ledger
+        led.advance_clock(until)  # persist the advanced clock before any work
         steps = proposals = failures = scheduled = blocked = stale = 0
 
         # claim_due_work leases at most one item and never returns work another
@@ -328,6 +352,7 @@ class RecoveryEngine:
                     self._strategist.propose(self._snapshot(snap, retry_fact))
                 )
             except Exception as exc:  # raised / timed out / invalid output
+                self._note_model_run(claim.case_id, error=type(exc).__name__)
                 result = led.apply_strategist_failure(
                     self._failure_cmd(claim, type(exc).__name__)
                 )
@@ -338,6 +363,7 @@ class RecoveryEngine:
                 scheduled += int(result.scheduled)
                 continue
 
+            self._note_model_run(claim.case_id)
             decision = authorize(proposal, snap, self._clock, retry_fact)
             result = led.apply_evaluation(
                 EvaluationCommand(
@@ -426,8 +452,37 @@ class RecoveryEngine:
             messages_remaining=max(0, MAX_MESSAGES_PER_CASE - snap.messages_sent),
             links_remaining=max(0, MAX_LINKS_PER_CASE - snap.links_created),
             actions_remaining=max(0, MAX_ACTIONS_PER_CASE - snap.actions_taken),
+            wait_hours_remaining=max(0, MAX_TOTAL_WAIT_HOURS - snap.total_wait_hours),
             prior_action=snap.prior_action,
             prior_policy_outcome=snap.prior_policy_outcome,
+        )
+
+    def _note_model_run(self, case_id: str, *, error: str | None = None) -> None:
+        """Append decision-linked model-run metadata to the audit trail when the
+        strategist exposes a ``last_run_meta`` attribute (a live LLM strategist
+        does; a scripted one does not - then this is a no-op). Only safe fields
+        are recorded - model id, prompt version, latency, repair flag,
+        validation result, token usage - never the prompt, raw customer data,
+        or any credential. The engine still imports no concrete strategist.
+        """
+        meta = getattr(self._strategist, "last_run_meta", None)
+        if meta is None:
+            return
+        detail = {
+            "model": meta.model,
+            "prompt_version": meta.prompt_version,
+            "latency_ms": meta.latency_ms,
+            "repair_used": meta.repair_used,
+            "validation_result": meta.validation_result,
+            "usage": meta.usage,
+        }
+        if error is not None:
+            detail["engine_error"] = error
+        self._ledger.note_event(
+            NoteEventCommand(
+                case_id=case_id, event_id=None, kind=AUDIT_AI_MODEL_RUN,
+                detail=detail, now=self._clock,
+            )
         )
 
     def _discard_cmd(self, claim: WorkClaim, reason: str) -> DiscardWorkCommand:

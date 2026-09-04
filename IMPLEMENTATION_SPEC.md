@@ -13,10 +13,14 @@ financial authority.
 ## Solution
 
 Hermes is the merchant-side recovery operator above Razorpay. A deterministic
-context builder gives a fresh, isolated Hermes Agent instance a minimized,
-source-labelled snapshot. Gemini 3.7 Flash returns one candidate strategy.
-Deterministic policy authorizes, replaces, blocks, stops, escalates, or exhausts
-that proposal. Only verified, unique payments change recovered-value metrics.
+context builder gives the strategist a minimized, source-labelled snapshot per
+decision. **The strategist is a direct Gemini 3.7 Flash adapter** (`google-genai`)
+behind the `Strategist` protocol - the Nous Hermes Agent runtime was evaluated
+and not adopted (Iteration 06); a fresh client, no tools, no memory, one call,
+strict local schema validation, at most one repair, an application timeout, and
+bounded in-flight calls. Gemini returns one candidate strategy. Deterministic
+policy authorizes, replaces, blocks, stops, escalates, or exhausts that
+proposal. Only verified, unique payments change recovered-value metrics.
 
 The demo keeps five golden scenarios, but only one flow needs real or hybrid
 Razorpay Test Mode evidence. All accelerated multi-day outcomes are explicitly
@@ -59,11 +63,17 @@ simulated.
 - `RecoveryEngine.run` builds context deterministically, calls one
   `Strategist`, applies deterministic policy, and persists action intent before
   executing an effect.
-- `HermesStrategist` implements the existing `Strategist` protocol. It creates
-  a fresh isolated Hermes `AIAgent` per decision and uses Gemini 3.7 Flash.
-- Embedded Hermes output is parsed and Pydantic-validated locally; invalid
-  output executes nothing and receives at most one bounded repair attempt.
-- Streamlit reads stable projections through FastAPI. Direct read-only Neon
+- `HermesStrategist` implements the existing `Strategist` protocol using a
+  direct `google-genai` (Gemini 3.7 Flash) client - a fresh client per
+  decision, no tools, no memory, one `generate_content` call. (The Nous Hermes
+  `AIAgent` runtime is *not* used; see Iteration 06.)
+- Model output is parsed and validated locally with a strict hand-rolled
+  structural check; invalid output executes nothing and receives at most one
+  bounded repair attempt. An application-level timeout plus a bounded
+  concurrency slot cap the number of model-call worker threads alive at once.
+- `message_intent` may only be a deterministic approved template
+  (`message_templates.py`); free-form generated customer copy is rejected.
+- Streamlit reads stable projections through FastAPI. Direct read-only DB
   access is a deadline fallback only.
 
 ### Data and time
@@ -117,15 +127,21 @@ reactivate the original subscription.
    public seam with the insufficient-funds failed-retry outcome, reminder/link
    intent, communication limits, action outcomes, and attribution. Preserve
    Case 1.
-2. **Hermes runtime spike** — pin one Hermes commit, prove isolated Gemini
-   invocation, strict local schema validation, timeout/repair behavior, and
-   audit metadata through the `Strategist` protocol. Timebox aggressively.
-3. **FastAPI signed simulated ingress** — accept locally signed
-   Razorpay-shaped fixtures, preserve raw-body verification, deduplicate, and
-   expose engine projections/demo controls.
-4. **Shared persistence slice** — implement the ledger contract in Neon,
-   including authoritative logical time and action intents. Use SQLite only if
-   Neon blocks the deadline.
+2. **Strategist runtime spike** *(done, Iteration 06)* — the Nous Hermes
+   `AIAgent` runtime was not adoptable on Windows; shipped a direct
+   `google-genai` adapter behind the `Strategist` protocol with strict local
+   validation, timeout, ≤1 repair, and run metadata.
+3. **FastAPI signed simulated ingress** *(done, Iteration 07)* — locally signed
+   Razorpay-shaped fixtures, raw-body verification, dedup, engine projections /
+   demo controls.
+4. **Runnable Case 3 demo** *(done, Iteration 08)* — Postgres/Neon-persisted
+   ledger (snapshot store: the tested in-memory logic + a committed JSON
+   snapshot per write; persisted logical clock and pending work), the direct
+   Gemini strategist wired behind the engine in live mode (never silently
+   scripted), a deterministic cumulative-wait bound, approved message
+   templates, and a minimal Streamlit-through-FastAPI interface for one
+   operable insufficient-funds case that survives restart. SQLite only if Neon
+   blocks the deadline.
 5. **Razorpay Test Mode hybrid slice** — ingest at least one real signed event,
    reconcile provider truth, and label every real/simulated event explicitly.
 6. **Five-case dashboard slice** — run all five golden cases, show timelines,

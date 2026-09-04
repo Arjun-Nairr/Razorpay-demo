@@ -32,6 +32,20 @@ gemini = [
 api = [
   "fastapi==0.117.1",
   "httpx==0.28.1",  # required by fastapi.testclient.TestClient
+  "uvicorn==0.37.0",  # local ASGI server: uvicorn hermes.asgi:app
+]
+# Slice 4: durable ledger. psycopg 3 (binary wheel for a no-toolchain Windows
+# install), verified this iteration (project env has psycopg 3.3.4). The
+# Postgres-backed store is only touched in live mode / opt-in integration tests.
+db = [
+  "psycopg[binary]==3.3.4",
+]
+# Local demo UI (Streamlit through the FastAPI backend). Not installed or
+# import-verified this iteration; range-pinned. The user installs it for the
+# live demo; the offline suite never imports it.
+ui = [
+  "streamlit>=1.37,<2",
+  "requests>=2.32,<3",
 ]
 
 [tool.hatch.build.targets.wheel]

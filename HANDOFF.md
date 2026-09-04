@@ -40,20 +40,19 @@ requirements in `PROJECT_BRIEF.md`.
   expected-state capture guard is closed, the wait -> failed-retry -> changed-
   strategy -> recovery-link -> `hermes_assisted` path is proven end to end
   through `receive`/`run`/`inspect`, and Case 1's 36-test suite remains green.
-- Status: **Slice 3 (FastAPI signed simulated Razorpay ingress) complete**,
-  plus a safe-boundaries correction pass, on `feat/fastapi-simulated-ingress`
-  - see Iteration 07. Delivery adapter only (raw-body HMAC-SHA256 verify with
-  strict 64-hex format check, event-id dedup, normalization -> `SIMULATED`,
-  `consent`/`reachable_channel` forced `False`, strict 3-letter currency,
-  fixed non-echoing error strings, config rejects blank secret /
-  non-`SIMULATED` mode); `/health`, `/webhooks/razorpay`, `/demo/run`
-  (non-object body -> 400, no engine), `/cases/{id}`; new optional `[api]`
-  extra. **174 tests pass**; engine/types/Case 1/3 untouched.
-  `.env.example` now also has a blank `DATABASE_URL=` for the planned
-  Postgres/Neon ledger. `feat/hermes-runtime-spike` (`7ada2bb`, incl. the two
-  authorized sanitized commits) is on `origin`. Next: user adds the two local
-  credentials, then Codex review, then slice 4 (Neon persistence + Gemini
-  strategist integration).
+- Status: **Iteration 08 - the first runnable end-to-end Case 3 demo -
+  implemented and offline-tested** on `feat/fastapi-simulated-ingress`.
+  Postgres/Neon-persisted ledger (survives restart, persisted clock + pending
+  work), the direct Gemini strategist wired behind the engine in *live* mode
+  (never silently scripted), a deterministic cumulative-wait bound (72 logical
+  hours), approved message templates, and a Streamlit-through-FastAPI local UI
+  driving one insufficient-funds case: failure -> eligible wait -> failed retry
+  -> recovery link -> uniquely correlated simulated payment -> `hermes_assisted`
+  recovered. **201 tests pass, 1 skipped** (opt-in real-Postgres). New optional
+  extras `[db]`, `[ui]` (+ `uvicorn` in `[api]`). **NOT yet live-verified** -
+  the user runs Neon init + the live Gemini/Neon demo; nothing here connected
+  to Neon or called Gemini. Next: user runs it, then Codex review, then
+  Razorpay Test Mode hybrid slice.
 - Prior: Runtime spike (`IMPLEMENTATION_SPEC.md` slice 2) complete on
   `feat/hermes-runtime-spike`, plus two corrections passes. **Fallback path
   shipped**: a direct google-genai (Gemini 3.7 Flash) `HermesStrategist`
@@ -411,6 +410,165 @@ until then.
    local `.env`.
 4. Then: slice 3 - FastAPI signed simulated ingress (**done - see Iteration
    07 below**).
+
+## Iteration 08 — First runnable Case 3 demo (persistence + Gemini + UI)
+
+Branch `feat/fastapi-simulated-ingress` (continued). One coherent operable
+insufficient-funds case, offline-tested end to end. Cases 2/4/5 deliberately
+not attempted.
+
+### What now works (implemented + offline-tested)
+
+- **Durable ledger.** `src/hermes/pg_ledger.py`: `PgLedger` wraps the tested
+  `InMemoryLedger` (unchanged logic - all atomicity, event dedup, version/state
+  guards, action-intent ordering, deterministic attribution, unique-payment
+  accounting) and, after every mutating call, writes the whole ledger state as
+  one JSON document through a `SnapshotStore` in a single committed
+  transaction. Reads hit memory. A write failure rolls the in-memory state back
+  to the last committed snapshot and raises. `PostgresSnapshotStore` = one
+  JSONB row in a dedicated `hermes_demo` schema; `InMemorySnapshotStore` for
+  tests. **The persisted logical clock and pending work survive restart**
+  (`RecoveryEngine` now resumes `logical_clock()` from the ledger at
+  construction; `run()` calls `ledger.advance_clock()`).
+- **Repeatable non-destructive init.** `scripts/init_neon.py` -
+  `CREATE SCHEMA/TABLE IF NOT EXISTS` + one `INSERT ... ON CONFLICT DO NOTHING`.
+  No DROP/TRUNCATE/DELETE, nothing outside `hermes_demo`, safe to re-run, DSN
+  never printed.
+- **Runtime composition.** `src/hermes/runtime.py` `Settings.load(mode=)`
+  loads the gitignored root `.env` (shell env wins), validates without printing
+  any value (`describe()` reports presence only). `offline` = `InMemoryLedger`
+  + `ScriptedStrategist`. `live` = `PgLedger` over `DATABASE_URL` +
+  `HermesStrategist` over `GEMINI_API_KEY`; **missing credentials fail startup -
+  live never falls back to scripted proposals.** `src/hermes/asgi.py` is the
+  uvicorn entrypoint (`HERMES_MODE` env).
+- **Gemini wired into the engine/policy seam.** In live mode the real
+  `HermesStrategist` is the engine's strategist. The engine now appends a
+  decision-linked `AI_MODEL_RUN` audit record (model, prompt version, latency,
+  repair flag, validation result, token usage - never the prompt, customer
+  data, or a credential) on every successful proposal and on strategist
+  failure. Strict schema validation and ≤1 repair unchanged. `HermesStrategist`
+  gained `max_in_flight` (default 2): a `BoundedSemaphore` slot is held until
+  the model-call worker thread *finishes* (even one abandoned after a timeout),
+  so repeated timeouts cannot pile up unbounded live threads.
+- **Deterministic total wait/re-evaluation bound.** New `Case.total_wait_hours`
+  accrues every authorized wait; `authorize()` blocks
+  `WAIT_FOR_PROVIDER_RETRY` with `total_wait_bound_reached` once it hits
+  `MAX_TOTAL_WAIT_HOURS = 72`. Current provider eligibility stays the primary
+  gate; `retry_outcome_recorded` (history) never blocks a wait on its own -
+  see POLICY_SPEC.md "Retry eligibility vs. prior failures".
+- **Approved message templates.** `src/hermes/message_templates.py` -
+  `_validate_proposal` rejects any `message_intent` not verbatim on the
+  allowlist (the scripted strategist's own line is on it). No free-form
+  generated customer copy reaches policy.
+- **One Case 3 flow, honest.** `src/hermes/demo_fixtures.py` (labelled
+  `SYNTHETIC_DEMO_FIXTURE` merchant context, envelope builders, `demo_sign`).
+  `api.py` gains server-side `/demo/case`, `/demo/step` (`advance` /
+  `retry_failed` / `capture`), `/demo/case/{id}` (projection + chronological
+  timeline). Every simulated event is built + signed with the **demo** secret
+  (never Razorpay's - `RAZORPAY_WEBHOOK_SECRET` stays blank/deferred) and goes
+  through the same verified `_ingest`. Merchant consent/channel/history come
+  only from the trusted synthetic fixture keyed by obligation id, never from
+  the payload; absent -> contact denied. The capture step correlates the
+  simulated payment id to the recovery link's own reference -> `hermes_assisted`
+  (never implies the link settled the subscription). The demo shows the actual
+  proposal and policy result; a strategist failure escalates the case and is
+  shown, not papered over.
+- **Minimal local UI.** `scripts/demo_ui.py` (Streamlit) talks only to the
+  local FastAPI, holds no secret, disables buttons while a request is in
+  flight. Controls: start fresh case, advance time / inject next outcome,
+  inspect case + audit timeline, show proposal / policy / actions / attribution
+  / simulated recovered value, reopen a persisted case by id.
+- **Launcher.** `scripts/run_demo.ps1` starts uvicorn (background job) + the
+  Streamlit UI on localhost; Ctrl+C stops the UI and the script stops the API
+  job. Shutdown notes in the header.
+
+### Changed / new files
+
+- New: `src/hermes/{pg_ledger,runtime,asgi,demo_fixtures,message_templates}.py`;
+  `scripts/{init_neon.py,demo_ui.py,run_demo.ps1}`;
+  `tests/{test_pg_ledger,test_runtime,test_demo_flow,test_recovery_bounds,test_pg_integration}.py`.
+- Modified: `src/hermes/protocols.py` (`Ledger.logical_clock` / `advance_clock`);
+  `src/hermes/types.py` (`Case`/`CaseSnapshot`/`CaseProjection.total_wait_hours`,
+  `StrategySnapshot.wait_hours_remaining`, `AUDIT_AI_MODEL_RUN`);
+  `src/hermes/adapters.py` (`InMemoryLedger` clock methods; `total_wait_hours`
+  accrual in `apply_evaluation`);
+  `src/hermes/engine.py` (`MAX_TOTAL_WAIT_HOURS`, wait bound in `authorize`,
+  clock resume/advance, `_note_model_run`, `logical_time` property, message
+  allowlist in `_validate_proposal`);
+  `src/hermes/hermes_strategist.py` (`max_in_flight` bounded slot);
+  `src/hermes/api.py` (merchant-context registry, `_ingest` refactor,
+  `/demo/case|step|case/{id}`, `razorpay` param);
+  `pyproject.toml` (`[db]`, `[ui]`, `uvicorn` in `[api]`); `.env.example`
+  (`DATABASE_URL`, `HERMES_DEMO_SIGNING_SECRET`, `HERMES_STRATEGIST_MODEL`,
+  `HERMES_DEMO_SCHEMA`, deferred Razorpay keys as comments); `POLICY_SPEC.md`
+  and `IMPLEMENTATION_SPEC.md` (wait bound, retry-eligibility-vs-history,
+  message templates, obsolete "fresh isolated Hermes AIAgent" text corrected to
+  the direct google-genai adapter, tracer sequence updated).
+
+### Verification (offline)
+
+- `python -m pytest -q` -> **201 passed, 1 skipped** (the skip is
+  `tests/test_pg_integration.py`, which runs only with `HERMES_PG_TEST_DSN`
+  set). The 174 prior tests are all still green; Case 1/3 *behaviour* is
+  unchanged (they use the in-memory ledger and scripted strategist).
+- Covered by the new tests: dump/hydrate round-trip of a full Case 3 ledger;
+  `PgLedger` restart recovery + clock resume + a second case not erasing the
+  first; write-failure rollback; `advance_clock` monotonicity; full API->engine
+  Case 3 with a stubbed Gemini (happy path, `AI_MODEL_RUN` linkage + redaction,
+  duplicate capture no double-count, second fresh case isolation, honest
+  strategist-failure escalation, absent/present merchant context); `Settings`
+  validation + no-secret `describe()` + live-requires-credentials +
+  live-never-scripted + offline app `/health` + `/demo/case`; cumulative wait
+  bound (unit + through the engine); off-allowlist message rejection; scripted
+  message on allowlist; engine clock resume + no-backward.
+- `python -m compileall -q src tests scripts` -> clean.
+- `git diff --check` -> clean. Staged diff scanned: no real key / DSN / PEM;
+  only test literals (`demosig_*`, `postgresql://u:p@h`, `SECRET-PW` inside a
+  redaction assertion). `.env` remains gitignored and untracked (not opened).
+- `uvicorn hermes.asgi:app` in offline mode: `/health` 200 `SIMULATED`,
+  `/demo/case` + `/demo/step advance` verified via `TestClient` in-process
+  (no server bound).
+
+### Not verified live (the user runs these)
+
+- No connection to Neon, no `CREATE`/`INSERT` executed, no schema created.
+- No Gemini API call; the real `HermesStrategist` transport is unexercised
+  end to end this iteration (its shape was probed against `google-genai 2.22.0`
+  in a prior iteration).
+- Streamlit is **not installed or import-checked** here (`[ui]` is range-pinned).
+- `scripts/run_demo.ps1` (two-process launch) not executed.
+
+### Exact user commands (PowerShell, one at a time)
+
+```
+cd C:\Users\dwish\Documents\Codex\2026-09-02\fors\outputs\ai-revenue-recovery
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e ".[api,db,gemini,ui]"
+Remove-Item Env:GEMINI_API_KEY -ErrorAction SilentlyContinue
+```
+Then put `GEMINI_API_KEY` (your replacement key) and `DATABASE_URL` (Neon
+Connect-panel Postgres URL incl. `?sslmode=require`) in `.\.env`, and:
+```
+python scripts\init_neon.py
+.\scripts\run_demo.ps1
+```
+Open the Streamlit URL it prints (127.0.0.1:8501). "Start a fresh Case 3",
+then "Advance time" (eligible wait), "Inject failed retry", "Advance time"
+(recovery link), "Simulate recovery payment". Then stop with Ctrl+C in the
+launcher window (the script stops the API job); or `Get-Job | Stop-Job`.
+Offline (no credentials): `.\scripts\run_demo.ps1 -Mode offline`.
+Opt-in Postgres test: `$env:HERMES_PG_TEST_DSN = "<url>"; python -m pytest -q tests/test_pg_integration.py`.
+
+### Limitations / next
+
+- Snapshot-per-write ledger is demo-grade: correct and durable, but not
+  row-per-entity and not built for concurrent writers. A future real Neon slice
+  can migrate to normalized tables behind the same `Ledger` protocol.
+- `merchant_manual` attribution still has no reachable path.
+- Cases 2/4/5, real Razorpay Test Mode, real messaging - untouched.
+- Next: user runs the live demo; then Codex review; then the Razorpay Test
+  Mode hybrid slice.
 
 ## Iteration 07 — FastAPI signed simulated Razorpay ingress (slice 3)
 
