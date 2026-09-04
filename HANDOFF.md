@@ -1,6 +1,6 @@
 # Cross-Agent Handoff — current-state index
 
-Last updated: 2026-09-04 (Asia/Dubai), Iteration 17. Branch
+Last updated: 2026-09-04 (Asia/Dubai), Iteration 18. Branch
 `feat/isolated-hermes-agent`, latest commit at bottom. This file stays
 **under 300 lines**: it is an index, not a log. Detail lives in the linked
 docs; iteration-by-iteration history is in
@@ -33,10 +33,10 @@ index; it does **not** authorize implementation. History on demand: the archive.
 
 ## Authorization (current)
 
-- Apply two small Codex-reviewed corrections to the Razorpay Test Mode HYBRID
-  slice, offline only (this iteration). **No live Razorpay or Gemini call, no
-  new Neon case, no public tunnel.** ONE live hybrid test remains authorized
-  only after Codex reviews this correction.
+- Iteration 18: ONE live HYBRID attempt - webhook-only tunnel, real Hermes +
+  Gemini decisions, at most one real Razorpay Test Mode link, Neon writes.
+  **Explicitly stopped before payment** on a later Codex/user scope change:
+  the demo does not require a completed checkout - see below.
 - Earlier authorization (still valid, unchanged): local startup fixes and the
   ONE already-completed real Gemini-backed Hermes case against the existing
   `hermes_demo` Neon schema (`case-11` - preserved, re-verified unchanged).
@@ -83,7 +83,7 @@ the budget is spent, what's left (including ~0) is what the next step gets,
 never a re-granted window. Regression:
 `test_no_fresh_grace_period_after_connect_exhausts_the_budget`.
 
-## Razorpay Test Mode — HYBRID slice (Iterations 15–17, offline-tested only)
+## Razorpay Test Mode — HYBRID slice (Iterations 15–17: code + offline tests)
 
 Per [`RAZORPAY_TEST_SLICE.md`](RAZORPAY_TEST_SLICE.md). The simulated SaaS
 obligation, its 3/12-month history, and the accelerated failure/retry sequence
@@ -152,14 +152,45 @@ call, which alone proves actual API behavior.
   A raw `ngrok http 8000` forwards the whole port - do not use that alone;
   pair it with a reverse proxy that 404s everything else, or use a tool with
   native path-restricted ingress.
-- **User-only setup, still pending**: create a Razorpay **Test Mode** account/
-  key pair (`rzp_test_...`); set `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET` in
-  `.env`; add a webhook in the Razorpay Test Mode dashboard pointing at the
-  tunnel URL above, subscribed to **`payment_link.paid`** only, and set its
-  secret as `RAZORPAY_WEBHOOK_SECRET` in `.env`; set
-  `RAZORPAY_PROVIDER=hybrid_test_mode` and, only when ready to allow real
-  calls, `RAZORPAY_TEST_MODE_ENABLED=1`. Manual Test Mode checkout (opening
-  the link and paying with a Razorpay test card) remains a user step.
+- **User-only setup**: DONE this iteration - Test Mode key pair, webhook
+  (`payment_link.paid` only), `RAZORPAY_PROVIDER=hybrid_test_mode`,
+  `RAZORPAY_TEST_MODE_ENABLED=1` are all in `.env`. Manual Test Mode checkout
+  remains a user step and was **deliberately not completed** (see below).
+
+## Iteration 18 — one live attempt, stopped before payment (case-18)
+
+Webhook-only exposure: `scripts/webhook_relay.py` (new; 12 offline tests) is a
+loopback-only reverse proxy that serves **only** `POST /webhooks/razorpay-test`
+- every other path/method is rejected before touching the main app, and it
+holds no engine/DB/credentials of its own, so even an unrestricted tunnel
+pointed at it can never expose `/demo/*`/`/cases/*`/docs. An SSH reverse
+tunnel (`ssh -p 443 -R0:127.0.0.1:8100 free.pinggy.io`, no new binary/no pip -
+plain OpenSSH) exposed the relay publicly; verified end-to-end (locally and
+through the public URL) that unrelated paths 404, the wrong method on the
+right path 405s, and an unsigned `POST` reaches the real handler and gets a
+genuine `401`. One tunnel domain (`lhr.life`, via `localhost.run`) was
+connection-reset by local Avast Web Shield (confirmed: unrelated HTTPS sites
+worked, that specific domain didn't, even via raw TLS) - not touched/excluded,
+just switched to a working provider (`pinggy.io`).
+
+`scripts/run_one_hybrid_case.py` (new) drove ONE case through real Hermes +
+Gemini decisions only (never the simulated capture step). Result: **case-18**
+(obligation `sub_demo_0004_8e781337`) - decision 1: `WAIT_FOR_PROVIDER_RETRY`
+authorized; after the simulated failed-retry input, decision 2:
+`CREATE_RECOVERY_LINK` authorized -> ONE real Razorpay Test Mode Payment Link
+created (reference `plink_TY2urjqVCjkjvB`; URL persisted in Neon, not
+reproduced here). State: **`active`, `counted=false`, awaiting payment** -
+this is the honest, current, final state for this iteration.
+
+**Scope change mid-task (Codex/user): do not complete the checkout.** The demo
+does not require a paid live checkout; recording will use this saved evidence
+rather than depend on a live payment. Case-18 was left exactly as-is - no
+simulated capture, no forged webhook, no state edit. All three processes this
+task started were stopped by exact PID/port match (main app :8000, relay
+:8100, the one `ssh.exe` tunneling :8100) - nothing else was touched. Verified
+after stopping: ports 8000/8100 no longer listening, the public tunnel URL no
+longer resolves, and a direct Neon re-read shows case-18 unchanged (same
+version) - no write happened after shutdown.
 
 ## Verified evidence
 
@@ -179,11 +210,15 @@ call, which alone proves actual API behavior.
   entities agree with each other on an amount or currency that disagrees with
   the persisted case (rejected before any provider call), and a preserved
   fully-agreeing valid-event path.
-- Ledger/persistence code was **not touched** this iteration (only the
-  Razorpay adapter/webhook module and its tests) - `case-11` and the
-  snapshot schema are structurally unaffected; no fresh readback was needed
-  to confirm that. No new Neon case; no live Razorpay/Gemini call; no public
-  tunnel.
+- Ledger/persistence code was **not touched** in Iteration 17 (only the
+  Razorpay adapter/webhook module and its tests) - `case-11`'s snapshot schema
+  was structurally unaffected.
+- **Iteration 18**: `python -m pytest -q --ignore=tests/test_hermes_agent.py`
+  -> **308 passed, 3 skipped** (was 296; +12 `tests/test_webhook_relay.py`).
+  `compileall` + `git diff --check` clean. This iteration DID make live calls:
+  real Hermes/Gemini decisions, one real Razorpay Test Mode link, real Neon
+  writes for `case-18` - see the Iteration 18 section above for the actual
+  evidence and its intentionally-incomplete (awaiting payment) final state.
 
 ## Inspecting the persisted proof
 
@@ -204,19 +239,18 @@ hybrid_test_mode` (+ the three `RAZORPAY_*` secrets) before launch; leave
 
 ## Blockers
 
-- None blocking further offline work. Live hybrid verification is blocked on:
-  (1) Codex review of this slice, (2) the user provisioning a Razorpay Test
-  Mode key pair + webhook, (3) a path-restricted tunnel actually being started
-  (deliberately not done this iteration).
+- None technical. `case-18` intentionally sits `active`/awaiting payment by
+  explicit Codex/user decision - the recorded demo will use this saved
+  evidence rather than depend on a live checkout. Completing that checkout
+  later, if ever wanted, needs a fresh tunnel (the pinggy.io one from this
+  iteration was stopped and its URL no longer resolves) but NOT a new case.
 - `hermes` mode remains manual-control only (see backlog).
 
 ## Next action
 
-Codex review of the Iteration 17 corrections (offline evidence above). Then,
-per the backlog and per this prompt's own closing instruction: webhook/tunnel
-setup and ONE manual Test Mode checkout - not another feature phase. The
-three deferred exemplars (on-time / late / mixed-history) still wait until
-after that one verified hybrid flow. Keep future `HANDOFF.md` updates under
+Codex review of Iteration 18. No further live action planned against
+`case-18`. The three deferred exemplars (on-time / late / mixed-history)
+remain deferred per the backlog. Keep future `HANDOFF.md` updates under
 300 lines.
 
 ## Working-document links
