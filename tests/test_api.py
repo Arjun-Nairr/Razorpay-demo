@@ -92,7 +92,9 @@ def test_health():
     tc, _ = make_client()
     r = tc.get("/health")
     assert r.status_code == 200
-    assert r.json() == {"status": "ok", "evidence_mode": "SIMULATED"}
+    body = r.json()
+    assert body["status"] == "ok" and body["evidence_mode"] == "SIMULATED"
+    assert "mode" in body  # scripted-offline / live-gemini, shown honestly
 
 
 # --- valid signed payload ---------------------------------------------

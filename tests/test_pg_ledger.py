@@ -173,3 +173,114 @@ def test_advance_clock_is_monotonic():
     with pytest.raises(ValueError):
         led.advance_clock(4)
     assert led.logical_clock() == 10
+
+
+# --- correction 4: PostgresSnapshotStore rollback + single writer -------
+#     (fully offline via a fake psycopg module; real DB checks are opt-in
+#      in tests/test_pg_integration.py)
+
+
+class _FakeCursor:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        self._conn.calls.append(sql.strip().split()[0].upper())
+        if self._conn.fail_next:
+            self._conn.fail_next = False
+            self._conn.aborted = True
+            raise RuntimeError("simulated SQL error")
+        if self._conn.aborted:
+            raise RuntimeError("current transaction is aborted")
+        self._sql = sql
+
+    def fetchone(self):
+        if "pg_try_advisory_lock" in getattr(self, "_sql", ""):
+            return (self._conn.lock_grants.pop(0) if self._conn.lock_grants else True,)
+        if "SELECT data" in getattr(self, "_sql", ""):
+            return (self._conn.row,)  # (None,) or (dict,)
+        return (None,)
+
+    @property
+    def rowcount(self):
+        return self._conn.rowcount
+
+
+class _FakeConn:
+    def __init__(self, *, row=None, rowcount=1, lock_grants=None):
+        self.row = row
+        self.rowcount = rowcount
+        self.lock_grants = list(lock_grants) if lock_grants is not None else [True]
+        self.calls: list[str] = []
+        self.fail_next = False
+        self.aborted = False
+        self.closed = False
+
+    def cursor(self):
+        return _FakeCursor(self)
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        self.aborted = False
+        self.calls.append("ROLLBACK")
+
+    def close(self):
+        self.closed = True
+
+
+class _FakePsycopg:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def connect(self, dsn):
+        return self._conn
+
+
+def _empty_dump():
+    from hermes.pg_ledger import dump_ledger
+
+    return dump_ledger(InMemoryLedger())
+
+
+def _store(conn):
+    from hermes.pg_ledger import PostgresSnapshotStore
+
+    return PostgresSnapshotStore("postgresql://x", "hermes_demo_t", _psycopg=_FakePsycopg(conn))
+
+
+def test_postgres_store_rolls_back_and_stays_usable_after_a_write_error():
+    conn = _FakeConn(row=_empty_dump(), rowcount=1)
+    store = _store(conn)
+    conn.fail_next = True
+
+    with pytest.raises(RuntimeError):
+        store.write({"clock": 1})
+
+    assert "ROLLBACK" in conn.calls and conn.aborted is False  # connection restored
+    conn.calls.clear()
+    store.write({"clock": 2})  # a subsequent write now succeeds
+    assert "ROLLBACK" not in conn.calls
+
+
+def test_second_writer_is_refused_the_advisory_lock():
+    _store(_FakeConn(row=_empty_dump(), lock_grants=[True]))  # first holder: ok
+    denied_conn = _FakeConn(row=_empty_dump(), lock_grants=[False])
+    with pytest.raises(RuntimeError, match="writer lock"):
+        _store(denied_conn)
+    assert denied_conn.closed is True  # the refused connection is released
+
+
+def test_close_releases_the_advisory_lock():
+    conn = _FakeConn(row=_empty_dump(), lock_grants=[True])
+    store = _store(conn)
+    store.close()
+    assert "SELECT" in conn.calls  # pg_advisory_unlock issued
+    assert conn.closed is True

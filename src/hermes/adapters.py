@@ -205,6 +205,9 @@ class InMemoryLedger:
     def case_id_for_obligation(self, obligation_id: str) -> str | None:
         return self._by_obligation.get(obligation_id)
 
+    def case_ids(self) -> tuple[str, ...]:
+        return tuple(self._cases)
+
     def case_snapshot(self, case_id: str) -> CaseSnapshot:
         c = self._cases[case_id]
         return CaseSnapshot(

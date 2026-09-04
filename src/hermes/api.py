@@ -34,10 +34,15 @@ import hashlib
 import hmac
 import json
 import re
+import secrets
+import threading
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
+
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 
 from .demo_fixtures import (
     CASE3_STEP_HOURS,
@@ -46,6 +51,7 @@ from .demo_fixtures import (
     case3_merchant_context,
     demo_sign,
     failure_envelope,
+    mint_demo_ids,
 )
 from .engine import RecoveryEngine
 from .types import AuditQuery, CaseQuery, RazorpayWebhook, WebhookType
@@ -197,28 +203,46 @@ def _case_json(projection: Any) -> dict:
     return dataclasses.asdict(projection)
 
 
+def _safe_obligation(body: Any) -> str | None:
+    """Read ``payload.subscription.entity.id`` from an ALREADY-parsed body for
+    merchant-context lookup. Runs only after HMAC verification and after
+    ``json.loads``; ``normalize_event`` re-validates the shape."""
+    try:
+        obl = body["payload"]["subscription"]["entity"]["id"]
+        return obl if isinstance(obl, str) else None
+    except (KeyError, TypeError):
+        return None
+
+
 def _ingest(
     engine: RecoveryEngine,
     config: ApiConfig,
-    merchant_context: MerchantContext | None,
+    mctx_lookup: "Callable[[str], MerchantContext | None] | None",
     raw: bytes,
     signature: str | None,
     event_id: str | None,
 ) -> dict:
-    """Verify signature over raw bytes, require the event id, decode, normalize,
-    and hand the event to ``engine.receive``. Never runs the recovery loop.
-    Raises :class:`HTTPException` on any failure. Shared by the public webhook
-    route and the server-side demo steps (which sign with the demo secret)."""
+    """Verify signature over raw bytes FIRST, then require the event id, decode,
+    resolve trusted merchant context, normalize, and hand the event to
+    ``engine.receive``. Never runs the recovery loop. Raises
+    :class:`HTTPException` on any failure. Shared by the public webhook route
+    and the server-side demo steps (which sign with the demo secret).
+
+    An invalid or missing signature returns 401 *before* the body is parsed -
+    no JSON decode, no merchant-context lookup, no engine call.
+    """
     if not _signature_ok(config.webhook_secret, raw, signature):
         raise HTTPException(status_code=401, detail=_ERR_BAD_SIGNATURE)
     if not event_id or not event_id.strip():
         raise HTTPException(status_code=400, detail=_ERR_MISSING_EVENT_ID)
     try:
-        body = json.loads(raw)
+        body = json.loads(raw)  # only reached once the signature is verified
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail=_ERR_MALFORMED_JSON)
+    obligation_id = _safe_obligation(body)
+    mctx = mctx_lookup(obligation_id) if (mctx_lookup and obligation_id) else None
     try:
-        webhook = normalize_event(body, event_id, config, merchant_context)
+        webhook = normalize_event(body, event_id, config, mctx)
     except _UnsupportedEvent:
         raise HTTPException(status_code=422, detail=_ERR_UNSUPPORTED_EVENT)
     result = engine.receive(webhook)  # durable intake only
@@ -231,136 +255,12 @@ def _ingest(
     }
 
 
-def _peek_obligation(raw: bytes) -> str | None:
-    """Best-effort read of ``payload.subscription.entity.id`` for merchant-context
-    lookup only. Any problem -> ``None``; the real validation is in
-    :func:`normalize_event`, which still runs afterwards."""
-    try:
-        obl = json.loads(raw)["payload"]["subscription"]["entity"]["id"]
-        return obl if isinstance(obl, str) else None
-    except Exception:
-        return None
-
-
 _DEMO_ERR_UNAVAILABLE = "demo controls require the simulated provider"
 _DEMO_ERR_UNKNOWN_CASE = "unknown demo case"
 _DEMO_ERR_BAD_STEP = "step must be one of: advance, retry_failed, capture"
+_DEMO_ERR_RUN_BUSY = "a recovery run is already in progress; retry shortly"
+_DEMO_ERR_NO_LINK = "no authorized recovery link to pay"
 _DEMO_STEPS = ("advance", "retry_failed", "capture")
-
-
-def _wire_demo_routes(app: FastAPI, engine: RecoveryEngine, config: ApiConfig) -> None:
-    """Higher-level Case 3 controls for the local UI. Every simulated event is
-    built server-side and signed with the configured demo secret, then goes
-    through the same verified :func:`_ingest` path. The secret never leaves the
-    server. Needs ``app.state.razorpay`` (the simulated provider)."""
-
-    def _need_provider():
-        rp = app.state.razorpay
-        if rp is None:
-            raise HTTPException(status_code=503, detail=_DEMO_ERR_UNAVAILABLE)
-        return rp
-
-    def _next_serial() -> int:
-        app.state.demo_serial += 1
-        return app.state.demo_serial
-
-    def _signed_ingest(envelope: dict, event_id: str) -> dict:
-        raw = json.dumps(envelope).encode("utf-8")
-        sig = demo_sign(config.webhook_secret, raw)
-        return _ingest(engine, config, app.state.merchant_context.get(
-            envelope["payload"]["subscription"]["entity"]["id"]), raw, sig, event_id)
-
-    @app.post("/demo/case")
-    async def demo_start_case() -> dict:
-        """Start a fresh Case 3 (insufficient funds). Registers the trusted
-        synthetic merchant context, marks the provider retry currently eligible,
-        and ingests the initial signed ``payment.failed``. Does NOT run the loop.
-        Previous cases are untouched.
-        """
-        rp = _need_provider()
-        serial = _next_serial()
-        obligation_id = f"sub_demo_{serial:04d}"
-        ctx = case3_merchant_context(obligation_id)
-        app.state.merchant_context[obligation_id] = ctx
-        rp.set_retry_eligibility(obligation_id, True)  # provider currently allows a retry
-        body = _signed_ingest(
-            failure_envelope(obligation_id, payment_id=f"pay_demo_{serial:04d}_f0"),
-            event_id=f"evt_demo_{serial:04d}_f0",
-        )
-        return {
-            "case_id": body["case_id"],
-            "obligation_id": obligation_id,
-            "merchant_context": dataclasses.asdict(ctx),
-            "evidence_mode": body["evidence_mode"],
-        }
-
-    @app.post("/demo/step")
-    async def demo_step(request: Request) -> dict:
-        rp = _need_provider()
-        try:
-            payload = json.loads(await request.body() or b"{}")
-        except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail=_ERR_MALFORMED_JSON)
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail=_ERR_BODY_NOT_OBJECT)
-        case_id = payload.get("case_id")
-        step = payload.get("step")
-        if step not in _DEMO_STEPS:
-            raise HTTPException(status_code=400, detail=_DEMO_ERR_BAD_STEP)
-        try:
-            proj = engine.inspect(CaseQuery(case_id=case_id))
-        except KeyError:
-            raise HTTPException(status_code=404, detail=_DEMO_ERR_UNKNOWN_CASE)
-        obligation_id = proj.obligation_id
-        serial = obligation_id.split("_")[-1]
-
-        if step == "advance":
-            report = engine.run(until=engine.logical_time + CASE3_STEP_HOURS)
-            return {"step": step, "run": _run_json(report)}
-
-        if step == "retry_failed":
-            # The provider now reports no further retry currently scheduled (a
-            # legitimate provider state, distinct from "retries exhausted"). The
-            # prior failed attempt is recorded as history by intake.
-            rp.set_retry_eligibility(obligation_id, False)
-            self_serial = _next_serial()
-            _signed_ingest(
-                failure_envelope(obligation_id, payment_id=f"pay_demo_{serial}_r1"),
-                event_id=f"evt_demo_{serial}_r1_{self_serial}",
-            )
-            report = engine.run(until=engine.logical_time + CASE3_STEP_HOURS)
-            return {"step": step, "run": _run_json(report)}
-
-        # step == "capture": a uniquely correlated simulated payment on the
-        # authorized recovery link (payment id == the link's own reference).
-        proj = engine.inspect(CaseQuery(case_id=case_id))
-        link_ref = next(
-            (i.reference for i in proj.action_intents
-             if i.action == "CREATE_RECOVERY_LINK" and i.reference), None,
-        )
-        if link_ref is None:
-            raise HTTPException(status_code=409, detail="no authorized recovery link to pay")
-        body = _signed_ingest(
-            capture_envelope(obligation_id, payment_id=link_ref),
-            event_id=f"evt_demo_{serial}_cap",
-        )
-        return {"step": step, "capture": body}
-
-    @app.get("/demo/case/{case_id}")
-    def demo_case_view(case_id: str) -> dict:
-        try:
-            proj = engine.inspect(CaseQuery(case_id=case_id))
-        except KeyError:
-            raise HTTPException(status_code=404, detail=_DEMO_ERR_UNKNOWN_CASE)
-        audit = engine.inspect(AuditQuery(case_id=case_id))
-        return {
-            "case": _case_json(proj),
-            "timeline": [
-                {"seq": r.seq, "logical_time": r.logical_time, "kind": r.kind,
-                 "detail": r.detail}
-                for r in audit.records
-            ],
-        }
 
 
 def _run_json(report: Any) -> dict:
@@ -377,43 +277,198 @@ def create_app(
     engine: RecoveryEngine,
     config: ApiConfig,
     razorpay: Any | None = None,
+    merchant_context: dict | None = None,
+    demo_serial_start: int = 1,
+    mode_label: str = "scripted-offline",
+    on_shutdown: "Callable[[], None] | None" = None,
 ) -> FastAPI:
     """Build the ingress app around an injected engine and config.
 
     Re-validates ``config`` before wiring routes: a blank ``webhook_secret`` or
-    a non-``SIMULATED`` ``evidence_mode`` raises ``ValueError`` here, so a
-    misconfigured app never starts serving requests.
+    a non-``SIMULATED`` ``evidence_mode`` raises ``ValueError`` here.
 
-    ``razorpay`` (the simulated payment provider) is optional and only enables
-    the higher-level ``/demo/*`` controls used by the local UI; the pure ingress
-    routes work without it.
+    ``razorpay`` (the simulated payment provider) enables the ``/demo/*``
+    controls. ``merchant_context`` / ``demo_serial_start`` carry state
+    reconstructed from a persisted ledger so a restarted app keeps existing
+    cases usable and mints genuinely-new ones. ``mode_label`` is reported by
+    ``/health`` so the UI can show live-Gemini vs scripted honestly.
+    ``on_shutdown`` (e.g. ``ledger.close``) is called when the app stops.
+
+    Concurrency: the ledger serialises its own operations; a slow model call in
+    ``engine.run`` happens between ledger ops and holds no lock, so webhook
+    intake never waits for Gemini. A single non-blocking ``run_lock`` enforces
+    one recovery runner at a time. Blocking work runs in a threadpool so
+    ``/health`` stays responsive.
     """
     _validate_config(config)
-    app = FastAPI(title="Hermes simulated ingress", docs_url=None, redoc_url=None)
+
+    @asynccontextmanager
+    async def _lifespan(_app: FastAPI):
+        yield
+        if on_shutdown is not None:
+            try:
+                on_shutdown()
+            except Exception:  # pragma: no cover - best-effort cleanup
+                pass
+
+    app = FastAPI(title="Hermes simulated ingress", docs_url=None, redoc_url=None,
+                  lifespan=_lifespan)
     app.state.engine = engine
     app.state.config = config
     app.state.razorpay = razorpay
-    app.state.merchant_context = {}  # obligation_id -> MerchantContext (demo only)
-    app.state.demo_serial = 0  # monotonic id source for demo-minted event ids
+    app.state.mode_label = mode_label
+    app.state.merchant_context = dict(merchant_context or {})
+    app.state.demo_serial = max(1, int(demo_serial_start)) - 1
+    app.state.run_lock = threading.Lock()  # one recovery runner at a time
+
+    def _mctx_lookup(obligation_id: str) -> "MerchantContext | None":
+        return app.state.merchant_context.get(obligation_id)
+
+    def _signed_ingest(envelope: dict, event_id: str) -> dict:
+        raw = json.dumps(envelope).encode("utf-8")
+        sig = demo_sign(config.webhook_secret, raw)
+        return _ingest(engine, config, _mctx_lookup, raw, sig, event_id)
+
+    def _need_provider():
+        rp = app.state.razorpay
+        if rp is None:
+            raise HTTPException(status_code=503, detail=_DEMO_ERR_UNAVAILABLE)
+        return rp
+
+    def _next_serial() -> int:
+        app.state.demo_serial += 1
+        return app.state.demo_serial
+
+    # -- health (never touches the engine; stays fast) -------------------
 
     @app.get("/health")
     def health() -> dict:
-        return {"status": "ok", "evidence_mode": config.evidence_mode}
+        return {
+            "status": "ok",
+            "evidence_mode": config.evidence_mode,
+            "mode": app.state.mode_label,
+        }
+
+    # -- public webhook: signature over raw bytes BEFORE any parsing ----
 
     @app.post("/webhooks/razorpay")
     async def razorpay_webhook(request: Request) -> dict:
-        raw = await request.body()  # exact raw bytes, before any decode
-        # A trusted merchant context is only ever registered by an explicit
-        # /demo control, keyed by obligation id - never from this payload.
-        body_obl = _peek_obligation(raw)
-        mctx = app.state.merchant_context.get(body_obl) if body_obl else None
-        return _ingest(
-            engine, config, mctx, raw,
-            request.headers.get("x-razorpay-signature"),
-            request.headers.get("x-razorpay-event-id"),
+        raw = await request.body()
+        signature = request.headers.get("x-razorpay-signature")
+        event_id = request.headers.get("x-razorpay-event-id")
+        # Off the event loop; the ledger serialises intake, so this does not
+        # wait for any in-progress model call.
+        return await run_in_threadpool(
+            _ingest, engine, config, _mctx_lookup, raw, signature, event_id
         )
 
-    _wire_demo_routes(app, engine, config)
+    # -- demo controls -------------------------------------------------
+
+    @app.post("/demo/case")
+    async def demo_start_case() -> dict:
+        rp = _need_provider()
+
+        def _sync() -> dict:
+            serial = _next_serial()
+            obligation_id, _tok = mint_demo_ids(serial)
+            ctx = case3_merchant_context(obligation_id)
+            app.state.merchant_context[obligation_id] = ctx
+            rp.set_retry_eligibility(obligation_id, True)
+            body = _signed_ingest(
+                failure_envelope(obligation_id, payment_id=f"pay_{obligation_id}_f0"),
+                event_id=f"evt_{obligation_id}_f0",
+            )
+            return {
+                "case_id": body["case_id"],
+                "obligation_id": obligation_id,
+                "merchant_context": dataclasses.asdict(ctx),
+                "evidence_mode": body["evidence_mode"],
+                "mode": app.state.mode_label,
+            }
+
+        return await run_in_threadpool(_sync)
+
+    @app.post("/demo/step")
+    async def demo_step(request: Request) -> dict:
+        rp = _need_provider()
+        try:
+            payload = json.loads(await request.body() or b"{}")
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail=_ERR_MALFORMED_JSON)
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail=_ERR_BODY_NOT_OBJECT)
+        case_id = payload.get("case_id")
+        step = payload.get("step")
+        if step not in _DEMO_STEPS:
+            raise HTTPException(status_code=400, detail=_DEMO_ERR_BAD_STEP)
+
+        def _resolve_obl() -> str:
+            try:
+                return engine.inspect(CaseQuery(case_id=case_id)).obligation_id
+            except KeyError:
+                raise HTTPException(status_code=404, detail=_DEMO_ERR_UNKNOWN_CASE)
+
+        if step == "capture":
+            def _sync_capture() -> dict:
+                obligation_id = _resolve_obl()
+                proj = engine.inspect(CaseQuery(case_id=case_id))
+                link_ref = next(
+                    (i.reference for i in proj.action_intents
+                     if i.action == "CREATE_RECOVERY_LINK" and i.reference), None,
+                )
+                if link_ref is None:
+                    raise HTTPException(status_code=409, detail=_DEMO_ERR_NO_LINK)
+                body = _signed_ingest(
+                    capture_envelope(obligation_id, payment_id=link_ref),
+                    event_id=f"evt_{obligation_id}_cap",  # stable: replays dedupe
+                )
+                return {"step": step, "capture": body}
+
+            return await run_in_threadpool(_sync_capture)
+
+        # advance / retry_failed both drive engine.run -> one runner at a time.
+        if not app.state.run_lock.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail=_DEMO_ERR_RUN_BUSY)
+
+        def _sync_run() -> dict:
+            try:
+                obligation_id = _resolve_obl()
+                if step == "retry_failed":
+                    # Provider now reports no further retry currently scheduled
+                    # (legitimate; NOT "retries exhausted"). History is recorded
+                    # by intake as retry_outcome_recorded.
+                    rp.set_retry_eligibility(obligation_id, False)
+                    _signed_ingest(
+                        failure_envelope(
+                            obligation_id, payment_id=f"pay_{obligation_id}_r1"),
+                        event_id=f"evt_{obligation_id}_r1_{secrets.token_hex(3)}",
+                    )
+                report = engine.run(until=engine.logical_time + CASE3_STEP_HOURS)
+                return {"step": step, "run": _run_json(report)}
+            finally:
+                app.state.run_lock.release()
+
+        return await run_in_threadpool(_sync_run)
+
+    @app.get("/demo/case/{case_id}")
+    async def demo_case_view(case_id: str) -> dict:
+        def _sync() -> dict:
+            try:
+                proj = engine.inspect(CaseQuery(case_id=case_id))
+            except KeyError:
+                raise HTTPException(status_code=404, detail=_DEMO_ERR_UNKNOWN_CASE)
+            audit = engine.inspect(AuditQuery(case_id=case_id))
+            return {
+                "case": _case_json(proj),
+                "mode": app.state.mode_label,
+                "timeline": [
+                    {"seq": r.seq, "logical_time": r.logical_time, "kind": r.kind,
+                     "detail": r.detail}
+                    for r in audit.records
+                ],
+            }
+
+        return await run_in_threadpool(_sync)
 
     @app.post("/demo/run")
     async def demo_run(request: Request) -> dict:
@@ -421,31 +476,33 @@ def create_app(
             body = json.loads(await request.body() or b"{}")
         except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail=_ERR_MALFORMED_JSON)
-        if not isinstance(body, dict):  # arrays / null / strings / numbers
+        if not isinstance(body, dict):
             raise HTTPException(status_code=400, detail=_ERR_BODY_NOT_OBJECT)
         until = body.get("until")
         if isinstance(until, bool) or not isinstance(until, int):
             raise HTTPException(status_code=400, detail=_ERR_UNTIL_NOT_INT)
+        if not app.state.run_lock.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail=_DEMO_ERR_RUN_BUSY)
+
+        def _sync() -> dict:
+            try:
+                return _run_json(engine.run(until=until))
+            finally:
+                app.state.run_lock.release()
+
         try:
-            report = engine.run(until=until)
+            return await run_in_threadpool(_sync)
         except ValueError:
             raise HTTPException(status_code=409, detail=_ERR_TIME_BACKWARD)
-        return {
-            "logical_time": report.logical_time,
-            "steps": report.steps,
-            "proposals": report.proposals,
-            "strategist_failures": report.strategist_failures,
-            "scheduled": report.scheduled,
-            "blocked": report.blocked,
-            "stale_claims": report.stale_claims,
-        }
 
     @app.get("/cases/{case_id}")
-    def get_case(case_id: str) -> dict:
-        try:
-            projection = engine.inspect(CaseQuery(case_id=case_id))
-        except KeyError:
-            raise HTTPException(status_code=404, detail=_ERR_CASE_NOT_FOUND)
-        return _case_json(projection)
+    async def get_case(case_id: str) -> dict:
+        def _sync() -> dict:
+            try:
+                return _case_json(engine.inspect(CaseQuery(case_id=case_id)))
+            except KeyError:
+                raise HTTPException(status_code=404, detail=_ERR_CASE_NOT_FOUND)
+
+        return await run_in_threadpool(_sync)
 
     return app

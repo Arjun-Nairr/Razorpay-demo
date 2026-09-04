@@ -65,6 +65,10 @@ class Ledger(Protocol):
 
     def case_snapshot(self, case_id: str) -> CaseSnapshot: ...
 
+    def case_ids(self) -> Sequence[str]: ...
+    # Every case id currently in the ledger. Used only to reconstruct demo /
+    # provider state after a restart; not part of the recovery workflow.
+
     def claim_due_work(self, now: int) -> Sequence[WorkClaim]: ...
     # Claims at most one due item per call; a live lease is never stolen.
 

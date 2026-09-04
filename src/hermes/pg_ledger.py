@@ -23,8 +23,10 @@ EXISTS`` only - it never drops or resets anything.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import re
+import threading
 from typing import Any, Callable, Protocol
 
 from .adapters import InMemoryLedger
@@ -129,21 +131,62 @@ def _validate_schema(schema: str) -> str:
     return schema
 
 
+def _advisory_key(schema: str) -> int:
+    """A stable signed 64-bit key for ``pg_advisory_lock`` derived from the
+    schema name."""
+    return int.from_bytes(hashlib.sha256(schema.encode("utf-8")).digest()[:8],
+                          "big", signed=True)
+
+
 class PostgresSnapshotStore:
     """The real durable store: one JSONB row in ``<schema>.ledger_state``.
-    Requires ``psycopg`` (the optional ``[db]`` extra) - imported lazily."""
+    Requires ``psycopg`` (the optional ``[db]`` extra) - imported lazily.
 
-    def __init__(self, dsn: str, schema: str = _DEFAULT_SCHEMA) -> None:
-        import psycopg  # noqa: PLC0415 - optional dependency, lazy
+    Single writer: on connect it takes a session-scoped ``pg_advisory_lock`` on
+    a key derived from the schema name. A second process opening the same
+    schema fails fast with a clear message instead of clobbering committed
+    state. The lock is released on :meth:`close` and, failing that, when the
+    session ends.
+
+    Every statement runs in a transaction that is rolled back on any error so
+    the connection stays usable (psycopg leaves a failed transaction aborted).
+    """
+
+    def __init__(self, dsn: str, schema: str = _DEFAULT_SCHEMA,
+                 *, _psycopg: Any | None = None) -> None:
+        psycopg = _psycopg
+        if psycopg is None:
+            import psycopg  # noqa: PLC0415 - optional dependency, lazy
 
         self._schema = _validate_schema(schema)
+        self._key = _advisory_key(self._schema)
         self._conn = psycopg.connect(dsn)  # sslmode etc. carried in the DSN
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute("SELECT pg_try_advisory_lock(%s)", (self._key,))
+                got = bool(cur.fetchone()[0])
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            self._conn.close()
+            raise
+        if not got:
+            self._conn.close()
+            raise RuntimeError(
+                f"another process holds the demo writer lock for schema "
+                f"'{self._schema}'. Stop the other app, or use a different "
+                "HERMES_DEMO_SCHEMA."
+            )
 
     def read(self) -> dict[str, Any] | None:
-        with self._conn.cursor() as cur:
-            cur.execute(f"SELECT data FROM {self._schema}.ledger_state WHERE id = 1")
-            row = cur.fetchone()
-        self._conn.commit()
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(f"SELECT data FROM {self._schema}.ledger_state WHERE id = 1")
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
         if row is None:
             raise RuntimeError(
                 f"{self._schema}.ledger_state is not initialised - run "
@@ -153,17 +196,27 @@ class PostgresSnapshotStore:
 
     def write(self, data: dict[str, Any]) -> None:
         payload = json.dumps(data)
-        with self._conn.cursor() as cur:
-            cur.execute(
-                f"UPDATE {self._schema}.ledger_state "
-                f"SET data = %s::jsonb, updated_at = now() WHERE id = 1",
-                (payload,),
-            )
-            if cur.rowcount != 1:  # pragma: no cover - init guarantees the row
-                raise RuntimeError("ledger_state row missing; run init first")
-        self._conn.commit()
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE {self._schema}.ledger_state "
+                    f"SET data = %s::jsonb, updated_at = now() WHERE id = 1",
+                    (payload,),
+                )
+                if cur.rowcount != 1:  # pragma: no cover - init guarantees the row
+                    raise RuntimeError("ledger_state row missing; run init first")
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()  # keep the connection usable for a retry
+            raise
 
     def close(self) -> None:
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute("SELECT pg_advisory_unlock(%s)", (self._key,))
+            self._conn.commit()
+        except Exception:
+            pass
         self._conn.close()
 
 
@@ -179,7 +232,7 @@ class PgLedger:
     """
 
     _READS = frozenset({
-        "logical_clock", "has_seen_event", "case_id_for_obligation",
+        "logical_clock", "has_seen_event", "case_id_for_obligation", "case_ids",
         "case_snapshot", "case_projection", "batch_projection", "audit_projection",
     })
     _WRITES = frozenset({
@@ -192,28 +245,35 @@ class PgLedger:
         self._store = store
         self._mem = load_ledger(store.read())
         self._last_json = json.dumps(dump_ledger(self._mem))
+        self._lock = threading.RLock()  # serialises each op; NOT held across an
+        # engine's strategist call (that happens between ledger ops)
 
     def close(self) -> None:
-        self._store.close()
+        with self._lock:
+            self._store.close()
 
     # -- delegation --------------------------------------------------
 
     def _delegate(self, name: str) -> Callable[..., Any]:
         method = getattr(self._mem, name)
         if name in self._READS:
-            return method
+            def _read(*args: Any, **kwargs: Any) -> Any:
+                with self._lock:
+                    return method(*args, **kwargs)
+            return _read
         if name in self._WRITES:
             def _committed(*args: Any, **kwargs: Any) -> Any:
-                try:
-                    result = method(*args, **kwargs)
-                    new_json = json.dumps(dump_ledger(self._mem))
-                    self._store.write(json.loads(new_json))
-                    self._last_json = new_json
-                    return result
-                except BaseException:
-                    # restore the in-memory state to the last committed snapshot
-                    self._mem = load_ledger(json.loads(self._last_json))
-                    raise
+                with self._lock:
+                    try:
+                        result = method(*args, **kwargs)
+                        new_json = json.dumps(dump_ledger(self._mem))
+                        self._store.write(json.loads(new_json))
+                        self._last_json = new_json
+                        return result
+                    except BaseException:
+                        # restore the in-memory state to the last committed snapshot
+                        self._mem = load_ledger(json.loads(self._last_json))
+                        raise
             return _committed
         raise AttributeError(name)
 

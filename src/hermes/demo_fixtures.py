@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
 import secrets
 from dataclasses import dataclass
 
@@ -25,6 +26,24 @@ def new_demo_signing_secret() -> str:
 
 def demo_sign(secret: str, raw: bytes) -> str:
     return hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+
+
+def mint_demo_ids(serial: int) -> tuple[str, str]:
+    """Collision-safe ``(obligation_id, run_token)`` for a fresh demo case.
+
+    The obligation id keeps a zero-padded serial prefix (so a restart can
+    reconstruct "next serial" from existing ids) plus a random suffix, so even
+    a serial counter that was reset in a new process cannot reuse an id.
+    """
+    token = secrets.token_hex(4)
+    return f"sub_demo_{serial:04d}_{token}", token
+
+
+def demo_serial_of(obligation_id: str) -> int | None:
+    """Extract the serial prefix from an obligation id minted by
+    :func:`mint_demo_ids` (or the legacy ``sub_demo_NNNN`` form)."""
+    m = re.match(r"\Asub_demo_(\d{1,9})(?:_|\Z)", obligation_id)
+    return int(m.group(1)) if m else None
 
 
 @dataclass(frozen=True)

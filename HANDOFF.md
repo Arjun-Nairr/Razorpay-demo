@@ -1,6 +1,6 @@
 # Cross-Agent Handoff
 
-Last updated: 2026-09-03 (Asia/Dubai)
+Last updated: 2026-09-04 (Asia/Dubai)
 
 ## Goal and scope
 
@@ -40,7 +40,33 @@ requirements in `PROJECT_BRIEF.md`.
   expected-state capture guard is closed, the wait -> failed-retry -> changed-
   strategy -> recovery-link -> `hermes_assisted` path is proven end to end
   through `receive`/`run`/`inspect`, and Case 1's 36-test suite remains green.
-- Status: **Iteration 08 - the first runnable end-to-end Case 3 demo -
+- Status: **Iteration 09 - reviewed-demo-blocker corrections + first user-run
+  end-to-end test prep** on `fix/runnable-demo-boundaries` (branched from
+  `d2e6572`). Six review blockers fixed: (1) full demo state survives an
+  app restart by deterministic reconstruction from the durable ledger
+  (merchant context, provider retry eligibility, next serial) plus
+  collision-safe case/event IDs - the DB is never reset; (2) zero-hour waits
+  are a bounded failure, not a reschedule loop - `WAIT_FOR_PROVIDER_RETRY`
+  requires `proposed_wait_hours >= 1` within the remaining 72h budget;
+  (3) the Gemini prompt now carries the approved message templates verbatim
+  and `wait_hours_remaining`, validated inside the at-most-one-repair
+  boundary with deterministic engine validation still the final guard
+  (`PROMPT_VERSION` bumped); (4) `PostgresSnapshotStore` rolls back and stays
+  usable after a SQL error, and a session-scoped `pg_try_advisory_lock`
+  enforces a single DB writer per schema; (5) webhook HMAC verification runs
+  on the raw bytes before any `json.loads`; (6) blocking `engine.run` /
+  Gemini / Postgres work runs off the event loop via `run_in_threadpool`
+  with one non-blocking recovery-runner lock (409 if busy) and a per-op
+  ledger `RLock`. **219 tests pass, 3 skipped** (opt-in real-Postgres).
+  Offline launch verified locally: FastAPI `/health` ok
+  (`mode: scripted-offline`), full Case 3 flow to
+  `state=recovered attribution=hermes_assisted`, Streamlit headless serves
+  200, and `scripts/run_demo.ps1 -Mode offline` both aborts cleanly on a
+  forced API-startup failure (no UI opened) and runs the happy path with no
+  leftover listeners after shutdown. **Still NOT live-verified** - the user
+  runs Neon init + the live Gemini/Neon demo; nothing here connected to Neon
+  or called Gemini. See "Iteration 09" below for the exact user commands.
+- Prior status: **Iteration 08 - the first runnable end-to-end Case 3 demo -
   implemented and offline-tested** on `feat/fastapi-simulated-ingress`.
   Postgres/Neon-persisted ledger (survives restart, persisted clock + pending
   work), the direct Gemini strategist wired behind the engine in *live* mode
@@ -82,6 +108,171 @@ requirements in `PROJECT_BRIEF.md`.
   For the smoke script the user now keeps a **replacement** `GEMINI_API_KEY` in
   a local gitignored `.env` (the previously used key was disclosed in chat and
   must stay revoked); the key is never requested in or pasted into chat.
+
+## Iteration 09 — Reviewed-demo-blocker corrections + user-run test prep
+
+Branch `fix/runnable-demo-boundaries` from `d2e6572`. No new features, no new
+scenarios. Six review blockers fixed; existing tests were not weakened.
+
+### Fixes (each with a regression test)
+
+1. **Demo survives a full app restart.** `runtime._bootstrap_demo_state`
+   rebuilds the trusted synthetic context and simulated-provider state from
+   the durable ledger on startup: for every persisted case it re-derives the
+   Case 3 merchant context, sets provider retry eligibility from
+   `not retry_outcome_recorded`, and computes the next demo serial from the
+   max `sub_demo_NNNN_*` serial already stored. New case/event IDs are
+   collision-safe (`mint_demo_ids` -> `sub_demo_{serial:04d}_{token_hex(4)}`;
+   stable `evt_*` ids for the deterministic steps, random suffix only on the
+   injected failed retry). The database is **not** reset on boot.
+   Tests: `tests/test_demo_restart.py` - existing case keeps its facts and can
+   still finish; a fresh case is genuinely new; duplicate payment delivery
+   still cannot double-count, all across a shared snapshot store.
+2. **Zero-hour wait loophole closed.** `_validate_proposal` rejects
+   `WAIT_FOR_PROVIDER_RETRY` with `proposed_wait_hours < 1`; `authorize`
+   clamps the wait to `min(proposed, MAX_WAIT_HOURS, remaining_budget)` and
+   BLOCKs `wait_must_be_positive` / `total_wait_bound_reached` instead of
+   scheduling a zero-hour reschedule. Invalid model output follows the
+   bounded strategist-failure path (never silently rewritten to success).
+   Test: `tests/test_recovery_bounds.py::test_zero_hour_wait_is_a_bounded_failure_not_a_reschedule_loop`
+   (repeated runs + a fresh engine over the same store).
+3. **Gemini prompt/validation contract aligned.** `_SYSTEM_PROMPT` now lists
+   the approved message templates verbatim and the model must copy one
+   exactly or use `null`; `_context_facts` includes `wait_hours_remaining`;
+   `parse_proposal` validates the message choice and the `>= 1` wait inside
+   the at-most-one-repair boundary; `_validate_proposal` in the engine stays
+   the deterministic final guard. `PROMPT_VERSION = hermes-strategist/2026-09-04.1`.
+   Tests: `tests/test_hermes_strategist.py` - real `HermesStrategist` with an
+   injected transport: approved proposal reaches policy; an unapproved
+   message gets exactly one repair then succeeds; repeated invalid output
+   takes the safe failure path; the wait budget and approved list are present
+   in the model context.
+4. **Persisted state protected.** `PostgresSnapshotStore.read/write` wrap the
+   statement in try/except with `rollback()` so the connection stays usable
+   after a SQL error (in-memory `PgLedger` rollback retained). A
+   session-scoped `pg_try_advisory_lock` on a key derived from
+   `sha256(schema)` enforces a single writer per schema - a second app
+   raises `RuntimeError("...writer lock...")` instead of overwriting; the
+   lock is released on `close()`, wired through the FastAPI `lifespan`
+   shutdown (`on_shutdown=ledger.close`).
+   Tests: offline `tests/test_pg_ledger.py` (fake psycopg - rollback keeps the
+   store usable, second writer refused, close releases the lock); opt-in
+   `tests/test_pg_integration.py` against a real DSN.
+5. **Signature before parsing.** `_ingest` verifies the HMAC on the raw
+   request bytes first (401), then checks the event id, then `json.loads`,
+   then resolves trusted merchant context from the parsed id.
+   Test: `tests/test_api_concurrency.py::test_invalid_signature_never_triggers_json_parsing`
+   (monkeypatched `json.loads` raises if reached).
+6. **API stays responsive.** `/webhooks/razorpay` and the `/demo/*` runners
+   call `engine`/ledger work via `run_in_threadpool`; a single non-blocking
+   `threading.Lock` (`app.state.run_lock`, 409 when held) keeps one recovery
+   runner; `PgLedger` takes a per-op `RLock` (never across the strategist
+   call) so a slow model call does not block webhook intake.
+   Tests: `tests/test_api_concurrency.py` with a `DelayedStrategist` - health
+   stays < 1s under a 1.5s model call, a second run attempt gets 409, webhook
+   intake (incl. duplicate) returns in < 1s during a 2s model call.
+
+### Changed / new files
+
+- `src/hermes/runtime.py` - `_bootstrap_demo_state`, `demo_schema` setting,
+  `build_app` wires reconstruction + `on_shutdown=ledger.close`.
+- `src/hermes/api.py` - signature-first `_ingest`, `run_in_threadpool` on
+  blocking paths, `run_lock`, `lifespan` shutdown hook, `mode_label` /
+  `merchant_context` / `demo_serial_start` params, `mint_demo_ids` for
+  `/demo/case`.
+- `src/hermes/engine.py` - `proposed_wait_hours >= 1` guard, budget-clamped
+  `authorize` WAIT branch, persisted-clock resume on `receive`.
+- `src/hermes/hermes_strategist.py` - approved-template prompt block,
+  `wait_hours_remaining` in context, message + wait validation in
+  `parse_proposal`, `PROMPT_VERSION` bump, `max_in_flight` bounded semaphore.
+- `src/hermes/pg_ledger.py` - transactional `read/write` recovery, advisory
+  single-writer lock, per-op `RLock`, `case_ids` read.
+- `src/hermes/pg_ledger.py` / `adapters.py` / `protocols.py` - `case_ids()`
+  on the `Ledger` protocol and both implementations.
+- `src/hermes/demo_fixtures.py` - `mint_demo_ids`, `demo_serial_of`.
+- `src/hermes/asgi.py` - startup failure prints a clear stderr line
+  (mode + our own error text; generic hint for non-ours) and re-raises so
+  the launcher's health check aborts before opening the UI.
+- `scripts/run_demo.ps1` - `-Mode live|offline`, health-poll abort (no UI on
+  failure, prints the job's startup output), `PYTHONPATH=src` fallback,
+  `finally` job cleanup.
+- `scripts/demo_ui.py` - sidebar shows the execution `mode`
+  (`live-gemini` / `scripted-offline`); the proposal panel is titled
+  "actual Gemini output" only in live mode, "scripted offline reasoning,
+  no model call" otherwise; SIMULATED note on payments/links in both.
+- New: `tests/test_demo_restart.py`, `tests/test_api_concurrency.py`.
+- Modified tests: `test_recovery_bounds.py`, `test_hermes_strategist.py`,
+  `test_pg_ledger.py`, `test_pg_integration.py`, `test_api.py`.
+
+### Verification (offline, this machine)
+
+- `python -m pytest -q` -> **219 passed, 3 skipped** (all 3 skips are the
+  opt-in real-Postgres tests in `test_pg_integration.py`, gated on
+  `HERMES_PG_TEST_DSN`).
+- `python -m compileall -q src tests scripts` -> clean.
+- `git diff --check` -> clean (only LF->CRLF advisories).
+- Secret scan of the full diff + new files -> no keys, DSNs, or `.env`
+  contents. `.env` is untracked and gitignored.
+- Real uvicorn (`python -m uvicorn hermes.asgi:app`, offline): `/health` ->
+  `{"status":"ok","evidence_mode":"SIMULATED","mode":"scripted-offline"}`;
+  full Case 3 via `/demo/*` -> `state=recovered attribution=hermes_assisted
+  recovered_minor=1000000 messages_sent=1 links_created=1`; timeline ends
+  `... ACTION_OUTCOME, INPUT_EVENT, PAYMENT_CONFIRMATION, TERMINAL_TRANSITION`.
+- Streamlit headless (`python -m streamlit run scripts/demo_ui.py
+  --server.headless true`) -> serves 200, `/_stcore/health` 200.
+- `scripts/run_demo.ps1 -Mode offline`: forced startup failure
+  (`HERMES_DEMO_SCHEMA` invalid) -> prints "API did not become healthy" +
+  the job's startup error, does **not** start Streamlit; happy path ->
+  API healthy (`/health` mode `scripted-offline`), Streamlit serves on the
+  UI port, no listeners left on the API/UI ports after the process exits.
+
+### Not verified live (the user runs these)
+
+Nothing in this iteration connected to Neon or called Gemini. Live
+Neon persistence, the real advisory-lock single-writer behaviour against
+Neon, and live Gemini proposal/repair/validation remain user-run.
+
+### Exact user commands (PowerShell, one at a time)
+
+```
+cd C:\Users\dwish\Documents\Codex\2026-09-02\fors\outputs\ai-revenue-recovery
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e ".[api,db,gemini,ui]"
+Remove-Item Env:GEMINI_API_KEY -ErrorAction SilentlyContinue
+```
+Put `GEMINI_API_KEY` (your replacement key) and `DATABASE_URL` (Neon
+Connect-panel URL incl. `?sslmode=require`) in `.\.env`, then:
+```
+python scripts\init_neon.py
+.\scripts\run_demo.ps1
+```
+In the Streamlit URL it prints (127.0.0.1:8501): "Start a fresh Case 3",
+"Advance time" (eligible wait), "Inject failed retry", "Advance time"
+(recovery link), "Simulate recovery payment". Confirm the header shows
+**live-gemini** and every payment/intervention is labelled **SIMULATED**.
+Restart check: Ctrl+C in the launcher window, run `.\scripts\run_demo.ps1`
+again, reopen the UI - the finished case is still there with its facts, and
+"Start a fresh Case 3" makes a genuinely new `sub_demo_*` id.
+Offline (no credentials): `.\scripts\run_demo.ps1 -Mode offline`.
+Opt-in real-Neon tests:
+`$env:HERMES_PG_TEST_DSN = "<url>"; python -m pytest -q tests/test_pg_integration.py`.
+
+### Limitations / exact next action
+
+- Snapshot-per-write ledger stays demo-grade (durable + correct, single
+  writer only). Migrating to normalized per-entity tables behind the same
+  `Ledger` protocol is a later real-Neon slice.
+- `merchant_manual` attribution still has no reachable path; Cases 2/4/5 and
+  real Razorpay Test Mode / real messaging untouched.
+- `RecoveryEngine._clock` is refreshed from the ledger on `receive`; a
+  concurrent `receive` during an in-flight `run` could read a slightly stale
+  in-process clock. The persisted clock and the non-blocking run lock keep
+  this cosmetic (no double-count, no backward time write - `run` raises
+  `ValueError` -> 409). Documented, not fixed.
+- **Next action: the user runs the live demo above** (Neon init + live
+  Gemini), then Codex review of Iteration 09, then the Razorpay Test Mode
+  hybrid slice.
 
 ## Iteration 06 — Runtime spike: isolated Gemini strategist (fallback path)
 

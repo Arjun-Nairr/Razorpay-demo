@@ -45,9 +45,17 @@ def _call(method: str, path: str, **kw):
         ss.busy = False
 
 
+mode = "unknown"
 try:
     health = requests.get(f"{API}/health", timeout=5).json()
-    st.sidebar.success(f"API up · evidence_mode = {health.get('evidence_mode')}")
+    mode = health.get("mode", "unknown")
+    st.sidebar.success(
+        f"API up · evidence_mode = {health.get('evidence_mode')} · mode = {mode}"
+    )
+    if mode == "live-gemini":
+        st.sidebar.info("Proposals are real Gemini output. Payments/links are SIMULATED.")
+    else:
+        st.sidebar.warning("Offline: proposals are scripted, not a model call. Payments/links are SIMULATED.")
 except Exception:
     st.sidebar.error("API not reachable")
 
@@ -97,7 +105,10 @@ if ss.case_id:
         policies = [r for r in timeline if r["kind"] == "POLICY_DECISION"]
         model_runs = [r for r in timeline if r["kind"] == "AI_MODEL_RUN"]
         if proposals:
-            st.subheader("Latest AI proposal (actual model output)")
+            label = ("Latest AI proposal (actual Gemini output)"
+                     if mode == "live-gemini"
+                     else "Latest proposal (scripted offline reasoning, no model call)")
+            st.subheader(label)
             st.json(proposals[-1]["detail"])
         if policies:
             st.subheader("Latest deterministic policy decision")

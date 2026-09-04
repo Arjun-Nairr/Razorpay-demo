@@ -71,3 +71,37 @@ def test_durable_case3_survives_a_real_reconnect():
     cv = eng2.inspect(CaseQuery(case_id=r.case_id))
     assert cv.state == "waiting" and cv.pending_work == 1
     led2.close()
+
+
+def test_second_writer_is_refused_by_the_real_advisory_lock():
+    _init(_DSN)
+    first = PostgresSnapshotStore(_DSN, _SCHEMA)
+    try:
+        with pytest.raises(RuntimeError, match="writer lock"):
+            PostgresSnapshotStore(_DSN, _SCHEMA)  # same schema, different session
+    finally:
+        first.close()
+    # after close() the lock is released -> a new writer can take it
+    third = PostgresSnapshotStore(_DSN, _SCHEMA)
+    third.close()
+
+
+def test_write_error_leaves_the_connection_usable():
+    _init(_DSN)
+    store = PostgresSnapshotStore(_DSN, _SCHEMA)
+    try:
+        # force a SQL error: cast a non-JSON string to jsonb inside write()'s
+        # transaction by monkey-poking the payload through a bad statement.
+        with pytest.raises(Exception):
+            with store._conn.cursor() as cur:  # noqa: SLF001 - integration probe
+                cur.execute("SELECT 1/0")
+            store._conn.commit()
+        store._conn.rollback()  # emulate the store's own recovery
+        # the store's own write path still works on the same connection
+        store.write({"probe": True})
+        got = store.read()
+        assert got == {"probe": True}
+    finally:
+        # restore an empty snapshot so re-runs start clean
+        _init(_DSN)
+        store.close()

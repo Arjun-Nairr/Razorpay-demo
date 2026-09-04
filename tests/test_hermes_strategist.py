@@ -38,13 +38,17 @@ def _valid_obj(**over) -> dict:
         "rationale": "wait is spent; offer an alternate collection path",
         "confidence": 0.71,
         "proposed_wait_hours": 0,
-        "message_intent": "Your recent payment did not go through - a secure way to complete it is ready.",
+        "message_intent": None,  # structural tests; message-choice tests set it explicitly
     }
     obj.update(over)
     return obj
 
 
 VALID_JSON = json.dumps(_valid_obj())
+
+from hermes.message_templates import APPROVED_MESSAGE_INTENT_LIST  # noqa: E402
+
+APPROVED_MSG = APPROVED_MESSAGE_INTENT_LIST[0]
 
 
 def snapshot(**over) -> StrategySnapshot:
@@ -391,6 +395,67 @@ def test_setup_failure_does_not_leak_prior_run_metadata():
         s.propose(snapshot())  # second run fails during transport construction
     assert s.last_run_meta.validation_result == "transport_error:RuntimeError"  # not stale "valid"
     assert s.last_run_meta.repair_used is False
+
+
+# --- prompt <-> validation contract alignment (correction 3) ---------
+
+
+def _obj(**over):
+    o = {"action": "CREATE_RECOVERY_LINK", "diagnosis": "d", "rationale": "r",
+         "confidence": 0.6, "proposed_wait_hours": 0, "message_intent": None}
+    o.update(over)
+    return json.dumps(o)
+
+
+def test_approved_message_proposal_reaches_policy():
+    s, stub = strategist(_obj(message_intent=APPROVED_MSG))
+    proposal = s.propose(snapshot(retry_outcome_recorded=True))
+    assert proposal.message_intent == APPROVED_MSG
+    assert len(stub.calls) == 1  # no repair needed
+    from hermes.engine import _validate_proposal  # final deterministic guard
+
+    _validate_proposal(proposal)  # must not raise
+
+
+def test_unapproved_message_gets_exactly_one_repair_then_succeeds():
+    s, stub = strategist(_obj(message_intent="totally made up casual copy"),
+                         _obj(message_intent=APPROVED_MSG))
+    proposal = s.propose(snapshot())
+    assert proposal.message_intent == APPROVED_MSG
+    assert len(stub.calls) == 2  # first + exactly one repair
+    assert "approved" in stub.calls[1]["user"].lower() or "rejected" in stub.calls[1]["user"].lower()
+    assert s.last_run_meta.repair_used is True
+
+
+def test_repeated_unapproved_message_follows_the_safe_failure_path():
+    bad = _obj(message_intent="still not on the list")
+    s, stub = strategist(bad, bad)
+    with pytest.raises(InvalidProposal):
+        s.propose(snapshot())
+    assert len(stub.calls) == 2  # first + one repair, never more
+    assert s.last_run_meta.validation_result.startswith("invalid:")
+
+
+def test_zero_hour_wait_is_invalid_output_not_rewritten():
+    s, stub = strategist(_obj(action="WAIT_FOR_PROVIDER_RETRY", proposed_wait_hours=0),
+                         _obj(action="WAIT_FOR_PROVIDER_RETRY", proposed_wait_hours=0))
+    with pytest.raises(InvalidProposal):
+        s.propose(snapshot())
+    assert len(stub.calls) == 2  # bounded: first + one repair
+
+
+def test_positive_wait_within_remaining_is_accepted():
+    s, stub = strategist(_obj(action="WAIT_FOR_PROVIDER_RETRY", proposed_wait_hours=24))
+    p = s.propose(snapshot(wait_hours_remaining=48))
+    assert p.action.value == "WAIT_FOR_PROVIDER_RETRY" and p.proposed_wait_hours == 24
+
+
+def test_wait_budget_and_approved_list_are_in_the_model_context():
+    s, stub = strategist(_obj(message_intent=APPROVED_MSG))
+    s.propose(snapshot(wait_hours_remaining=17))
+    system, user = stub.calls[0]["system"], stub.calls[0]["user"]
+    assert "wait_hours_remaining" in user and "17" in user
+    assert APPROVED_MSG in system  # Gemini is shown the exact approved strings
 
 
 # --- guardrail ----------------------------------------------

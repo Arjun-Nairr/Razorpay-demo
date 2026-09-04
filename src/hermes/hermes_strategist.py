@@ -37,12 +37,16 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
+from .message_templates import APPROVED_MESSAGE_INTENT_LIST, is_approved_message_intent
 from .types import InvalidProposal, ProposalAction, StrategyProposal, StrategySnapshot
 
 DEFAULT_MODEL = "gemini-3.7-flash"
 DEFAULT_TIMEOUT_S = 60.0
 DEFAULT_API_KEY_ENV = "GEMINI_API_KEY"
-PROMPT_VERSION = "hermes-strategist/2026-09-03.1"
+# Bumped: the prompt now hands Gemini the exact approved message strings and
+# includes wait_hours_remaining; message choice is validated in-adapter within
+# the one-repair boundary.
+PROMPT_VERSION = "hermes-strategist/2026-09-04.1"
 _MAX_RAW_CHARS = 4000  # bounded raw-response capture for run metadata
 
 # The model must return a JSON object with EXACTLY these keys - no more, no less.
@@ -105,7 +109,11 @@ class _Transport(Protocol):
 
 # --- prompt (versioned) -------------------------------------------------------
 
-_SYSTEM_PROMPT = """You are Hermes, a merchant-side subscription-payment recovery strategist.
+_APPROVED_MESSAGES_BLOCK = "\n".join(
+    f'  {i + 1}. "{text}"' for i, text in enumerate(APPROVED_MESSAGE_INTENT_LIST)
+)
+
+_SYSTEM_PROMPT = f"""You are Hermes, a merchant-side subscription-payment recovery strategist.
 You PROPOSE one strategy; deterministic policy decides what is allowed.
 
 Return ONLY a single JSON object, no prose, with exactly these keys:
@@ -115,11 +123,17 @@ Return ONLY a single JSON object, no prose, with exactly these keys:
   "diagnosis": short string
   "rationale": short string
   "confidence": number between 0 and 1
-  "proposed_wait_hours": integer >= 0 (only meaningful for WAIT_FOR_PROVIDER_RETRY)
-  "message_intent": short string, or null
+  "proposed_wait_hours": integer (only meaningful for WAIT_FOR_PROVIDER_RETRY;
+                         when action is WAIT_FOR_PROVIDER_RETRY it MUST be an
+                         integer >= 1 and MUST NOT exceed "wait_hours_remaining"
+                         from the snapshot)
+  "message_intent": EITHER null, OR one of these approved strings COPIED VERBATIM
+                    (no other text is accepted; pick the closest fit):
+{_APPROVED_MESSAGES_BLOCK}
 
-Never put a URL, currency symbol, amount, discount, or provider identifier in
-"message_intent". Use only the facts in the snapshot."""
+"provider_retry_eligible" is the CURRENT provider fact. "retry_outcome_recorded"
+only means a prior retry already failed - it does NOT mean retries are
+exhausted; the two are independent. Use only the facts in the snapshot."""
 
 
 def _context_facts(snap: StrategySnapshot) -> dict[str, Any]:
@@ -138,6 +152,7 @@ def _context_facts(snap: StrategySnapshot) -> dict[str, Any]:
         "messages_remaining": snap.messages_remaining,
         "links_remaining": snap.links_remaining,
         "actions_remaining": snap.actions_remaining,
+        "wait_hours_remaining": snap.wait_hours_remaining,
         "prior_action": snap.prior_action,
         "prior_policy_outcome": snap.prior_policy_outcome,
     }
@@ -195,6 +210,8 @@ def parse_proposal(raw: str) -> StrategyProposal:
     wait = obj["proposed_wait_hours"]
     if isinstance(wait, bool) or not isinstance(wait, int) or wait < 0:
         raise InvalidProposal(f"proposed_wait_hours must be int >= 0: {wait!r}")
+    if action is ProposalAction.WAIT_FOR_PROVIDER_RETRY and wait < 1:
+        raise InvalidProposal("WAIT_FOR_PROVIDER_RETRY requires proposed_wait_hours >= 1")
 
     diagnosis = obj["diagnosis"]
     rationale = obj["rationale"]
@@ -208,6 +225,13 @@ def parse_proposal(raw: str) -> StrategyProposal:
         raise InvalidProposal(f"message_intent must be string or null: {message_intent!r}")
     if isinstance(message_intent, str):
         message_intent = message_intent.strip() or None
+    # Message choice is validated here too (within the one-repair boundary), so
+    # a repair prompt can tell Gemini exactly which strings are allowed. The
+    # engine's _validate_proposal is still the final deterministic guard.
+    if not is_approved_message_intent(message_intent):
+        raise InvalidProposal(
+            "message_intent must be null or one of the approved templates verbatim"
+        )
 
     return StrategyProposal(
         action=action,

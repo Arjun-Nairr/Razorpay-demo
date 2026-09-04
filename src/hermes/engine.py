@@ -80,6 +80,11 @@ def _validate_proposal(obj: object) -> StrategyProposal:
         raise InvalidProposal(f"confidence out of range: {obj.confidence}")
     if obj.proposed_wait_hours < 0:
         raise InvalidProposal(f"negative wait: {obj.proposed_wait_hours}")
+    if obj.action is ProposalAction.WAIT_FOR_PROVIDER_RETRY and obj.proposed_wait_hours < 1:
+        # A wait "for the next provider retry" must be a real future interval.
+        # Zero-hour waits spend no budget and reschedule immediately - an
+        # endless-loop hole. Treat as invalid output -> bounded failure path.
+        raise InvalidProposal("WAIT_FOR_PROVIDER_RETRY requires proposed_wait_hours >= 1")
     if obj.message_intent is not None:
         if not obj.message_intent.strip():
             raise InvalidProposal("blank message_intent")
@@ -125,7 +130,9 @@ def authorize(
         remaining = MAX_TOTAL_WAIT_HOURS - case.total_wait_hours
         if remaining <= 0:
             return PolicyDecision(PolicyOutcome.BLOCK, "total_wait_bound_reached")
-        wait = max(0, min(proposal.proposed_wait_hours, MAX_WAIT_HOURS, remaining))
+        wait = min(proposal.proposed_wait_hours, MAX_WAIT_HOURS, remaining)
+        if wait < 1:  # never authorize a zero/negative-hour "wait"
+            return PolicyDecision(PolicyOutcome.BLOCK, "wait_must_be_positive")
         return PolicyDecision(
             PolicyOutcome.ALLOW, "provider_retry_permitted", scheduled_time=now + wait
         )
@@ -209,6 +216,10 @@ class RecoveryEngine:
         and never runs the work loop.
         """
         led = self._ledger
+        # Refresh the logical clock from the persisted ledger so a payment that
+        # arrives while another runner is mid-decision is stamped at current
+        # demo time (and so a restarted engine intakes at the resumed clock).
+        self._clock = led.logical_clock()
         if webhook.type is WebhookType.PAYMENT_FAILED:
             result = led.apply_intake(
                 IntakeCommand(
