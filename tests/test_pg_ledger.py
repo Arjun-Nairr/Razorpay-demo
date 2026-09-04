@@ -6,6 +6,8 @@ tests/integration/ and skip unless HERMES_PG_TEST_DSN is set.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from hermes.adapters import FakeRazorpayAdapter, InMemoryLedger, ScriptedStrategist
@@ -264,10 +266,18 @@ class _FakeConn:
 
 
 class _FakePsycopg:
-    def __init__(self, conn):
+    def __init__(self, conn, *, delay_s: float = 0.0, raises: BaseException | None = None):
         self._conn = conn
+        self._delay_s = delay_s
+        self._raises = raises
+        self.connect_kwargs = None
 
-    def connect(self, dsn):
+    def connect(self, dsn, **kwargs):
+        self.connect_kwargs = kwargs
+        if self._delay_s:
+            time.sleep(self._delay_s)
+        if self._raises is not None:
+            raise self._raises
         return self._conn
 
 
@@ -311,3 +321,77 @@ def test_close_releases_the_advisory_lock():
     store.close()
     assert "SELECT" in conn.calls  # pg_advisory_unlock issued
     assert conn.closed is True
+
+
+# --- bounded DB connect (Iteration 12 startup fix) ------------------------
+#     Neon serverless can take ~25-30s to resume; an unbounded psycopg.connect
+#     hung the whole app import. _connect_bounded caps it and raises a
+#     sanitised RuntimeError instead.
+
+
+def test_connect_that_hangs_is_bounded_not_infinite():
+    from hermes.pg_ledger import PostgresSnapshotStore
+
+    slow = _FakePsycopg(_FakeConn(row=_empty_dump()), delay_s=20)
+    t0 = time.monotonic()
+    with pytest.raises(RuntimeError, match=r"did not succeed in 3s"):
+        PostgresSnapshotStore("postgresql://x", "hermes_demo_t",
+                              _psycopg=slow, connect_timeout_s=3)
+    assert time.monotonic() - t0 < 6  # returned promptly, did not wait 20s
+
+
+def test_connect_failure_retries_then_gives_up_sanitised_no_dsn():
+    from hermes.pg_ledger import PostgresSnapshotStore
+
+    boom = _FakePsycopg(_FakeConn(), raises=OSError("connection refused to secret-host:5432"))
+    t0 = time.monotonic()
+    with pytest.raises(RuntimeError) as ei:
+        PostgresSnapshotStore("postgresql://user:pw@secret-host/db", "hermes_demo_t",
+                              _psycopg=boom, connect_timeout_s=10)
+    msg = str(ei.value)
+    assert "OSError" in msg  # type only
+    assert "secret-host" not in msg and "pw@" not in msg and "postgresql://" not in msg
+    assert time.monotonic() - t0 < 12  # bounded total, not per-attempt x attempts unbounded
+
+
+def test_transient_failure_then_success_on_retry():
+    from hermes.pg_ledger import PostgresSnapshotStore
+
+    class _Flaky(_FakePsycopg):
+        def __init__(self):
+            super().__init__(_FakeConn(row=_empty_dump(), lock_grants=[True]))
+            self.n = 0
+
+        def connect(self, dsn, **kw):
+            self.connect_kwargs = kw
+            self.n += 1
+            if self.n == 1:
+                raise OSError("cold start")
+            return self._conn
+
+    fp = _Flaky()
+    store = PostgresSnapshotStore("postgresql://x", "hermes_demo_t",
+                                  _psycopg=fp, connect_timeout_s=30)
+    assert fp.n == 2 and store.read() == _empty_dump()
+    store.close()
+
+
+def test_fast_connect_still_works_and_passes_libpq_timeout():
+    fp = _FakePsycopg(_FakeConn(row=_empty_dump(), lock_grants=[True]))
+    from hermes.pg_ledger import PostgresSnapshotStore
+
+    store = PostgresSnapshotStore("postgresql://x", "hermes_demo_t",
+                                  _psycopg=fp, connect_timeout_s=30)
+    assert store.read() == _empty_dump()
+    assert fp.connect_kwargs.get("connect_timeout")  # a TCP-phase bound was forwarded
+    store.close()
+
+
+def test_env_var_overrides_connect_timeout(monkeypatch):
+    from hermes.pg_ledger import PostgresSnapshotStore
+
+    monkeypatch.setenv("HERMES_DB_CONNECT_TIMEOUT_S", "3")
+    monkeypatch.setenv("HERMES_DB_CONNECT_ATTEMPTS", "1")
+    slow = _FakePsycopg(_FakeConn(row=_empty_dump()), delay_s=20)
+    with pytest.raises(RuntimeError, match=r"in 3s across 1 attempt"):
+        PostgresSnapshotStore("postgresql://x", "hermes_demo_t", _psycopg=slow)

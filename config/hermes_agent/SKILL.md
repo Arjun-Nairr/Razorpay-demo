@@ -34,14 +34,15 @@ Choose exactly one `action`, from the executable set only:
   wait budget remains. `proposed_wait_hours` must be an integer >= 1.
 - `CREATE_RECOVERY_LINK` — only after a failed retry outcome is recorded; at
   most one. `message_intent` is optional and, if present, MUST be one of the
-  approved templates you are given, copied verbatim — never other text.
-- `SEND_REMINDER` — merchant-owned communication + consent + reachable channel;
-  approved template only.
+  approved templates you are given, copied verbatim — never other text. A
+  customer reminder is only ever attached to the link this way; there is no
+  standalone message action.
 - `ESCALATE` — the explicit safe path when evidence is inadequate or no other
   action is authorized. It is a real deterministic terminal transition to
   `escalated` (unrecovered); use it instead of guessing.
 
-Do not propose `STOP` or any other action — policy cannot execute them.
+Do not propose `SEND_REMINDER`, `STOP`, or any other action — policy cannot
+execute them.
 
 ## Confidence
 

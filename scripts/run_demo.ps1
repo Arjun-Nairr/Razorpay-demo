@@ -3,12 +3,13 @@
 #   Setup (once):
 #     python -m venv .venv
 #     .\.venv\Scripts\Activate.ps1
-#     python -m pip install -e ".[api,db,gemini,ui]"
+#     python -m pip install -e ".[api,db,gemini,ui,dev]"
 #     # put GEMINI_API_KEY and DATABASE_URL in .\.env  (see .env.example)
 #     python scripts\init_neon.py           # one-time, idempotent, non-destructive
 #
 #   Run:
-#     .\scripts\run_demo.ps1                 # live mode (real Gemini + Neon)
+#     .\scripts\run_demo.ps1 -Mode hermes    # actual isolated Nous Hermes + Gemini + Neon
+#     .\scripts\run_demo.ps1 -Mode live      # direct Gemini + Neon
 #     .\scripts\run_demo.ps1 -Mode offline   # no credentials; scripted proposals
 #
 #   Shutdown:
@@ -27,41 +28,66 @@ $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
 $env:HERMES_MODE = $Mode
 $env:HERMES_API_BASE = "http://127.0.0.1:$ApiPort"
-# Fallback so `hermes` imports even without `pip install -e .` (the src layout).
-if (-not $env:PYTHONPATH) { $env:PYTHONPATH = "$repo\src" }
 
+# --- use the PROJECT venv interpreter, not whatever `python` resolves to on PATH.
+# (A bare `python` in a background job resolved to the system interpreter, which
+# also had fastapi/uvicorn/psycopg installed, so the wrong Python ran the app.)
+$py = Join-Path $repo ".venv\Scripts\python.exe"
+if (-not (Test-Path $py)) {
+    $py = (Get-Command python -ErrorAction SilentlyContinue).Source
+}
+if (-not $py) {
+    Write-Host "No project .venv and no `python` on PATH. Run: python -m venv .venv" -ForegroundColor Red
+    exit 1
+}
+# With the venv interpreter the installed package is used; keep a src fallback
+# only if it is somehow not installed there.
+& $py -c "import hermes" 2>$null
+if ($LASTEXITCODE -ne 0 -and -not $env:PYTHONPATH) { $env:PYTHONPATH = "$repo\src" }
+
+Write-Host "Interpreter: $py" -ForegroundColor DarkGray
 Write-Host "Starting FastAPI (uvicorn) on 127.0.0.1:$ApiPort  [mode=$Mode]" -ForegroundColor Cyan
 $api = Start-Job -Name hermes-api -ScriptBlock {
-    param($repo, $port, $mode)
+    param($repo, $port, $mode, $py, $pp)
     Set-Location $repo
     $env:HERMES_MODE = $mode
-    if (-not $env:PYTHONPATH) { $env:PYTHONPATH = "$repo\src" }
-    python -m uvicorn hermes.asgi:app --host 127.0.0.1 --port $port
-} -ArgumentList $repo, $ApiPort, $Mode
+    if ($pp) { $env:PYTHONPATH = $pp }
+    & $py -m uvicorn hermes.asgi:app --host 127.0.0.1 --port $port
+} -ArgumentList $repo, $ApiPort, $Mode, $py, $env:PYTHONPATH
 
 # --- wait for the API to become healthy; abort (do NOT open the UI) on failure ---
+# Bounded wait. `hermes`/`live` open a Neon connection during app import; Neon
+# serverless can take ~25-30s to resume suspended compute, so allow more time
+# for those modes. The loop still exits IMMEDIATELY when the job dies (a
+# sanitised SystemExit), so a real failure is not delayed by the ceiling.
+$maxWaitSec = if ($Mode -eq "offline") { 20 } else { 100 }
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
 $healthy = $false
-for ($i = 0; $i -lt 30; $i++) {
+$r = $null
+while ($sw.Elapsed.TotalSeconds -lt $maxWaitSec) {
     if ($api.State -eq "Failed" -or $api.State -eq "Completed") { break }
     try {
-        $r = Invoke-RestMethod -Uri "http://127.0.0.1:$ApiPort/health" -TimeoutSec 2
+        $r = Invoke-RestMethod -Uri "http://127.0.0.1:$ApiPort/health" -TimeoutSec 3
         if ($r.status -eq "ok") { $healthy = $true; break }
     } catch { }
-    Start-Sleep -Milliseconds 500
+    Start-Sleep -Seconds 1
 }
+$sw.Stop()
 
 if (-not $healthy) {
-    Write-Host "API did not become healthy. Startup output:" -ForegroundColor Red
+    Write-Host ("API did not become healthy after {0:n0}s. Job state: {1}. Startup output:" -f `
+        $sw.Elapsed.TotalSeconds, $api.State) -ForegroundColor Red
     Receive-Job -Job $api
     Stop-Job -Job $api -ErrorAction SilentlyContinue
     Remove-Job -Job $api -ErrorAction SilentlyContinue
     exit 1
 }
-Write-Host "API healthy (mode reported by /health): $($r.mode)" -ForegroundColor Green
+Write-Host ("API healthy in {0:n0}s (mode reported by /health): {1})" -f `
+    $sw.Elapsed.TotalSeconds, $r.mode) -ForegroundColor Green
 
 Write-Host "Starting Streamlit UI on 127.0.0.1:$UiPort" -ForegroundColor Cyan
 try {
-    python -m streamlit run scripts\demo_ui.py `
+    & $py -m streamlit run scripts\demo_ui.py `
         --server.address 127.0.0.1 --server.port $UiPort --server.headless true
 }
 finally {

@@ -25,8 +25,10 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import os
 import re
 import threading
+import time
 from typing import Any, Callable, Protocol
 
 from .adapters import InMemoryLedger
@@ -41,6 +43,74 @@ from .types import (
 _SNAPSHOT_VERSION = 1
 _DEFAULT_SCHEMA = "hermes_demo"
 _SCHEMA_RE = re.compile(r"\A[a-z_][a-z0-9_]{0,62}\Z")
+
+# Bounds on opening the database connection. Neon serverless holds the
+# connection open while it *resumes* suspended compute; measured resume latency
+# on this project's endpoint was ~25s warm-ish and 45s to >75s from fully cold,
+# and it is variable (one attempt can stall past the ceiling while the next
+# succeeds once resume has kicked in). libpq's ``connect_timeout`` only covers
+# the pure-TCP phase, so an unbounded ``psycopg.connect`` hangs the whole app
+# import (uvicorn never prints its banner). We therefore bound EACH attempt and
+# retry a few times within a finite total. Once connected Neon stays warm for
+# minutes, so this cost is paid at most once per demo session. Both knobs are
+# overridable (HERMES_DB_CONNECT_TIMEOUT_S = total; HERMES_DB_CONNECT_ATTEMPTS).
+_DEFAULT_CONNECT_TIMEOUT_S = 150.0
+_DEFAULT_CONNECT_ATTEMPTS = 3
+_PER_ATTEMPT_CEILING_S = 55.0
+_RETRY_BACKOFF_S = 2.0
+
+
+def _connect_once(psycopg: Any, dsn: str, per_attempt_s: float):
+    box: dict[str, Any] = {}
+
+    def _work() -> None:
+        try:
+            box["conn"] = psycopg.connect(dsn, connect_timeout=max(5, int(per_attempt_s)))
+        except BaseException as exc:  # noqa: BLE001 - reported by type only
+            box["err"] = exc
+
+    th = threading.Thread(target=_work, name="pg-connect", daemon=True)
+    th.start()
+    th.join(per_attempt_s)
+    if th.is_alive():
+        # Orphaned daemon thread; it dies with the process (which exits via a
+        # sanitised SystemExit on the failure path).
+        return None, "timeout"
+    if "err" in box:
+        return None, type(box["err"]).__name__
+    return box["conn"], None
+
+
+def _connect_bounded(psycopg: Any, dsn: str, total_timeout_s: float,
+                     attempts: int | None = None):
+    """``psycopg.connect`` with a bounded per-attempt timeout, retried within a
+    finite total. Raises ``RuntimeError`` (never the DSN) so the ASGI
+    entrypoint reports a sanitised startup failure instead of stalling."""
+    if attempts is None:
+        try:
+            attempts = int(os.environ.get("HERMES_DB_CONNECT_ATTEMPTS",
+                                          _DEFAULT_CONNECT_ATTEMPTS))
+        except (TypeError, ValueError):
+            attempts = _DEFAULT_CONNECT_ATTEMPTS
+    attempts = max(1, attempts)
+    deadline = time.monotonic() + total_timeout_s
+    last = "timeout"
+    for i in range(attempts):
+        remaining = deadline - time.monotonic()
+        if remaining <= 1:
+            break
+        conn, err = _connect_once(psycopg, dsn, min(remaining, _PER_ATTEMPT_CEILING_S))
+        if conn is not None:
+            return conn
+        last = err or "unknown"
+        if i + 1 < attempts and deadline - time.monotonic() > _RETRY_BACKOFF_S + 1:
+            time.sleep(_RETRY_BACKOFF_S)
+    raise RuntimeError(
+        f"database connection did not succeed in {int(total_timeout_s)}s "
+        f"across {attempts} attempt(s) (last: {last}). Neon compute may be "
+        "resuming - retry, or raise HERMES_DB_CONNECT_TIMEOUT_S / "
+        "HERMES_DB_CONNECT_ATTEMPTS."
+    )
 
 
 # --- (de)serialisation of the whole in-memory ledger ----------------------
@@ -153,14 +223,21 @@ class PostgresSnapshotStore:
     """
 
     def __init__(self, dsn: str, schema: str = _DEFAULT_SCHEMA,
-                 *, _psycopg: Any | None = None) -> None:
+                 *, _psycopg: Any | None = None,
+                 connect_timeout_s: float | None = None) -> None:
         psycopg = _psycopg
         if psycopg is None:
             import psycopg  # noqa: PLC0415 - optional dependency, lazy
 
         self._schema = _validate_schema(schema)
         self._key = _advisory_key(self._schema)
-        self._conn = psycopg.connect(dsn)  # sslmode etc. carried in the DSN
+        if connect_timeout_s is None:
+            try:
+                connect_timeout_s = float(os.environ.get(
+                    "HERMES_DB_CONNECT_TIMEOUT_S", _DEFAULT_CONNECT_TIMEOUT_S))
+            except (TypeError, ValueError):
+                connect_timeout_s = _DEFAULT_CONNECT_TIMEOUT_S
+        self._conn = _connect_bounded(psycopg, dsn, connect_timeout_s)
         try:
             with self._conn.cursor() as cur:
                 cur.execute("SELECT pg_try_advisory_lock(%s)", (self._key,))

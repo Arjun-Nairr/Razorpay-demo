@@ -47,9 +47,11 @@ _ALL_ACTIONS = {
     "STOP", "ESCALATE",
 }
 # Only the actions deterministic policy can actually authorize/execute today.
-# STOP is deliberately NOT offered as executable (policy would only BLOCK it).
+# STOP and a standalone SEND_REMINDER are deliberately NOT offered as executable
+# (policy would only BLOCK them). Reminder copy still rides along with an
+# authorized CREATE_RECOVERY_LINK via message_intent.
 _SUPPORTED_ACTIONS = {
-    "WAIT_FOR_PROVIDER_RETRY", "CREATE_RECOVERY_LINK", "SEND_REMINDER", "ESCALATE",
+    "WAIT_FOR_PROVIDER_RETRY", "CREATE_RECOVERY_LINK", "ESCALATE",
 }
 MODEL_ITERATION_BUDGET = 8   # shared across the initial reasoning AND the one repair
 TOOL_CALL_BUDGET = 6         # shared across the initial reasoning AND the one repair

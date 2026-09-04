@@ -55,14 +55,14 @@ _PARENT_FAIL_CHILD = "child_reported_failure"
 _PARENT_FAIL_PROPOSAL_SHAPE = "proposal_shape"
 
 # Only the actions deterministic policy can authorize + execute today. This is
-# what the child advertises as the "allowed actions" catalog - STOP is omitted.
+# what the child advertises as the "allowed actions" catalog. STOP and a
+# standalone SEND_REMINDER are omitted - policy would only BLOCK them; reminder
+# copy still attaches to an authorized CREATE_RECOVERY_LINK via message_intent.
 _POLICY_SUPPORTED_ACTIONS: tuple[str, ...] = (
     "WAIT_FOR_PROVIDER_RETRY (only while provider_retry_eligible is true and wait "
     "budget remains; integer proposed_wait_hours >= 1)",
     "CREATE_RECOVERY_LINK (only after a recorded failed retry outcome; at most one; "
     "optional message_intent must be an approved template)",
-    "SEND_REMINDER (merchant-owned communication + consent + reachable channel; "
-    "approved template only)",
     "ESCALATE (the safe path when evidence is inadequate or no other action is "
     "authorized; deterministic terminal transition to 'escalated'/unrecovered)",
 )

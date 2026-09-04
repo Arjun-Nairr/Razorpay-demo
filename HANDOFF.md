@@ -40,9 +40,48 @@ requirements in `PROJECT_BRIEF.md`.
   expected-state capture guard is closed, the wait -> failed-retry -> changed-
   strategy -> recovery-link -> `hermes_assisted` path is proven end to end
   through `receive`/`run`/`inspect`, and Case 1's 36-test suite remains green.
-- Status: **Iteration 11 - reviewed-Hermes-blocker corrections + visible Neon
-  proof path** on `feat/isolated-hermes-agent` (baseline `48de227`). Ten review
-  items fixed on the Iteration 10 isolated real-Hermes integration:
+- Status: **Iteration 12 - hermes-mode startup fix (bounded DB connect)** on
+  `feat/isolated-hermes-agent` (baseline `c0e59fd`). **Cause of the silent
+  `run_demo.ps1 -Mode hermes` stall:** `PostgresSnapshotStore.__init__` called
+  `psycopg.connect(dsn)` with **no timeout**; Neon serverless holds the
+  connection open while it resumes suspended compute (measured 25s to >75s,
+  variable), so `import hermes.asgi` never finished, uvicorn never printed its
+  banner, and the launcher's 15 s health poll aborted with no output. Both the
+  direct `.venv` launch and the background job hit the same hang (the job also
+  used a bare `python` that resolved to the system interpreter, which happens
+  to have fastapi/uvicorn/psycopg installed). **Fix:** `_connect_bounded` in
+  `pg_ledger.py` bounds each connect attempt and retries within a finite total
+  (defaults 55 s/attempt, 3 attempts, 150 s total; env-overridable
+  `HERMES_DB_CONNECT_TIMEOUT_S` / `HERMES_DB_CONNECT_ATTEMPTS`), raising a
+  sanitised `RuntimeError` (never the DSN) that `asgi.py` already turns into a
+  one-line stderr message + `SystemExit(1)`. `run_demo.ps1` now uses
+  `.venv\Scripts\python.exe` explicitly for uvicorn **and** Streamlit, and
+  waits a mode-aware bounded time (offline 20 s, live/hermes 100 s) that exits
+  immediately when the job dies. Also removed the standalone `SEND_REMINDER`
+  from the strategist-facing contract (child `_SUPPORTED_ACTIONS`, parent
+  `_POLICY_SUPPORTED_ACTIONS`, `SKILL.md`) - policy only ever BLOCKs it;
+  reminder copy still attaches to `CREATE_RECOVERY_LINK` via `message_intent`.
+  Actual Hermes mode, pinned runtime, isolated home, tool limits, deterministic
+  policy, and no-fallback all preserved.
+  **Verification:** offline `python -m pytest -q --ignore=tests/test_hermes_agent.py`
+  -> **230 passed, 3 skipped** (`+5` bounded-connect regressions in
+  `test_pg_ledger.py`: hang is bounded, retry-then-give-up is sanitised with no
+  DSN, transient-fail-then-success, fast path still works, env overrides);
+  real-Hermes harness `tests/test_hermes_agent.py` -> **28 passed**; compileall
+  + `git diff --check` clean. `import hermes.asgi` in `hermes` mode now **fails
+  fast with the sanitised line instead of hanging** (proven).
+  **BLOCKER (external): the live Case 3 was NOT executed.** The Neon endpoint
+  stopped accepting connections during this session - one connect succeeded
+  early (~47 s), then every attempt since (bounded 75 s, 150 s, 180 s, and a
+  raw 5-minute `psycopg.connect`) hung with no response and no error. This is a
+  Neon-side outage/suspension, not a code fault; the startup fix correctly
+  refuses to hang on it. **Next action for the user:** once Neon accepts
+  connections again, run `.\scripts\run_demo.ps1 -Mode hermes` (or the one-shot
+  below) then `python scripts\neon_proof.py` - the launch is now reliable and
+  self-diagnosing. No recovery is claimed.
+- Prior status: **Iteration 11 - reviewed-Hermes-blocker corrections + visible
+  Neon proof path** on `feat/isolated-hermes-agent` (baseline `48de227`). Ten
+  review items fixed on the Iteration 10 isolated real-Hermes integration:
   (1) the unauthorized-tool test uses a harmless sentinel + a canary-file
   isolation assertion (never a destructive host command); `test_asgi_startup`
   neutralises `.env` loading and builds synthetic Settings.
@@ -176,6 +215,80 @@ requirements in `PROJECT_BRIEF.md`.
   For the smoke script the user now keeps a **replacement** `GEMINI_API_KEY` in
   a local gitignored `.env` (the previously used key was disclosed in chat and
   must stay revoked); the key is never requested in or pasted into chat.
+
+## Iteration 12 — hermes-mode startup fix (bounded DB connect)
+
+Baseline `c0e59fd`. Implementation + verification only; storage unchanged.
+
+### Cause (bounded diagnosis)
+
+`run_demo.ps1 -Mode hermes` "failed its health check without startup output".
+`python -X faulthandler -c "import hermes.asgi"` (HERMES_MODE=hermes, 35 s
+dump) showed the process blocked in:
+
+```
+psycopg/waiting.py:112 wait_conn  <-  psycopg/connection.py:109 connect
+  <-  hermes/pg_ledger.py:163 PostgresSnapshotStore.__init__
+  <-  hermes/runtime.py build_ledger  <-  build_app  <-  hermes/asgi.py:<module>
+```
+
+`psycopg.connect(dsn)` had **no timeout**. Neon serverless keeps the socket
+open while resuming suspended compute; a raw `socket.create_connection` to the
+endpoint took **45 s** and `psycopg.connect` **47 s** in one measurement, and
+other attempts never completed. So `import hermes.asgi` never returned, uvicorn
+never bound / printed its banner, and the launcher's `30 x 500 ms` health poll
+gave up first - hence "no startup output". The launcher's background job also
+ran a bare `python` that resolved to the **system** interpreter (which also has
+fastapi/uvicorn/psycopg installed) rather than the project `.venv`.
+
+### Changes
+
+- `src/hermes/pg_ledger.py` - `_connect_bounded` / `_connect_once`: each
+  `psycopg.connect` runs in a daemon thread joined with a per-attempt ceiling
+  (55 s), retried up to 3 times within a finite total (150 s default). Timeout
+  or error -> `RuntimeError` naming only the exception **type** and the knobs
+  (`HERMES_DB_CONNECT_TIMEOUT_S`, `HERMES_DB_CONNECT_ATTEMPTS`) - never the DSN.
+  `PostgresSnapshotStore.__init__` gains `connect_timeout_s`. `asgi.py` already
+  converts a startup `RuntimeError` to a sanitised one-liner + `SystemExit(1)`.
+- `scripts/run_demo.ps1` - resolves `$repo\.venv\Scripts\python.exe` (falls
+  back to PATH `python`) and uses it for uvicorn **and** Streamlit; passes it +
+  `PYTHONPATH` into the job; mode-aware bounded health wait (offline 20 s,
+  live/hermes 100 s) via a stopwatch loop that still breaks immediately when
+  the job state is Failed/Completed; reports elapsed + job state on abort.
+- `src/hermes/hermes_agent/child_main.py`, `hermes_agent_strategist.py`,
+  `config/hermes_agent/SKILL.md` - standalone `SEND_REMINDER` removed from the
+  strategist-facing action set / catalog / skill (policy only BLOCKs it;
+  reminder copy still rides `CREATE_RECOVERY_LINK` `message_intent`).
+- `tests/test_pg_ledger.py` - `_FakePsycopg` accepts `**kwargs` / `delay_s` /
+  `raises`; `+5` regressions: hang is bounded (returns in <6 s, not 20 s);
+  retry-then-give-up is sanitised and DSN-free and total-bounded;
+  transient-fail-then-success on the 2nd attempt; fast path still works and
+  forwards a libpq `connect_timeout`; env vars override total + attempts.
+
+### Verification
+
+- `python -m pytest -q --ignore=tests/test_hermes_agent.py` -> **230 passed,
+  3 skipped**.
+- `python -m pytest -q tests/test_hermes_agent.py` -> **28 passed** (real
+  Hermes child + stub transport; SEND_REMINDER removal caused no regression).
+- `python -m compileall -q src tests scripts` clean; `git diff --check` clean.
+- `HERMES_MODE=hermes python -c "import hermes.asgi"` now **exits fast with the
+  sanitised startup line** instead of hanging (verified repeatedly).
+- **Live Case 3 NOT run** - Neon endpoint unresponsive this session (see the
+  status bullet / blocker). No fabricated recovery.
+
+### Remaining blocker
+
+External: the Neon compute for the demo project was not accepting connections
+by the end of this session. When it is back, one repeatable launch:
+
+```
+$repo\.venv\Scripts\python.exe -m uvicorn hermes.asgi:app --host 127.0.0.1 --port 8000
+```
+
+(or `.\scripts\run_demo.ps1 -Mode hermes`), then `python scripts\neon_proof.py`;
+inspect with `sql\neon_demo_inspect.sql` (schema `hermes_demo`). If a cold
+resume needs longer than 150 s, `setx`/`$env:HERMES_DB_CONNECT_TIMEOUT_S`.
 
 ## Iteration 11 — Hermes-blocker corrections + visible Neon proof
 
