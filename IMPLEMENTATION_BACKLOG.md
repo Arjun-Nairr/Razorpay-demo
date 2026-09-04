@@ -35,7 +35,10 @@ was delivered.
   interception root missing from the child venv's certifi (parent now supplies
   an OS-trust CA bundle to the child). The Iteration-12 "Neon outage" claim was
   wrong. See HANDOFF.md.
-- Razorpay runtime still uses FakeRazorpayAdapter. Keys present is NOT integration.
+- SUPERSEDED (Iteration 13 baseline only - see §2 below): a hybrid
+  `RazorpayTestModeAdapter` + `HybridPaymentProvider` now exist and are wired
+  in via `RAZORPAY_PROVIDER=hybrid_test_mode`; `case-18` created one real
+  Razorpay Test Mode recovery link (checkout intentionally not completed).
 - Neon currently stores cases/audit inside one ledger_state JSON snapshot row;
   one decision does not create a separate SQL row. Existing inspection SQL exposes
   these records. No schema redesign required merely for visible proof.
@@ -143,7 +146,7 @@ was delivered.
 - [x] Report actual final state, timing and attribution; safe failure is not recovery.
 - [x] Supply repeatable launch command; preserve other Hermes installations.
 
-### 2. Razorpay Test Mode: HYBRID slice (Iteration 16 — offline-tested; live pending)
+### 2. Razorpay Test Mode: HYBRID slice (live-verified, Iteration 18 - case-18)
 
 - [x] Codex's verified fields/endpoints/limitations: `RAZORPAY_TEST_SLICE.md`.
 - [x] Real recovery-link creation (Standard Payment Link, notify/reminders/
@@ -164,9 +167,10 @@ was delivered.
   Payment Link never implies the original subscription settled/reactivated;
   native subscription-retry signals and historical-data retrieval remain
   explicitly NOT implemented (retry eligibility stays simulated).
-- No real-money operations. Test Mode does not supply a ready-made historical
-  customer dataset. Synthetic data only models plausible useful merchant/provider
-  records, with explicit provenance; never invent unavailable bank/customer facts.
+- No real-money operations. Historical-dataset limitation detailed in
+  "Production history note" above (Current checkpoint) - not repeated here.
+  Synthetic data only models plausible useful merchant/provider records, with
+  explicit provenance; never invent unavailable bank/customer facts.
 
 ### 3. Hermes judgment skills and evidence (partly built; refine and prove)
 
@@ -227,9 +231,11 @@ Store/retrieve enough to reconstruct each case:
 - SUPERSEDED (2026-09-04, Iteration 14 prompt): the five-case plan below is
   replaced by THREE deferred exemplars — consistently on-time, consistently
   late, and mixed history with a justified optional history lookup. Sequence
-  is strictly: startup corrections (done) -> Codex verification -> Razorpay
-  Test Mode integration into the existing working case (`case-11`'s slice)
-  -> these three exemplars. Do not implement new scenarios before that order.
+  is strictly: startup corrections (done) -> Razorpay Test Mode HYBRID
+  integration + one live recovery-link proof (DONE - `case-18`, checkout
+  intentionally not completed, no further live Razorpay run authorized) ->
+  Codex/user review -> these three exemplars. Do not implement new scenarios
+  before that review.
 - [ ] (deferred until after Razorpay) Build the three exemplars above per
   SCENARIO_MATRIX.md as it is updated for this narrower scope. History informs
   judgment; it is not a moral label or reason to bypass policy.

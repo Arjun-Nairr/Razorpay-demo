@@ -1,8 +1,8 @@
 # Cross-Agent Handoff — current-state index
 
-Last updated: 2026-09-04 (Asia/Dubai), Iteration 19. Branch
+Last updated: 2026-09-04 (Asia/Dubai), Iteration 20. Branch
 `feat/isolated-hermes-agent`, latest commit at bottom. This file stays
-**under 300 lines**: it is an index, not a log. Detail lives in the linked
+**under 280 lines**: it is an index, not a log. Detail lives in the linked
 docs; iteration-by-iteration history is in
 [`docs/archive/HANDOFF_full_2026-09-04.md`](docs/archive/HANDOFF_full_2026-09-04.md).
 
@@ -75,13 +75,9 @@ transcripts.
 
 ## Startup & connectivity (Iterations 13–15)
 
-Full narrative in the archive. Iteration 15 closed one leftover gap: the
-lock-probe/first-read remaining-time calculation had a `max(2.0, …)` floor, so
-a connect that had already spent the whole startup budget still handed the
-next bounded step a **fresh** ~2s grace window. Fixed to `max(0.0, …)` - once
-the budget is spent, what's left (including ~0) is what the next step gets,
-never a re-granted window. Regression:
-`test_no_fresh_grace_period_after_connect_exhausts_the_budget`.
+Unchanged - full narrative in the archive (IPv6/TLS/encoding root causes,
+bounded startup budget incl. DNS + first read, no fresh grace period after
+the budget is spent).
 
 ## Razorpay Test Mode — HYBRID slice
 
@@ -169,6 +165,39 @@ decisions correctly paired (`WAIT_FOR_PROVIDER_RETRY` then
 **case-11** unchanged: `state=recovered`, `display_status=RECOVERED`,
 `attribution=hermes_assisted`, `counted=true`.
 
+## Iteration 20 — relay corrections (offline only, no live activity)
+
+Three defects closed in `scripts/webhook_relay.py`, none of them touching a
+live API/Gemini/Razorpay/Neon call or the relay/tunnel (neither was started):
+
+1. **Absolute deadline, not inactivity-only.** The old `_read_body` set one
+   socket timeout, then called `self.rfile.read(length)` - which loops
+   internally over MULTIPLE `recv()` calls, each getting its OWN fresh
+   timeout, so a sender drip-feeding bytes just inside each gap could extend
+   the read forever. Now an incremental loop recalculates `remaining =
+   deadline - now()` before every read and uses `rfile.read1(want)` (at most
+   ONE underlying `recv()` per call, so the recalculated timeout genuinely
+   bounds just that step) - a continuously-active drip-feeder is still cut
+   off (408) once the absolute deadline passes, never forwarded partial.
+2. **Premature EOF.** A connection closing before exactly `Content-Length`
+   bytes arrive is now a distinct, fixed `400` rejection (was previously
+   indistinguishable from a timeout) - never forwarded upstream.
+3. **Normalized log method.** `log_request` printed `self.command` - the
+   client's raw, unvalidated method token - directly. Now mapped through a
+   fixed allowlist (`GET`/`HEAD`/`POST`/`PUT`/`DELETE`/`PATCH`/`OPTIONS`);
+   anything else, however crafted, logs as the fixed label `"OTHER"`.
+
++4 tests in `tests/test_webhook_relay.py`: a continuously drip-feeding sender
+(never quiet long enough for a naive per-call timer to fire) is still
+rejected well inside the budget; a real premature EOF via `shutdown(SHUT_WR)`
+rejects 400 and never reaches the upstream stub; an attacker-controlled
+method string never appears in captured log output, only `"OTHER"`.
+
+`IMPLEMENTATION_BACKLOG.md` corrected: removed the stale "still uses
+FakeRazorpayAdapter" / "live pending" language (case-18 already proved the
+hybrid path live in Iteration 18) and trimmed one repeated historical-dataset
+sentence.
+
 ## Verified evidence
 
 - **Offline**: `python -m pytest -q --ignore=tests/test_hermes_agent.py` ->
@@ -178,15 +207,6 @@ decisions correctly paired (`WAIT_FOR_PROVIDER_RETRY` then
   (unaffected - this iteration touched only `razorpay_test_mode.py` and its
   tests). `compileall` + `git diff --check` clean; diff confined to those two
   files.
-- New coverage this iteration: (1) a local `http.server` fixture producing
-  REAL truncated/invalid-encoding/malformed-JSON response bytes over a real
-  socket, tested both directly against `_live_post` and end-to-end through
-  `engine.run()` to the durable `escalated`/`uncertain` outcome, plus a
-  well-formed-bytes sanity check; (2) missing/wrong `payment_link.status` and
-  `payment.status` in the signed envelope, an envelope whose link/payment
-  entities agree with each other on an amount or currency that disagrees with
-  the persisted case (rejected before any provider call), and a preserved
-  fully-agreeing valid-event path.
 - **Iteration 18**: `python -m pytest -q --ignore=tests/test_hermes_agent.py`
   -> **308 passed, 3 skipped** (was 296; +12 `tests/test_webhook_relay.py`).
   This iteration DID make live calls: real Hermes/Gemini decisions, one real
@@ -194,10 +214,12 @@ decisions correctly paired (`WAIT_FOR_PROVIDER_RETRY` then
 - **Iteration 19**: `python -m pytest -q --ignore=tests/test_hermes_agent.py`
   -> **369 passed, 3 skipped** (+16 `test_run_one_hybrid_case.py`, +3
   `test_api.py` `/health` fields, +9 `test_webhook_relay.py` hardening,
-  +33 `test_neon_views.py`). `compileall` + `git diff --check` clean; secret
-  scan clean. Live: `scripts/init_neon.py` ran once (DDL only) and the five
-  views were read back directly - see Iteration 19 section above for the
-  exact case-18/case-11 results.
+  +33 `test_neon_views.py`). Live: `scripts/init_neon.py` ran once (DDL only)
+  and the five views were read back directly - see Iteration 19 section above.
+- **Iteration 20**: `python -m pytest -q --ignore=tests/test_hermes_agent.py`
+  -> **373 passed, 3 skipped** (+4 `test_webhook_relay.py`). `compileall` +
+  `git diff --check` clean; secret scan clean. No API/relay/tunnel started, no
+  live Gemini/Razorpay/Neon call - offline only, as authorized.
 
 ## Inspecting the persisted proof
 
@@ -232,10 +254,11 @@ actually wired to `hermes-runtime` + `hybrid_test_mode` + enabled.
 
 ## Next action
 
-Codex review of Iteration 19. No further live action planned against
-`case-18`. The three deferred exemplars (on-time / late / mixed-history)
-remain deferred per the backlog. Keep future `HANDOFF.md` updates under
-300 lines.
+Codex/user will author the Hermes SOUL and judgment drafts against the
+existing Neon evidence contract (the five views + `ledger_state`) - not
+Claude Code in this task. No further live action planned against `case-18`.
+The three deferred exemplars (on-time / late / mixed-history) remain deferred
+per the backlog. Keep future `HANDOFF.md` updates under 280 lines.
 
 ## Working-document links
 

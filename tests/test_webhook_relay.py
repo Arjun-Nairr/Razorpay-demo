@@ -263,6 +263,85 @@ def test_slow_body_read_times_out(monkeypatch, relay, upstream):
     assert _UpstreamStub.seen == []  # never forwarded a partial body
 
 
+def test_drip_fed_bytes_cannot_extend_the_absolute_deadline(monkeypatch, relay, upstream):
+    """Regression for an inactivity-only timeout: a sender that NEVER goes
+    quiet for longer than the budget (so a per-recv/inactivity timer would
+    never fire and could be drip-fed forever) must still be cut off once the
+    ABSOLUTE deadline passes. The client keeps actively sending, in a
+    background thread, for far longer than the budget; the server must
+    reject well before the client is done - proving the deadline is
+    anchored to when the read STARTED, not reset by each new byte."""
+    monkeypatch.setattr(relay_mod, "BODY_READ_TIMEOUT_S", 0.5)
+    port = relay.server_address[1]
+    stop = threading.Event()
+
+    def _drip(sock):
+        # 1 byte every 0.1s, well under the 0.5s budget per gap, for up to
+        # 3s total - roughly 6x the absolute deadline - unless told to stop.
+        for _ in range(30):
+            if stop.is_set():
+                return
+            try:
+                sock.sendall(b"x")
+            except OSError:
+                return
+            time.sleep(0.1)
+
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+        s.sendall(
+            b"POST /webhooks/razorpay-test HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            b"Content-Length: 1000\r\nConnection: close\r\n\r\n"
+        )
+        sender = threading.Thread(target=_drip, args=(s,), daemon=True)
+        t0 = time.monotonic()
+        sender.start()
+        s.settimeout(5)
+        chunks = []
+        try:
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        except OSError:
+            # A concurrently-writing sender thread racing the server's own
+            # post-response close can surface as ECONNRESET here on some
+            # platforms instead of a clean EOF - either way, we're done.
+            pass
+        elapsed = time.monotonic() - t0
+        stop.set()
+        sender.join(timeout=2)
+    assert _status_of(b"".join(chunks)) == 408
+    assert _UpstreamStub.seen == []  # never forwarded a partial body
+    # The client was actively sending (never quiet for >0.1s) for the whole
+    # 3s it was allowed to run - an inactivity-only timer would never have
+    # fired. Rejecting well before that proves the ABSOLUTE deadline fired.
+    assert elapsed < 2.0
+
+
+def test_premature_eof_is_rejected_and_never_forwarded(relay, upstream):
+    port = relay.server_address[1]
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+        s.sendall(
+            b"POST /webhooks/razorpay-test HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            b"Content-Length: 50\r\nConnection: close\r\n\r\n"
+            b"only nine"  # 9 of the declared 50 bytes
+        )
+        s.shutdown(socket.SHUT_WR)  # client hangs up mid-body - a real premature EOF
+        s.settimeout(5)
+        chunks = []
+        try:
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        except (TimeoutError, socket.timeout):
+            pass
+    assert _status_of(b"".join(chunks)) == 400
+    assert _UpstreamStub.seen == []  # never forwarded the partial body
+
+
 # --- sanitized logging: no raw path, query string, headers, or body -------
 
 
@@ -290,3 +369,26 @@ def test_log_output_is_method_status_and_fixed_category_only(relay, upstream, ca
     out = capsys.readouterr().out
     assert "webhook" in out and "401" in out and "POST" in out
     assert "{" not in out  # never the body
+
+
+def test_attacker_controlled_method_token_never_appears_in_logs(relay, upstream, capsys):
+    """self.command is whatever raw token the client put in the request line -
+    never printed directly. An unrecognized method must log as the fixed
+    label "OTHER", never the attacker's own text."""
+    port = relay.server_address[1]
+    weird = "FOO<script>bar"
+    req = (f"{weird} /webhooks/razorpay-test HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+           f"Connection: close\r\n\r\n").encode()
+    _raw_request(port, req)
+    time.sleep(0.05)
+    out = capsys.readouterr().out
+    assert weird not in out
+    assert "<script>" not in out
+    assert "OTHER" in out
+
+
+def test_known_methods_are_logged_by_their_own_name(relay, upstream, capsys):
+    _get(_url(relay, "/nope"))  # GET, rejected path -> still a known method
+    time.sleep(0.05)
+    out = capsys.readouterr().out
+    assert "GET" in out and "OTHER" not in out
