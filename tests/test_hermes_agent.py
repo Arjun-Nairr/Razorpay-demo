@@ -536,6 +536,86 @@ def test_system_prompt_orders_soul_before_skill_before_case_context():
     assert i_soul < i_skill < i_case
 
 
+def test_invalid_utf8_soul_fails_closed(tmp_path):
+    bad_soul = tmp_path / "soul_bad.md"
+    bad_soul.write_bytes(b"\xff\xfe not valid utf-8")
+    good_skill = tmp_path / "skill.md"
+    good_skill.write_text("skill", encoding="utf-8")
+    with pytest.raises(HermesRuntimeUnavailable, match="soul"):
+        HermesAgentStrategist(
+            home=tmp_path / "h", checkout=_fake_checkout(tmp_path), verify_revision=False,
+            soul_path=bad_soul, skill_path=good_skill,
+        )
+
+
+def test_invalid_utf8_skill_fails_closed(tmp_path):
+    good_soul = tmp_path / "soul.md"
+    good_soul.write_text("soul", encoding="utf-8")
+    bad_skill = tmp_path / "skill_bad.md"
+    bad_skill.write_bytes(b"\xff\xfe not valid utf-8")
+    with pytest.raises(HermesRuntimeUnavailable, match="skill"):
+        HermesAgentStrategist(
+            home=tmp_path / "h", checkout=_fake_checkout(tmp_path), verify_revision=False,
+            soul_path=good_soul, skill_path=bad_skill,
+        )
+
+
+def test_stale_run_meta_not_leaked_after_instruction_load_failure(monkeypatch, tmp_path):
+    """A successful decision followed by a removed instruction file must not
+    leave the previous successful run's metadata on the new failure."""
+    soul_path = tmp_path / "soul.md"
+    skill_path = tmp_path / "skill.md"
+    soul_path.write_text("soul text", encoding="utf-8")
+    skill_path.write_text("skill text", encoding="utf-8")
+
+    ok_payload = _SENTINEL + json.dumps({
+        "ok": True,
+        "proposal": {"action": "WAIT_FOR_PROVIDER_RETRY", "diagnosis": "d", "rationale": "r",
+                     "confidence": 0.6, "proposed_wait_hours": 24, "message_intent": None},
+        "audit": {"validation_result": "valid", "tool_calls_used": 2, "confidence_band": "medium"},
+    })
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: _fake_proc(ok_payload, rc=0))
+    strat = HermesAgentStrategist(
+        mock_base_url="http://127.0.0.1:1/v1", home=tmp_path / "h",
+        checkout=_fake_checkout(tmp_path), python=__import__("sys").executable,
+        verify_revision=False, soul_path=soul_path, skill_path=skill_path,
+    )
+    p = strat.propose(_snap())
+    assert p.action is ProposalAction.WAIT_FOR_PROVIDER_RETRY
+    assert strat.last_run_meta.extra.get("tool_calls_used") == 2
+
+    soul_path.unlink()  # second attempt now fails to load its instructions
+    with pytest.raises(HermesRuntimeUnavailable):
+        strat.propose(_snap())
+
+    ex = strat.last_run_meta.extra
+    assert ex["failure_category"] == "instruction_load_failed"
+    assert ex["failure_stage"] == "instruction_load"
+    assert "tool_calls_used" not in ex and "confidence_band" not in ex
+    assert strat.last_run_meta.validation_result == "invalid:instruction_load_failed"
+
+
+def test_final_system_prompt_contains_real_soul_and_skill_in_order():
+    """Direct proof using the REAL project SOUL.md/SKILL.md content (not
+    markers): the final prompt contains both exact file contents, in order
+    SOUL -> SKILL -> case context -> tool/output contract."""
+    from hermes.hermes_agent import child_main
+    from hermes.hermes_agent_strategist import _SKILL_PATH, _SOUL_PATH
+
+    soul_text = _SOUL_PATH.read_text(encoding="utf-8")
+    skill_text = _SKILL_PATH.read_text(encoding="utf-8")
+    ctx = {"case_marker": "CASE-CONTEXT-MARKER"}
+    prompt = child_main._system_prompt(soul_text, skill_text, ctx, [_APPROVED_MSG])
+
+    assert soul_text.strip() in prompt
+    assert skill_text.strip() in prompt
+    i_soul = prompt.index(soul_text.strip())
+    i_skill = prompt.index(skill_text.strip())
+    i_case = prompt.index("CASE-CONTEXT-MARKER")
+    i_contract = prompt.index("Return EXACTLY one JSON object")
+    assert i_soul < i_skill < i_case < i_contract
+
+
 def test_child_stream_decoded_as_utf8_not_locale(tmp_path):
     """Regression: the child's result line must be recovered even when the
     Hermes runtime writes non-cp1252 bytes to its streams. A real tiny child

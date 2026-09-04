@@ -1,6 +1,6 @@
 # Cross-Agent Handoff — current-state index
 
-Last updated: 2026-09-04 (Asia/Dubai), Iteration 20. Branch
+Last updated: 2026-09-04 (Asia/Dubai), Iteration 21. Branch
 `feat/isolated-hermes-agent`, latest commit at bottom. This file stays
 **under 280 lines**: it is an index, not a log. Detail lives in the linked
 docs; iteration-by-iteration history is in
@@ -153,6 +153,29 @@ case context. The existing `@requires_runtime` real-Hermes/offline-stub tests
 proposal after the wiring change - this proves wiring and contract behavior
 only, not the quality of Hermes's judgment against the new SOUL/SKILL text.
 
+**Iteration 21 corrections** (4 review findings closed, same iteration):
+
+1. Invalid-UTF-8 SOUL/SKILL content now fails closed too, not just missing/
+   unreadable: a shared `_read_utf8()` helper catches `(OSError, UnicodeError)`
+   in both `__init__` and `_propose_locked` and raises `HermesRuntimeUnavailable`
+   with a fixed, sanitized message (label + exception type only - never the
+   path or file content). New regression tests for SOUL and SKILL separately.
+2. `_propose_locked` now creates `HermesRunMeta` and assigns `last_run_meta`
+   **before** re-reading the instruction files; a load failure marks that
+   fresh metadata with `failure_category=instruction_load_failed` /
+   `failure_stage=instruction_load` and raises - a prior successful run's
+   confidence/tool/result metadata can no longer leak onto a later failure.
+   New regression: a successful decision, then a removed SOUL file, then
+   `last_run_meta` on the second (failing) call carries only the new failure.
+3. A direct test now builds the final `_system_prompt()` from the REAL
+   `SOUL.md`/`SKILL.md` file contents (not marker strings) and asserts both
+   exact texts appear, in order SOUL -> SKILL -> case context -> tool/output
+   contract.
+4. This section.
+
+No isolation, deadline, tool-budget, repair-limit, audit-allowlist, policy,
+dependency, provider, fixture, or dashboard change. No live service called.
+
 ## Verified evidence
 
 - **Offline**: `python -m pytest -q --ignore=tests/test_hermes_agent.py` ->
@@ -175,6 +198,17 @@ only, not the quality of Hermes's judgment against the new SOUL/SKILL text.
   -> **373 passed, 3 skipped** (+4 `test_webhook_relay.py`). `compileall` +
   `git diff --check` clean; secret scan clean. No API/relay/tunnel started, no
   live Gemini/Razorpay/Neon call - offline only, as authorized.
+- **Iteration 21** (SOUL wiring + corrections), using the project
+  `.venv\Scripts\python.exe` (3.12.5): focused
+  `python -m pytest -q tests/test_hermes_agent.py` -> **41 passed** (was 33
+  pre-wiring, 37 after wiring, +4 correction regressions: invalid-UTF-8 SOUL,
+  invalid-UTF-8 SKILL, stale-metadata-not-leaked, real-file prompt-order
+  proof). Full offline `python -m pytest -q --ignore=tests/test_hermes_agent.py`
+  -> **373 passed, 3 skipped** (unchanged - this iteration touched only
+  `hermes_agent_strategist.py`/`child_main.py`/`test_hermes_agent.py`/
+  `HANDOFF.md`). `compileall` + `git diff --check` clean; diff inspected,
+  confined to those files plus this section; no secrets. Offline-stub tests
+  prove wiring/contract behavior only, never Hermes's judgment quality.
 
 ## Inspecting the persisted proof
 
@@ -209,11 +243,13 @@ actually wired to `hermes-runtime` + `hybrid_test_mode` + enabled.
 
 ## Next action
 
-Codex/user will author the Hermes SOUL and judgment drafts against the
-existing Neon evidence contract (the five views + `ledger_state`) - not
-Claude Code in this task. No further live action planned against `case-18`.
-The three deferred exemplars (on-time / late / mixed-history) remain deferred
-per the backlog. Keep future `HANDOFF.md` updates under 280 lines.
+Run one real consistent-history Hermes/Gemini exemplar (the SOUL + Rule 1
+judgment now wired in), persist it to Neon, and read it back through the five
+presentation views (`case_summary`, `hermes_decisions`, `recovery_actions`,
+`hermes_evidence`, `audit_timeline`). No further live action planned against
+`case-18`. The two remaining deferred exemplars (inconsistent / mixed-history
+rules + cases) stay deferred per the backlog. Keep future `HANDOFF.md`
+updates under 280 lines.
 
 ## Working-document links
 

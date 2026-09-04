@@ -62,6 +62,7 @@ _PARENT_FAIL_NO_RESULT = "no_result_line"
 _PARENT_FAIL_ABNORMAL_EXIT = "abnormal_child_exit"
 _PARENT_FAIL_CHILD = "child_reported_failure"
 _PARENT_FAIL_PROPOSAL_SHAPE = "proposal_shape"
+_PARENT_FAIL_INSTRUCTION_LOAD = "instruction_load_failed"
 
 # Only the actions deterministic policy can authorize + execute today. This is
 # what the child advertises as the "allowed actions" catalog. STOP and a
@@ -115,6 +116,17 @@ class HermesRunMeta:
     usage: dict[str, Any] | None = None
     cost_usd: float | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+
+
+def _read_utf8(path: Path, label: str) -> str:
+    """Read a project instruction file as UTF-8, failing closed. Never surfaces
+    the path or file content - only the fixed label and exception type."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise HermesRuntimeUnavailable(
+            f"project {label} file unreadable: {type(exc).__name__}"
+        ) from exc
 
 
 def _verify_revision(checkout: Path) -> str:
@@ -276,11 +288,8 @@ class HermesAgentStrategist:
             raise HermesRuntimeUnavailable(f"project skill file missing: {self._skill_path}")
         if not self._soul_path.exists():
             raise HermesRuntimeUnavailable(f"project soul file missing: {self._soul_path}")
-        try:
-            self._skill_path.read_text(encoding="utf-8")
-            self._soul_path.read_text(encoding="utf-8")
-        except OSError as exc:
-            raise HermesRuntimeUnavailable(f"project soul/skill file unreadable: {exc}") from exc
+        _read_utf8(self._skill_path, "skill")
+        _read_utf8(self._soul_path, "soul")
         self._revision = _verify_revision(self._checkout) if verify_revision else "unverified"
         self._prepare_home()
 
@@ -385,12 +394,29 @@ class HermesAgentStrategist:
             self._one_in_flight.release()
 
     def _propose_locked(self, snap: StrategySnapshot) -> StrategyProposal:
+        # Fresh metadata for THIS attempt before any instruction loading, so a
+        # failure below can never leave a previous successful run's metadata
+        # (confidence, tool usage, validation_result) attached to this failure.
+        meta = HermesRunMeta(model=(self._mock_model if self._mock_base_url else self._gemini_model))
+        meta.extra = {"runtime_revision": self._revision}
+        self.last_run_meta = meta
+
+        try:
+            soul_text = _read_utf8(self._soul_path, "soul")
+            skill_text = _read_utf8(self._skill_path, "skill")
+        except HermesRuntimeUnavailable:
+            meta.validation_result = "invalid:instruction_load_failed"
+            meta.extra = {"runtime_revision": self._revision,
+                          "failure_category": _PARENT_FAIL_INSTRUCTION_LOAD,
+                          "failure_stage": "instruction_load"}
+            raise
+
         job = {
             "mode": "mock" if self._mock_base_url else "gemini",
             "deadline_s": self._deadline_s,
             "max_iterations": MAX_MODEL_ITERATIONS,
-            "soul_text": self._soul_path.read_text(encoding="utf-8"),
-            "skill_text": self._skill_path.read_text(encoding="utf-8"),
+            "soul_text": soul_text,
+            "skill_text": skill_text,
             "approved_messages": list(APPROVED_MESSAGE_INTENT_LIST),
             "evidence_bundle": _evidence_bundle(
                 snap, history_available=self._history_available,
@@ -403,9 +429,6 @@ class HermesAgentStrategist:
             job["gemini"] = {"model": self._gemini_model}
 
         started = time.monotonic()
-        meta = HermesRunMeta(model=(self._mock_model if self._mock_base_url else self._gemini_model))
-        meta.extra = {"runtime_revision": self._revision}
-        self.last_run_meta = meta
         try:
             proc = subprocess.run(
                 [str(self._python), CHILD_MAIN],
