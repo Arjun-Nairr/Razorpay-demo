@@ -47,6 +47,15 @@ from .types import InvalidProposal, ProposalAction, StrategyProposal, StrategySn
 # returns the real per-case audit projection.
 PROMPT_VERSION = "hermes-agent/2026-09-05.1"
 
+# Bump to invalidate any previously-cached CA bundle on disk (e.g. the earlier
+# fix imported every OS root indiscriminately, ignoring trust purpose and
+# encoding; this rebuilds it immediately instead of trusting the old file for
+# up to 24h).
+_CA_BUNDLE_VERSION = "2"
+# id-kp-serverAuth (RFC 5280): the only extended-key-usage purpose a CA root
+# needs to be trusted for here - this is a TLS client only.
+_SERVER_AUTH_OID = "1.3.6.1.5.5.7.3.1"
+
 # Fixed, allowlisted parent-side failure categories (no raw strings ever).
 _PARENT_FAIL_TIMEOUT = "subprocess_deadline"
 _PARENT_FAIL_NO_RESULT = "no_result_line"
@@ -278,20 +287,30 @@ class HermesAgentStrategist:
 
     def _ca_bundle(self) -> str | None:
         """Path to a CA bundle the child should trust for outbound HTTPS: the
-        ``certifi`` roots PLUS whatever the OS trust store holds. On machines
-        with a TLS-inspecting proxy/AV (e.g. Avast Web Shield re-signs
+        ``certifi`` roots PLUS whatever the OS trust store holds a
+        server-authentication cert for. On machines with a TLS-inspecting
+        proxy/AV (e.g. Avast Web Shield re-signs
         ``generativelanguage.googleapis.com`` with a local root), the child's
         ``certifi``-only client otherwise fails verification even though the OS
-        trusts the chain. This does NOT weaken verification - it makes the
-        isolated venv trust exactly what the machine already trusts. Written
-        once into the gitignored isolated home; refreshed if stale."""
+        trusts the chain. This does NOT weaken verification: it still requires
+        a signature chaining to a trusted root, and it imports only OS roots
+        that are actually valid for server auth - not every cert the OS store
+        happens to hold (code-signing/email-only roots are excluded). Written
+        once into the gitignored isolated home; refreshed if stale or if the
+        bundle format changed (``_CA_BUNDLE_VERSION``), so a previously
+        generated broader bundle is rebuilt rather than reused."""
         try:
             import ssl  # noqa: PLC0415
 
+            header = f"# hermes-ca-bundle v{_CA_BUNDLE_VERSION}\n".encode()
             out = self._home / "ca-bundle.pem"
             if out.exists() and (time.time() - out.stat().st_mtime) < 86400:
-                return str(out)
-            parts: list[bytes] = []
+                try:
+                    if out.read_bytes().startswith(header):
+                        return str(out)
+                except Exception:  # noqa: BLE001
+                    pass
+            parts: list[bytes] = [header]
             try:
                 import certifi  # noqa: PLC0415
 
@@ -300,11 +319,19 @@ class HermesAgentStrategist:
                 pass
             for store in ("ROOT", "CA"):
                 try:
-                    for der, _enc, _trust in ssl.enum_certificates(store):
-                        parts.append(ssl.DER_cert_to_PEM_cert(der).encode())
+                    entries = ssl.enum_certificates(store)
                 except Exception:  # noqa: BLE001 - non-Windows / unavailable
-                    pass
-            if not parts:
+                    continue
+                for der, encoding, trust in entries:
+                    if encoding != "x509_asn":
+                        continue  # unsupported encoding; never guess-parse it
+                    if trust is not True and _SERVER_AUTH_OID not in trust:
+                        continue  # not trusted for TLS server authentication
+                    try:
+                        parts.append(ssl.DER_cert_to_PEM_cert(der).encode())
+                    except Exception:  # noqa: BLE001 - skip a single bad cert
+                        continue
+            if len(parts) <= 1:  # only the header - nothing usable found
                 return None
             out.write_bytes(b"\n".join(parts))
             return str(out)

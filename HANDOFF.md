@@ -1,6 +1,6 @@
 # Cross-Agent Handoff — current-state index
 
-Last updated: 2026-09-04 (Asia/Dubai). Branch `feat/isolated-hermes-agent`,
+Last updated: 2026-09-04 (Asia/Dubai), Iteration 14. Branch `feat/isolated-hermes-agent`,
 latest commit at bottom. This file stays **under 300 lines**: it is an index,
 not a log. Detail lives in the linked docs; iteration-by-iteration history is in
 [`docs/archive/HANDOFF_full_2026-09-04.md`](docs/archive/HANDOFF_full_2026-09-04.md).
@@ -97,63 +97,97 @@ index; it does **not** authorize implementation. History on demand: the archive.
   messages, stderr slices, or transcripts. `confidence` never grants a
   permission and is never required to rise after more evidence.
 
-## Startup & connectivity (Iteration 13 — fixed)
+## Startup & connectivity (Iteration 13, refined in 14)
 
-The `run_demo.ps1 -Mode hermes` "silent stall" had **two local causes**, now
-fixed; the earlier "Neon outage" claim is **superseded/unproven**.
+The `run_demo.ps1 -Mode hermes` "silent stall" had **two local causes**, fixed
+in Iteration 13; the earlier "Neon outage" claim is **superseded/unproven**.
+Iteration 14 closed three edge cases the review found in that fix (see
+[the archive](docs/archive/HANDOFF_full_2026-09-04.md) for full narrative).
 
 1. **IPv6 black hole.** `getaddrinfo` returned AAAA first; each dead IPv6 SYN
    cost ~21 s before libpq fell to IPv4 (~0.1 s). Fix: `pg_ledger` resolves an
    IPv4 and passes it as libpq `hostaddr` (TLS still verifies the cert against
    `host`; `sslmode`/`channel_binding` from the DSN untouched). Real Neon now
-   connects in ~3 s.
+   connects in ~3 s. **Iteration 14:** the resolution itself is now bounded
+   (a hung resolver used to block before the deadline clock even started; it
+   now shares the same startup budget and falls back to unresolved on stall).
 2. **TLS interception.** Avast "Web/Mail Shield" re-signs
    `generativelanguage.googleapis.com` with a local root absent from the child
    venv's `certifi`, so the Gemini call failed verification. Fix: the parent
-   writes a CA bundle (`certifi` + the OS ROOT/CA store) into the gitignored
+   writes a CA bundle (`certifi` + the OS trust store) into the gitignored
    isolated home and hands it to the child via `SSL_CERT_FILE` /
    `REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE` / `GRPC_DEFAULT_SSL_ROOTS_FILE_PATH`.
-   This does **not** weaken TLS — it makes the isolated venv trust exactly what
-   the machine already trusts. Override with `HERMES_CA_BUNDLE`.
+   **Iteration 14:** the bundle now imports only OS-store certs that carry
+   `x509_asn` encoding AND are trusted for TLS server-auth (`1.3.6.1.5.5.7.3.1`)
+   — the first cut imported every OS root regardless of purpose/encoding. The
+   on-disk cache is versioned (`_CA_BUNDLE_VERSION`) so any previously-written
+   broad bundle is discarded and rebuilt immediately, not reused for the rest
+   of its 24h window. Still does **not** weaken verification — full chain
+   verification, just scoped to what the OS actually trusts for this purpose.
+   Override with `HERMES_CA_BUNDLE`.
 3. **Encoding.** The parent decodes the child's streams as UTF-8
    (`errors="replace"`); Windows cp1252 was dropping the result line
    (spurious `no_result_line`).
-4. **One bounded startup budget.** `HERMES_DB_CONNECT_TIMEOUT_S` (default 30 s)
-   bounds connect **+ the advisory-lock probe + first read** together;
-   `run_demo.ps1` waits that budget + 30 s fixed margin, so the launcher
-   ceiling is always the looser one. The launcher uses
+4. **One bounded startup budget**, now covering DNS too. `HERMES_DB_CONNECT_TIMEOUT_S`
+   (default 30 s) bounds DNS pre-resolution + connect + the advisory-lock probe
+   **+ the first snapshot read** together (the first read used to run after all
+   bounding was over — unbounded); `run_demo.ps1` waits that budget + 30 s fixed
+   margin, so the launcher ceiling is always the looser one. The launcher uses
    `.venv\Scripts\python.exe` explicitly for uvicorn **and** Streamlit.
-5. Startup failures still exit fast with one sanitised stderr line + nonzero
+5. **Timeout cleanup no longer risks blocking on a busy connection.** After a
+   writer-lock-probe (or first-read) timeout, the probe's own thread may still
+   be mid-query on that connection; psycopg serialises access to a connection
+   with its own lock, so a synchronous `rollback()`/`close()` from the main
+   thread would wait for that stuck query — reintroducing the same stall. A
+   genuine timeout (`_BoundedTimeout`) now only schedules a best-effort close
+   on its own daemon thread; a real completed error (thread already finished)
+   still gets a synchronous rollback+close as before.
+6. **Late-connection race closed.** `_connect_once`'s worker and the timed-out
+   caller now decide the connection's fate under one lock (`state["claimed"]`)
+   instead of an independent `Event` check on one side and `is_alive()` on the
+   other — the connection is always either returned to the caller or closed by
+   the worker, never dropped unclosed.
+7. Startup failures still exit fast with one sanitised stderr line + nonzero
    code (never the DSN); only positively-identified project processes were ever
    stopped.
 
 ## Verified evidence
 
 - **Offline:** `python -m pytest -q --ignore=tests/test_hermes_agent.py` ->
-  **233 passed, 3 skipped**. Real-Hermes harness
-  `python -m pytest -q tests/test_hermes_agent.py` -> **29 passed (~5 min)** (real
-  `AIAgent` + tool loop against a stubbed OpenAI-compat transport; 8
-  parent-shape/bundle tests need no runtime). `compileall` + `git diff --check`
-  clean. `+8` new `test_pg_ledger.py` bounded-startup regressions; `+1`
-  `test_hermes_agent.py` UTF-8 decode regression.
+  **237 passed, 3 skipped**. Real-Hermes harness
+  `python -m pytest -q tests/test_hermes_agent.py` -> **33 passed (~5 min)** (real
+  `AIAgent` + tool loop against a stubbed OpenAI-compat transport; parent-shape/
+  bundle/CA-trust tests need no runtime). `compileall` + `git diff --check`
+  clean. Iteration 14 added `+4` `test_pg_ledger.py` regressions (bounded DNS,
+  bounded first read, timeout cleanup does not touch a busy connection,
+  late-connection race at the exact boundary — 50-trial deterministic
+  interleaving) and `+4` `test_hermes_agent.py` regressions (CA bundle:
+  server-auth-trusted cert included, restricted-purpose cert excluded,
+  unsupported encoding skipped, previously-generated broad bundle rebuilt).
 - **LIVE, end-to-end (actual Hermes -> Gemini -> deterministic policy ->
-  simulated payments -> Neon):** case **`case-11`** / obligation
-  `sub_demo_0003_9bc1578f`. Two real `gemini-3.7-flash` decisions
-  (`validation_result=valid`, `confidence_band=high`, 2 evidence tool calls
-  each, ~16 s each): `WAIT_FOR_PROVIDER_RETRY` -> policy `ALLOW`
+  simulated payments -> Neon), Iteration 13, re-verified read-only in 14:**
+  case **`case-11`** / obligation `sub_demo_0003_9bc1578f`. Two real
+  `gemini-3.7-flash` decisions (`validation_result=valid`, 2 evidence tool
+  calls each, ~16 s each): `WAIT_FOR_PROVIDER_RETRY` -> policy `ALLOW`
   (`provider_retry_permitted`); then after a simulated failed retry,
   `CREATE_RECOVERY_LINK` -> policy `ALLOW`
   (`recovery_link_authorized_message_authorized`) -> action intent + outcome.
-  Simulated capture on the uniquely-correlated link ->
-  `TERMINAL_TRANSITION`. **Independently read back from Neon** (direct
-  `psycopg`, not via the API): `state=recovered`, `attribution=hermes_assisted`,
-  `counted=true`, `linked_payment_id=rlnk_case-11:CREATE_RECOVERY_LINK`, ledger
-  `recovered_minor` total `1000000`. Budgets preserved (<=2 iters, <=2 tools
-  per decision, no repair).
-- Two earlier cases this session (`case-1`, `case-6`) are honest failures from
-  the two defects above (UTF-8 decode; Avast TLS) and were left `escalated` /
-  `unrecovered` — **not drained or retried after the fix**; only `case-11` was
-  run to completion once both fixes landed.
+  Simulated capture on the uniquely-correlated link -> `TERMINAL_TRANSITION`.
+  Iteration 14 re-read this SAME case, read-only, direct `psycopg`, one bounded
+  query, no writes, no advisory lock taken: `state=recovered`,
+  `attribution=hermes_assisted`, `counted=true`, both `AI_MODEL_RUN` records
+  `validation_result=valid`, both `POLICY_DECISION` records `outcome=ALLOW`,
+  `linked_payment_id=rlnk_case-11:CREATE_RECOVERY_LINK`. Case's own
+  contribution `recovered_minor=1,000,000` (== its `amount_minor`, this is a
+  per-case field) vs the ledger-wide aggregate `recovered_minor=1,000,000`
+  across `cases=3`/`recovered_cases=1` — same number here only because exactly
+  one case has recovered so far; they are different fields. **This read-only
+  re-check is not a new live Gemini/Hermes proof** — no new case was run this
+  iteration, per scope (local fixes only).
+- Two earlier cases from Iteration 13 (`case-1`, `case-6`) are honest failures
+  from the two defects fixed there (UTF-8 decode; Avast TLS) and were left
+  `escalated` / `unrecovered` — **not drained or retried**; only `case-11` ever
+  reached `recovered`.
 
 ## Inspecting the persisted proof
 
@@ -188,9 +222,12 @@ genuine cold resume ever needs > 30 s.
 
 ## Next action
 
-Codex review of the Iteration 13 milestone (startup fixes + the live `case-11`
-proof). Then, per the backlog: the Razorpay Test Mode hybrid slice and the
-remaining golden cases / five-case dashboard. Keep future `HANDOFF.md` updates
+Codex verification of the Iteration 14 corrections (bounded DNS/first-read,
+non-blocking timeout cleanup, closed late-connection race, restricted-purpose
+CA trust), then the Razorpay Test Mode integration into the existing working
+`case-11` slice (see `IMPLEMENTATION_BACKLOG.md` §2) — not yet started. The
+three deferred exemplars (on-time / late / mixed-history) come after that;
+they supersede the earlier five-case plan. Keep future `HANDOFF.md` updates
 under 300 lines — archive completed detail into `docs/archive/`.
 
 ## Working-document links

@@ -85,12 +85,40 @@ def _ipv4_hostaddr(dsn: str) -> str | None:
     return None
 
 
+def _bounded_best_effort(fn: Callable[[], Any], seconds: float) -> Any:
+    """Run ``fn()`` on a daemon thread; return its result, or ``None`` on
+    timeout/exception. Used for best-effort steps (DNS pre-resolution) that
+    must never block past their share of the startup budget - a stall here
+    just falls back to letting the next bounded step resolve it."""
+    box: dict[str, Any] = {}
+
+    def _w() -> None:
+        try:
+            box["v"] = fn()
+        except Exception:  # noqa: BLE001
+            pass
+
+    th = threading.Thread(target=_w, name="pg-bestfx", daemon=True)
+    th.start()
+    th.join(max(0.0, seconds))
+    return box.get("v")
+
+
 def _connect_once(psycopg: Any, dsn: str, per_attempt_s: float, hostaddr: str | None):
     """One bounded ``psycopg.connect`` on a daemon thread. If the join times
     out, a late-successful connection on the orphan thread is closed rather than
-    leaked."""
+    leaked.
+
+    The connection's fate is decided under one lock shared by both threads, not
+    by re-checking ``Event``/``is_alive`` independently: the worker and the
+    joiner each try to *claim* the result, and whichever claims it first wins.
+    That closes the boundary race where the worker sees "not abandoned yet",
+    then the joiner times out and stops looking, and the worker's connection is
+    never returned to anyone and never closed.
+    """
     box: dict[str, Any] = {}
-    abandoned = threading.Event()
+    lock = threading.Lock()
+    state = {"claimed": False}
 
     def _work() -> None:
         try:
@@ -99,26 +127,38 @@ def _connect_once(psycopg: Any, dsn: str, per_attempt_s: float, hostaddr: str | 
                 kw["hostaddr"] = hostaddr  # cert still verified against host
             conn = psycopg.connect(dsn, **kw)
         except BaseException as exc:  # noqa: BLE001 - reported by type only
-            box["err"] = exc
+            with lock:
+                if state["claimed"]:
+                    return  # joiner already gave up and moved on; nothing to do
+                box["err"] = exc
+                state["claimed"] = True
             return
-        if abandoned.is_set():
-            try:
-                conn.close()
-            except Exception:  # noqa: BLE001
-                pass
-            box["late_closed"] = True
-            return
-        box["conn"] = conn
+        with lock:
+            if state["claimed"]:
+                # joiner already gave up: close now, this thread is the only
+                # remaining owner of the connection.
+                try:
+                    conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                box["late_closed"] = True
+                return
+            box["conn"] = conn
+            state["claimed"] = True
 
     th = threading.Thread(target=_work, name="pg-connect", daemon=True)
     th.start()
     th.join(per_attempt_s)
-    if th.is_alive():
-        abandoned.set()  # a connection that lands after this is closed by _work
-        return None, "timeout"
-    if "err" in box:
-        return None, type(box["err"]).__name__
-    return box.get("conn"), None
+    with lock:
+        if state["claimed"]:
+            # The worker delivered before/at the moment we looked, regardless
+            # of th.is_alive() timing - we own the result now.
+            if "conn" in box:
+                return box["conn"], None
+            return None, type(box["err"]).__name__
+        state["claimed"] = True  # too late for the worker to hand us anything;
+        # it will see this and close the connection itself.
+    return None, "timeout"
 
 
 def _connect_bounded(psycopg: Any, dsn: str, total_timeout_s: float,
@@ -133,8 +173,13 @@ def _connect_bounded(psycopg: Any, dsn: str, total_timeout_s: float,
         except (TypeError, ValueError):
             attempts = _DEFAULT_CONNECT_ATTEMPTS
     attempts = max(1, attempts)
-    hostaddr = _ipv4_hostaddr(dsn)
     deadline = time.monotonic() + total_timeout_s
+    # DNS pre-resolution is best-effort and must not itself stall past the
+    # budget (a hung resolver used to block here with no timeout at all).
+    # Give it a modest slice of the total budget; whatever remains still
+    # goes to the connect attempt(s) below.
+    dns_budget = max(0.5, min(5.0, total_timeout_s / 4, deadline - time.monotonic()))
+    hostaddr = _bounded_best_effort(lambda: _ipv4_hostaddr(dsn), dns_budget)
     last = "timeout"
     for i in range(attempts):
         remaining = deadline - time.monotonic()
@@ -154,10 +199,20 @@ def _connect_bounded(psycopg: Any, dsn: str, total_timeout_s: float,
     )
 
 
+class _BoundedTimeout(RuntimeError):
+    """Raised by :func:`_run_bounded` when ``fn`` did not finish in time. A
+    distinct type (not a bare ``RuntimeError``) so callers can tell "the
+    background thread is still busy on the connection" apart from "the
+    operation ran to completion and raised" - the two need different cleanup:
+    a still-busy connection must not be touched synchronously (see
+    ``PostgresSnapshotStore.__init__``)."""
+
+
 def _run_bounded(fn, seconds: float, on_timeout_msg: str):
-    """Run ``fn()`` on a daemon thread; raise ``RuntimeError(on_timeout_msg)``
+    """Run ``fn()`` on a daemon thread; raise ``_BoundedTimeout(on_timeout_msg)``
     if it does not finish within ``seconds`` (keeps post-connect init inside the
-    same startup budget). Propagates ``fn``'s own exception if it raises."""
+    same startup budget). Propagates ``fn``'s own exception, with its own type,
+    if it raises before the deadline."""
     box: dict[str, Any] = {}
 
     def _w() -> None:
@@ -170,7 +225,7 @@ def _run_bounded(fn, seconds: float, on_timeout_msg: str):
     th.start()
     th.join(seconds)
     if th.is_alive():
-        raise RuntimeError(on_timeout_msg)
+        raise _BoundedTimeout(on_timeout_msg)
     if "e" in box:
         raise box["e"]
     return box.get("v")
@@ -298,9 +353,16 @@ class PostgresSnapshotStore:
 
         start = time.monotonic()
         self._conn = _connect_bounded(psycopg, dsn, budget)
-        # The advisory-lock probe runs inside the SAME budget so a hung
-        # post-connect query cannot blow past it.
-        remaining = max(2.0, budget - (time.monotonic() - start))
+        # The advisory-lock probe AND the first read run inside the SAME
+        # budget as the connect, so a hung post-connect query cannot blow
+        # past the one startup deadline the caller was promised.
+
+        def _deadline_msg(what: str) -> str:
+            return (f"database did not respond to the {what} within the "
+                    f"{int(budget)}s startup budget")
+
+        def _remaining() -> float:
+            return max(2.0, budget - (time.monotonic() - start))
 
         def _take_lock() -> bool:
             with self._conn.cursor() as cur:
@@ -310,17 +372,12 @@ class PostgresSnapshotStore:
             return v
 
         try:
-            got = _run_bounded(
-                _take_lock, remaining,
-                f"database did not respond to the writer-lock probe within the "
-                f"{int(budget)}s startup budget",
-            )
+            got = _run_bounded(_take_lock, _remaining(), _deadline_msg("writer-lock probe"))
+        except _BoundedTimeout:
+            self._close_after_busy_timeout()  # the probe thread may still own the
+            raise                             # connection; do not touch it here
         except Exception:
-            try:
-                self._conn.rollback()
-            except Exception:  # noqa: BLE001
-                pass
-            self._conn.close()
+            self._safe_close_after_completed_error()
             raise
         if not got:
             self._conn.close()
@@ -330,7 +387,50 @@ class PostgresSnapshotStore:
                 "HERMES_DEMO_SCHEMA."
             )
 
-    def read(self) -> dict[str, Any] | None:
+        # First read, still inside the same startup budget (fix: this used to
+        # be unbounded, so a hung query here silently reintroduced the stall
+        # the connect/lock bounding was meant to close).
+        try:
+            self._initial_read: dict[str, Any] | None = _run_bounded(
+                self._do_read, _remaining(), _deadline_msg("initial read"),
+            )
+        except _BoundedTimeout:
+            self._close_after_busy_timeout()
+            raise
+        except Exception:
+            self._safe_close_after_completed_error()
+            raise
+        self._initial_read_pending = True
+
+    # -- timeout cleanup ---------------------------------------------------
+    # Two different failure shapes need two different cleanups. When a bounded
+    # step (``_run_bounded``) actually completes and raises, the background
+    # thread is done and ``self._conn`` is idle: rollback+close on THIS thread
+    # is safe. When it times out, the background thread may still be inside
+    # ``cur.execute`` on the SAME connection - psycopg serialises access to a
+    # connection with its own internal lock, so calling rollback()/close() from
+    # this thread would block on that lock until the stuck query returns,
+    # reintroducing the exact silent stall this budget exists to prevent. So on
+    # a genuine timeout we never touch the connection synchronously; a
+    # best-effort close runs on its own daemon thread instead.
+
+    def _safe_close_after_completed_error(self) -> None:
+        try:
+            self._conn.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        self._conn.close()
+
+    def _close_after_busy_timeout(self) -> None:
+        threading.Thread(target=self._best_effort_close, name="pg-close", daemon=True).start()
+
+    def _best_effort_close(self) -> None:
+        try:
+            self._conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _do_read(self) -> dict[str, Any] | None:
         try:
             with self._conn.cursor() as cur:
                 cur.execute(f"SELECT data FROM {self._schema}.ledger_state WHERE id = 1")
@@ -345,6 +445,12 @@ class PostgresSnapshotStore:
                 "`python scripts/init_neon.py` against DATABASE_URL first"
             )
         return row[0] or None
+
+    def read(self) -> dict[str, Any] | None:
+        if self._initial_read_pending:
+            self._initial_read_pending = False
+            return self._initial_read
+        return self._do_read()
 
     def write(self, data: dict[str, Any]) -> None:
         payload = json.dumps(data)

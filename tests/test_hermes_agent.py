@@ -14,10 +14,12 @@ with a fake ``subprocess.run``.
 from __future__ import annotations
 
 import json
+import ssl
 import subprocess
 import threading
 import types
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 import pytest
 
@@ -487,3 +489,74 @@ def test_child_stream_decoded_as_utf8_not_locale(tmp_path):
     payload = mod._parse_result(proc.stdout)
     assert payload is not None and payload["ok"] is True
     assert payload["proposal"]["action"] == "ESCALATE"
+
+
+# === CA bundle: restricted trust purpose + encoding (offline, no runtime) ===
+
+
+def _bare_strategist(tmp_path) -> HermesAgentStrategist:
+    fake_checkout = tmp_path / "checkout"
+    fake_checkout.mkdir()
+    (fake_checkout / "run_agent.py").write_text("# fake\n", encoding="utf-8")
+    return HermesAgentStrategist(
+        mock_base_url="http://127.0.0.1:1/v1", home=tmp_path / "h",
+        checkout=fake_checkout, python=__import__("sys").executable,
+        verify_revision=False,
+    )
+
+
+def test_ca_bundle_includes_a_server_auth_trusted_cert(monkeypatch, tmp_path):
+    strat = _bare_strategist(tmp_path)
+    monkeypatch.setattr(
+        ssl, "enum_certificates",
+        lambda store: [(b"DER-ALL-PURPOSE", "x509_asn", True)],  # trusted for everything
+    )
+    monkeypatch.setattr(ssl, "DER_cert_to_PEM_cert", lambda der: "PEM<" + der.decode() + ">")
+    path = strat._ca_bundle()
+    assert path is not None
+    assert "PEM<DER-ALL-PURPOSE>" in Path(path).read_text()
+
+
+def test_ca_bundle_excludes_a_restricted_non_server_auth_cert(monkeypatch, tmp_path):
+    """A cert the OS trusts only for e.g. code signing (not server auth) must
+    not be imported into the outbound-TLS trust store."""
+    strat = _bare_strategist(tmp_path)
+    code_signing_oid = "1.3.6.1.5.5.7.3.3"
+    monkeypatch.setattr(
+        ssl, "enum_certificates",
+        lambda store: [(b"DER-CODE-SIGNING-ONLY", "x509_asn", {code_signing_oid})],
+    )
+    monkeypatch.setattr(ssl, "DER_cert_to_PEM_cert", lambda der: "PEM<" + der.decode() + ">")
+    path = strat._ca_bundle()
+    text = Path(path).read_text() if path else ""
+    assert "PEM<DER-CODE-SIGNING-ONLY>" not in text
+
+
+def test_ca_bundle_skips_unsupported_encoding(monkeypatch, tmp_path):
+    """``ssl.enum_certificates`` documents ``x509_asn`` as the only currently
+    supported encoding; anything else must be skipped, not guess-decoded."""
+    strat = _bare_strategist(tmp_path)
+    monkeypatch.setattr(
+        ssl, "enum_certificates",
+        lambda store: [(b"NOT-REALLY-DER", "some_future_encoding", True)],
+    )
+    called = []
+    monkeypatch.setattr(ssl, "DER_cert_to_PEM_cert",
+                        lambda der: called.append(der) or "PEM<" + der.decode() + ">")
+    strat._ca_bundle()
+    assert called == []  # never handed to the DER decoder
+
+
+def test_ca_bundle_rebuilds_a_previously_generated_broad_bundle(tmp_path):
+    """A bundle written by the earlier (unrestricted) logic must be discarded
+    and rebuilt immediately, not trusted for the rest of its 24h cache window."""
+    strat = _bare_strategist(tmp_path)
+    home = tmp_path / "h"
+    home.mkdir(parents=True, exist_ok=True)
+    stale = home / "ca-bundle.pem"
+    stale.write_bytes(b"-----BEGIN CERTIFICATE-----\nSTALE-BROAD-BUNDLE\n-----END CERTIFICATE-----\n")
+    path = strat._ca_bundle()
+    assert path is not None
+    text = Path(path).read_text()
+    assert "STALE-BROAD-BUNDLE" not in text
+    assert text.startswith(f"# hermes-ca-bundle v{mod._CA_BUNDLE_VERSION}")

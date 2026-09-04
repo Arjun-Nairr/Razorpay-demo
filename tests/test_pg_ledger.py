@@ -6,6 +6,7 @@ tests/integration/ and skip unless HERMES_PG_TEST_DSN is set.
 
 from __future__ import annotations
 
+import threading
 import time
 
 import pytest
@@ -432,6 +433,124 @@ def test_post_connect_lock_probe_is_inside_the_budget():
         PostgresSnapshotStore("postgresql://localhost/x", "hermes_demo_t",
                               _psycopg=fp, connect_timeout_s=3)
     assert time.monotonic() - t0 < 8
+
+
+def test_stalled_dns_is_bounded_not_infinite(monkeypatch):
+    """DNS pre-resolution used to run before the deadline clock started, so a
+    hung resolver stalled forever. It must now consume its own bounded slice
+    of the SAME startup budget and fall back (no pre-resolved hostaddr) rather
+    than block the connect attempt behind it."""
+    import hermes.pg_ledger as pg
+    from hermes.pg_ledger import PostgresSnapshotStore
+
+    def _hang(dsn):
+        time.sleep(20)
+        return "203.0.113.9"
+
+    monkeypatch.setattr(pg, "_ipv4_hostaddr", _hang)
+    fp = _FakePsycopg(_FakeConn(row=_empty_dump(), lock_grants=[True]))
+    t0 = time.monotonic()
+    store = PostgresSnapshotStore("postgresql://localhost/x", "hermes_demo_t",
+                                  _psycopg=fp, connect_timeout_s=6)
+    assert fp.connect_kwargs.get("hostaddr") is None  # DNS was abandoned, not awaited
+    assert time.monotonic() - t0 < 6
+    store.close()
+
+
+def test_initial_read_is_bounded_not_infinite():
+    """The first snapshot read used to run after all bounding was over. A
+    hung initial read must fail within the same startup budget as connect and
+    the lock probe, not block indefinitely."""
+    from hermes.pg_ledger import PostgresSnapshotStore
+
+    class _SlowReadCursor(_FakeCursor):
+        def execute(self, sql, params=None):
+            if "SELECT data" in sql:
+                time.sleep(20)
+                return
+            return super().execute(sql, params)
+
+    class _SlowReadConn(_FakeConn):
+        def cursor(self):
+            return _SlowReadCursor(self)
+
+    fp = _FakePsycopg(_SlowReadConn(row=_empty_dump(), lock_grants=[True]))
+    t0 = time.monotonic()
+    with pytest.raises(RuntimeError, match=r"initial read within the 3s startup budget"):
+        PostgresSnapshotStore("postgresql://localhost/x", "hermes_demo_t",
+                              _psycopg=fp, connect_timeout_s=3)
+    assert time.monotonic() - t0 < 8
+
+
+def test_timeout_cleanup_does_not_block_on_a_busy_connection():
+    """Regression: after a writer-lock-probe timeout, cleanup used to call
+    ``rollback()``/``close()`` synchronously on the SAME connection the probe
+    thread might still be using. psycopg serialises access to a connection
+    with its own internal lock, so that synchronous call would block until the
+    stuck query returned - reintroducing the exact silent stall the startup
+    budget exists to prevent. Simulate that lock with a real threading.Lock
+    the stuck query holds throughout its "hang"."""
+    from hermes.pg_ledger import PostgresSnapshotStore
+
+    conn_lock = threading.Lock()
+
+    class _BusyCursor(_FakeCursor):
+        def execute(self, sql, params=None):
+            if "pg_try_advisory_lock" in sql:
+                with conn_lock:
+                    time.sleep(20)  # simulates a query stuck on the wire
+                return
+            return super().execute(sql, params)
+
+    class _BusyConn(_FakeConn):
+        def cursor(self):
+            return _BusyCursor(self)
+
+        def rollback(self):
+            with conn_lock:  # would block for ~20s if called synchronously
+                super().rollback()
+
+        def close(self):
+            with conn_lock:  # same
+                super().close()
+
+    fp = _FakePsycopg(_BusyConn(row=_empty_dump(), lock_grants=[True]))
+    t0 = time.monotonic()
+    with pytest.raises(RuntimeError, match=r"writer-lock probe within the 2s startup budget"):
+        PostgresSnapshotStore("postgresql://localhost/x", "hermes_demo_t",
+                              _psycopg=fp, connect_timeout_s=2)
+    # returned promptly - cleanup did not wait on the busy connection's lock
+    assert time.monotonic() - t0 < 5
+
+
+def test_late_connection_race_at_the_timeout_boundary_is_never_leaked_or_double_delivered():
+    """Force the exact boundary: the worker's ``connect()`` returns at
+    (approximately) the same wall-clock instant the caller's join times out.
+    Whichever side gets there first must win outright - the connection must
+    end up EITHER returned to the caller open, OR closed by the worker -
+    never dropped-and-open (leaked) and never claimed by both. Run many
+    trials to actually land on the race window."""
+    from hermes.pg_ledger import _connect_once
+
+    per_attempt_s = 0.02
+    for _ in range(50):
+        conn = _FakeConn(row=_empty_dump())
+        release = threading.Event()
+
+        class _GatedPsycopg:
+            def connect(self, dsn, **kw):
+                release.wait(1.0)
+                return conn
+
+        threading.Timer(per_attempt_s, release.set).start()  # fires ~at the deadline
+        got, err = _connect_once(_GatedPsycopg(), "postgresql://localhost/x",
+                                 per_attempt_s=per_attempt_s, hostaddr=None)
+        if got is not None:
+            assert err is None and conn.closed is False
+        else:
+            assert err == "timeout"
+            time.sleep(0.05)  # let a possibly-still-running worker close it
+            assert conn.closed is True
 
 
 def test_late_successful_connection_after_timeout_is_closed_not_leaked():
