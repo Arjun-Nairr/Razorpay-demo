@@ -1,8 +1,8 @@
 # Cross-Agent Handoff — current-state index
 
-Last updated: 2026-09-05 (Asia/Dubai), Iteration 26. Branch
+Last updated: 2026-09-05 (Asia/Dubai), Iteration 27. Branch
 `feat/isolated-hermes-agent`, latest commit at bottom. This file stays
-**under 240 lines**: it is an index, not a log. Detail lives in the linked
+**at or below 230 lines**: it is an index, not a log. Detail lives in the linked
 docs; iteration-by-iteration history is in
 [`docs/archive/HANDOFF_full_2026-09-04.md`](docs/archive/HANDOFF_full_2026-09-04.md).
 
@@ -91,90 +91,61 @@ five-defect correction, two small gap fixes) are archived. User-only setup
 (Test Mode key pair, webhook, `.env` flags) is DONE; manual Test Mode
 checkout was deliberately not completed (see Iteration 18 below).
 
-## Iterations 18-24 — case-18, Neon views, SOUL wiring, advisory + corrections
+## Iterations 18-25 — case-18, Neon views, SOUL wiring, advisory + Telegram
 
 Fully condensed; full narrative archived, see
 [`docs/archive/HANDOFF_full_2026-09-04.md`](docs/archive/HANDOFF_full_2026-09-04.md).
 In order: one live HYBRID attempt stopped before payment (**case-18**);
 `/health` provider-mode flags + five read-only Neon views
 (`case_summary`/`hermes_decisions`/`recovery_actions`/`hermes_evidence`/
-`audit_timeline`); `webhook_relay.py` hardening; Codex's
-`config/hermes_agent/SOUL.md` wired beside `SKILL.md` into the isolated
-child's prompt; one live consistent-history case (**case-25**,
-`WAIT_FOR_PROVIDER_RETRY`/`ALLOW`/`waiting`); the non-executable
-`RecommendedIntervention` advisory contract + `MessageStatus`
-(`NOT_REQUESTED`/`SUPPRESSED`/`AUTHORIZED`/`DRAFTED`/`SENT`-reserved)
-lifecycle added, with a `MESSAGE_DRAFTED` audit event; then correction-only
-fixes (a fabricated-delivery gap in `engine.py`, a `SKILL.md` instruction
-contradiction, repair-boundary validation alignment).
-
-## Iteration 25 — product scope lock + narrowed advisory + Telegram foundation
-
-Condensed; full detail archived. Locked the product to insufficient-funds
-recovery at the webhook boundary; narrowed the advisory contract to
-`NONE`/`PAYMENT_PLAN_REVIEW`; built the Telegram delivery foundation
-(`telegram_delivery.py`, `MessageDeliveryAdapter` protocol,
-`engine.deliver_drafted_message`). Two gaps found in review - no
-claim-before-send atomicity, no deterministic payment-plan eligibility
-check - were closed in Iteration 26 below. See
-[`docs/archive/HANDOFF_full_2026-09-04.md`](docs/archive/HANDOFF_full_2026-09-04.md)
-for the full narrative.
+`audit_timeline`); `webhook_relay.py` hardening; SOUL/SKILL wiring; one live
+consistent-history case (**case-25**); the non-executable
+`RecommendedIntervention`/`MessageStatus` advisory + draft lifecycle;
+correction-only fixes (fabricated-delivery gap, `SKILL.md` contradiction,
+repair-boundary alignment); product scope locked to insufficient-funds
+recovery; advisory narrowed to `NONE`/`PAYMENT_PLAN_REVIEW`; Telegram
+delivery foundation built (two gaps - claim atomicity, deterministic
+eligibility - closed in Iteration 26).
 
 ## Iteration 26 — claim-before-send + deterministic eligibility + LIVE golden case
 
-**The golden reliable-customer case ran live and succeeded - see below.**
+Condensed; full detail archived, see
+[`docs/archive/HANDOFF_full_2026-09-04.md`](docs/archive/HANDOFF_full_2026-09-04.md).
+Added atomic claim-before-send (`claim_message_delivery`, permanently-closed
+claim gate after any outcome, `sanitize_delivery_receipt` fail-closed) and
+deterministic `PAYMENT_PLAN_REVIEW` eligibility (>= 2 prior late/failed
+obligations, 12-month window only if actually requested; a live proposal
+while ineligible fails closed). Minimal Neon visibility added to
+`hermes_decisions`/`recovery_actions`. **The golden reliable-customer case
+ran live and succeeded (`case-29`)**: `WAIT_FOR_PROVIDER_RETRY` (conf 0.55)
+then, after the simulated failed retry, `CREATE_RECOVERY_LINK` (conf 0.88,
+real Test Mode link `plink_TYIV2xy5wOT55x`); both `recommended_intervention
+=NONE`; message staged `DRAFTED` then delivered - **verified `SENT`** via
+real Telegram. Never opened checkout, never marked recovered. Neon read
+back read-only, confirmed.
 
-- **Claim-before-send** (`types.py`/`adapters.py`/`engine.py`): a new
-  `claim_message_delivery` ledger call durably marks an attempt
-  `in_progress` BEFORE Telegram is ever called - a concurrent/second
-  claimant gets `claimed=False` and never calls the adapter. After ANY
-  outcome (`sent`/`failed`/`uncertain`) the claim gate is permanently
-  closed - never automatically eligible again. `reconcile_uncertain_intents`
-  (already run at every startup) now also sweeps a crashed `in_progress`
-  claim to a safe, non-retryable `uncertain`. `sanitize_delivery_receipt`
-  (checked at both the orchestration and ledger boundaries) forces an
-  unknown outcome, or `sent` without a nonblank/bounded/digit-only message
-  id, to `uncertain` - never `SENT`; a non-`sent` outcome never carries a
-  message id. New regressions: concurrent claim, replay after
-  failure/uncertainty, crash recovery, forged-`sent` receipts.
-- **Deterministic `PAYMENT_PLAN_REVIEW` eligibility**
-  (`hermes_agent_strategist.py`): a new `_payment_plan_eligibility` fact,
-  computed from the SAME synthetic records actually disclosed for the
-  decision (never model text) - requires >= 2 PRIOR (never the current
-  failure) completed late/failed obligations; the 12-month window counts
-  only if `get_payment_history` was actually called. A live proposal of
-  `PAYMENT_PLAN_REVIEW` while ineligible fails closed
-  (`payment_plan_ineligible`) before persistence as an accepted advisory.
-  The sanitized eligibility + prior-difficulty count are persisted on every
-  decision regardless of outcome. New hostile-model regression proves a
-  convincing rationale cannot override this on the reliable-customer
-  fixture (eligibility is always `false` there - no chronic/mixed fixture
-  was added).
-- **Minimal Neon visibility**: `hermes_decisions` gained
-  `payment_plan_eligible`/`payment_plan_prior_difficulty_count`;
-  `recovery_actions` gained `delivery_channel`/`delivery_status`/
-  `delivery_message_id`/`delivery_attempted_time` (never a URL/token/chat
-  id). `POST /demo/step {"step":"deliver_message"}` (new) claims+sends via
-  `app.state.delivery` (a real `TelegramAdapter` when configured,
-  `NullTelegramAdapter` otherwise); `/health` reports a sanitized
-  `message_delivery_channel` flag.
+## Iteration 27 — demo-visibility Neon view (presentation only, no engine change)
 
-**LIVE golden case (`case-29`)**, run via new
-`scripts/run_golden_reliable_case.py --confirm-live`: preflighted
-`GEMINI_API_KEY`/`DATABASE_URL`/Razorpay Test Mode creds/`TELEGRAM_*`/the
-pinned Hermes revision (no value printed) and `/health`
-(`hermes-runtime`/`hybrid_test_mode`/`message_delivery_channel=telegram`).
-Decision 1: `WAIT_FOR_PROVIDER_RETRY`, `recommended_intervention=NONE`,
-confidence 0.55. Decision 2 (after the simulated failed retry):
-`CREATE_RECOVERY_LINK`, `recommended_intervention=NONE`, confidence 0.88 -
-one real Razorpay Test Mode link (`plink_TYIV2xy5wOT55x`). The approved
-template staged `DRAFTED`, then claimed and sent through the real Telegram
-adapter - **verified `SENT`** (real `delivery_message_id`). Never opened
-checkout, never marked money recovered, no tunnel. Neon read back
-read-only and confirmed: one case, both decisions' evidence/confidence
-correct, no 12-month expansion, `recommended_intervention=NONE` both times,
-`message_status=SENT`, `recovered_amount_minor=0`, no human review/payment
-plan triggered. All local processes stopped after readback.
+New read-only view `hermes_demo.demo_case_story` (`scripts/init_neon.py`):
+one row per MEANINGFUL business step for one case, chronologically -
+`PAYMENT_FAILURE_RECEIVED` / `HERMES_DECISION` / `POLICY_AUTHORIZATION` /
+`RECOVERY_LINK_AUTHORIZED` / `PROVIDER_RETRY_SCHEDULED` /
+`PROVIDER_RETRY_FAILED` / `RECOVERY_LINK_CREATED` / `MESSAGE_DRAFTED` /
+`TELEGRAM_SENT`. Columns: `case_id, step_number, stage, actor,
+input_or_evidence, reasoning_or_rule, output_or_action, status,
+duration_ms`; `step_number` is `ROW_NUMBER()` over the filtered, per-case,
+seq-ordered set - never hardcoded, so it generalises to any case.
+Provenance bookkeeping, `PENDING_WORK_CANCELLED`, and intermediate Telegram
+`in_progress` claims are excluded; only the final delivery outcome per
+intent surfaces. The five existing views are unchanged; no new table; no
+engine/Hermes/Telegram/fixture change; no live Gemini/Razorpay/Telegram
+call; no new case. `sql/neon_demo_inspect.sql` gained the recommended
+recording query. Applied live via `init_neon.py` and read back read-only:
+**case-29** returns exactly the 10-step story above in order, both Hermes
+decisions present with tools/rationale/confidence, no 12-month expansion,
+both recommendations `NONE`, Telegram `SENT` (message id present, no
+URL/token/chat id), no recovered-money claim (view has no such column).
+Older cases (`case-1/6/11/18/25`) remain readable through the same view.
 
 ## Verified evidence
 
@@ -190,11 +161,17 @@ Iterations 21/23/24/25 focused/full counts: 41/373, 60/404, 67/410,
   secret scan reviewed; `.env` untouched. Live: one golden case (`case-29`)
   - real Gemini x2, one real Razorpay Test Mode link, one verified Telegram
   send - Neon read back read-only, confirmed above.
+- **Iteration 27**: focused `tests/test_neon_views.py` -> **51 passed**
+  (+12). `compileall` + `git diff --check` clean; secret scan clean; no
+  Python source outside `scripts/init_neon.py` and `tests/` touched. Live:
+  `init_neon.py` applied the new view; `case-29` read back read-only as
+  above; no case data written.
 
 ## Inspecting the persisted proof
 
-- Neon SQL editor, schema `hermes_demo`: query the five views directly (e.g.
-  `SELECT * FROM hermes_demo.case_summary`) - see
+- Neon SQL editor, schema `hermes_demo`: query the six views directly (e.g.
+  `SELECT * FROM hermes_demo.demo_case_story WHERE case_id = 'case-29'
+  ORDER BY step_number`) - see
   [`sql/neon_demo_inspect.sql`](sql/neon_demo_inspect.sql) for ready-made
   all-cases and one-case queries (swap in `'case-18'`). User-run flow:
   [`scripts/neon_proof.py`](scripts/neon_proof.py).
@@ -219,13 +196,14 @@ relay/tunnel is currently running.
 
 ## Next action
 
-The golden reliable-customer case is done and verified (`case-29`). Next:
-author and run the chronically-late exemplar (a new synthetic fixture with
->= 2 prior late/failed obligations, so `PAYMENT_PLAN_REVIEW` can genuinely
-trigger), then the mixed-history exemplar (12-month expansion path). The
-dashboard remains the final presentation layer, built last. No further live
-action planned against `case-18`/`case-25`/`case-29`. Keep future updates
-under 240 lines.
+The golden reliable-customer case is done and verified (`case-29`); the
+demo-facing `demo_case_story` view is done and verified. Next: author and
+run the chronically-late exemplar (a new synthetic fixture with >= 2 prior
+late/failed obligations, so `PAYMENT_PLAN_REVIEW` can genuinely trigger),
+then the mixed-history exemplar (12-month expansion path). The dashboard
+remains the final presentation layer, built last. No further live action
+planned against `case-18`/`case-25`/`case-29`. Keep future updates at or
+below 230 lines.
 
 ## Working-document links
 

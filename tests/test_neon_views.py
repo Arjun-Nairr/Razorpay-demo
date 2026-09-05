@@ -72,6 +72,10 @@ EXPECTED_COLUMNS = {
         "seq", "logical_time", "case_id", "kind", "action", "outcome", "reason",
         "state", "evidence_mode", "detail",
     ],
+    "demo_case_story": [
+        "case_id", "step_number", "stage", "actor", "input_or_evidence",
+        "reasoning_or_rule", "output_or_action", "status", "duration_ms",
+    ],
 }
 
 _DESTRUCTIVE = re.compile(r"\b(DROP|TRUNCATE|DELETE|ALTER|GRANT|REVOKE)\b", re.IGNORECASE)
@@ -80,7 +84,7 @@ _DESTRUCTIVE = re.compile(r"\b(DROP|TRUNCATE|DELETE|ALTER|GRANT|REVOKE)\b", re.I
 # --- structural: creation, schema-qualification, columns, no destructive SQL
 
 
-def test_all_five_views_are_defined():
+def test_all_six_views_are_defined():
     assert set(VIEWS) == set(EXPECTED_COLUMNS)
 
 
@@ -283,3 +287,89 @@ def test_checkout_url_present_not_the_url_itself():
         assert "checkout_url_present" in sql
         # the raw ->>'url' value must never be selected as its own output column
         assert not re.search(r"->>'url'\s+AS\s+\w*url\w*(?<!_present)\b", sql)
+
+
+# --- demo_case_story: one row per meaningful business step, one case at a time
+
+
+def test_demo_case_story_step_number_is_row_number_not_a_literal():
+    """step_number must be a computed rank over the FILTERED, case-partitioned,
+    seq-ordered set - never a hardcoded case-29-specific integer."""
+    sql = VIEWS["demo_case_story"]
+    assert "ROW_NUMBER() OVER (PARTITION BY case_id ORDER BY seq)" in sql
+    assert "case-29" not in sql  # the view itself must generalise to any case
+
+
+def test_demo_case_story_reads_only_ledger_state_no_new_table():
+    sql = VIEWS["demo_case_story"]
+    assert "ledger_state" in sql
+    assert "CREATE TABLE" not in sql.upper()
+
+
+def test_demo_case_story_excludes_implementation_noise():
+    """Provenance bookkeeping, cancelled pending-work, and intermediate
+    Telegram 'in_progress' claims must never surface as a business step."""
+    sql = VIEWS["demo_case_story"]
+    assert "DEMO_CASE_PROVENANCE" not in sql
+    assert "PENDING_WORK_CANCELLED" not in sql
+    assert "outcome' <> 'in_progress'" in sql
+
+
+def test_demo_case_story_shows_final_telegram_result_only_once_per_intent():
+    """DISTINCT ON (intent_id) with seq DESC keeps exactly the final delivery
+    outcome per intent - never the earlier 'in_progress' claim row."""
+    sql = VIEWS["demo_case_story"]
+    assert "DISTINCT ON (e->'detail'->>'intent_id')" in sql
+    assert "'TELEGRAM_SENT'" in sql
+
+
+def test_demo_case_story_distinguishes_hermes_proposal_from_policy_authorization():
+    sql = VIEWS["demo_case_story"]
+    assert "'HERMES_DECISION'" in sql
+    assert "'POLICY_AUTHORIZATION'" in sql
+    assert "'RECOVERY_LINK_AUTHORIZED'" in sql
+
+
+def test_demo_case_story_message_drafted_and_telegram_sent_are_separate_stages():
+    """A staged draft must never be conflated with an actually-sent message -
+    they are distinct rows keyed to distinct audit kinds."""
+    sql = VIEWS["demo_case_story"]
+    assert "'MESSAGE_DRAFTED'" in sql
+    assert "e->>'kind' = 'MESSAGE_DRAFTED'" in sql
+    assert "e->>'kind' = 'MESSAGE_DELIVERY_ATTEMPTED'" in sql
+
+
+def test_demo_case_story_never_selects_a_url_token_or_chat_id():
+    sql = VIEWS["demo_case_story"]
+    assert "->>'url'" not in sql
+    assert not re.search(r"AS\s+\w*token\w*", sql, re.IGNORECASE)
+    assert not re.search(r"AS\s+\w*chat_id\w*", sql, re.IGNORECASE)
+
+
+def test_demo_case_story_never_selects_raw_customer_identifiers():
+    """Only the synthetic obligation_id/reference/reason_code business facts
+    are surfaced - never a raw customer id field."""
+    sql = VIEWS["demo_case_story"]
+    assert not re.search(r"AS\s+\w*customer\w*", sql, re.IGNORECASE)
+
+
+def test_demo_case_story_two_hermes_decisions_would_remain_two_separate_rows():
+    """Parity check: the view keys HERMES_DECISION rows off each individual
+    AI_PROPOSAL event (one row per proposal, no aggregation/collapse) - so a
+    case with two proposals surfaces two decision rows, not one."""
+    sql = VIEWS["demo_case_story"]
+    assert "p->>'kind' = 'AI_PROPOSAL'" in sql
+    assert "GROUP BY" not in sql.upper()
+
+
+def test_demo_case_story_chronological_ordering_uses_audit_seq():
+    sql = VIEWS["demo_case_story"]
+    assert "ORDER BY seq" in sql or "ORDER BY case_id ORDER BY seq" in sql
+
+
+def test_demo_case_story_old_cases_remain_readable():
+    """No WHERE clause filters to a specific case_id inside the view itself -
+    any case_id (old or new) is readable by filtering the SELECT from it."""
+    sql = VIEWS["demo_case_story"]
+    assert "WHERE case_id =" not in sql
+    assert "AND case_id =" not in sql

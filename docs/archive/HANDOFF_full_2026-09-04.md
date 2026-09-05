@@ -2624,3 +2624,64 @@ Iteration 26 - see HANDOFF.md.
 
 Verified: focused tests/test_hermes_agent.py 67 -> 71 passed; full offline
 410 -> 442 passed, 3 skipped. compileall + git diff --check clean.
+
+## Iteration 26 — claim-before-send + deterministic eligibility + LIVE golden case
+
+**The golden reliable-customer case ran live and succeeded.**
+
+- **Claim-before-send** (`types.py`/`adapters.py`/`engine.py`): a new
+  `claim_message_delivery` ledger call durably marks an attempt
+  `in_progress` BEFORE Telegram is ever called - a concurrent/second
+  claimant gets `claimed=False` and never calls the adapter. After ANY
+  outcome (`sent`/`failed`/`uncertain`) the claim gate is permanently
+  closed - never automatically eligible again. `reconcile_uncertain_intents`
+  (already run at every startup) now also sweeps a crashed `in_progress`
+  claim to a safe, non-retryable `uncertain`. `sanitize_delivery_receipt`
+  (checked at both the orchestration and ledger boundaries) forces an
+  unknown outcome, or `sent` without a nonblank/bounded/digit-only message
+  id, to `uncertain` - never `SENT`; a non-`sent` outcome never carries a
+  message id. New regressions: concurrent claim, replay after
+  failure/uncertainty, crash recovery, forged-`sent` receipts.
+- **Deterministic `PAYMENT_PLAN_REVIEW` eligibility**
+  (`hermes_agent_strategist.py`): a new `_payment_plan_eligibility` fact,
+  computed from the SAME synthetic records actually disclosed for the
+  decision (never model text) - requires >= 2 PRIOR (never the current
+  failure) completed late/failed obligations; the 12-month window counts
+  only if `get_payment_history` was actually called. A live proposal of
+  `PAYMENT_PLAN_REVIEW` while ineligible fails closed
+  (`payment_plan_ineligible`) before persistence as an accepted advisory.
+  The sanitized eligibility + prior-difficulty count are persisted on every
+  decision regardless of outcome. New hostile-model regression proves a
+  convincing rationale cannot override this on the reliable-customer
+  fixture (eligibility is always `false` there - no chronic/mixed fixture
+  was added).
+- **Minimal Neon visibility**: `hermes_decisions` gained
+  `payment_plan_eligible`/`payment_plan_prior_difficulty_count`;
+  `recovery_actions` gained `delivery_channel`/`delivery_status`/
+  `delivery_message_id`/`delivery_attempted_time` (never a URL/token/chat
+  id). `POST /demo/step {"step":"deliver_message"}` (new) claims+sends via
+  `app.state.delivery` (a real `TelegramAdapter` when configured,
+  `NullTelegramAdapter` otherwise); `/health` reports a sanitized
+  `message_delivery_channel` flag.
+
+**LIVE golden case (`case-29`)**, run via new
+`scripts/run_golden_reliable_case.py --confirm-live`: preflighted
+`GEMINI_API_KEY`/`DATABASE_URL`/Razorpay Test Mode creds/`TELEGRAM_*`/the
+pinned Hermes revision (no value printed) and `/health`
+(`hermes-runtime`/`hybrid_test_mode`/`message_delivery_channel=telegram`).
+Decision 1: `WAIT_FOR_PROVIDER_RETRY`, `recommended_intervention=NONE`,
+confidence 0.55. Decision 2 (after the simulated failed retry):
+`CREATE_RECOVERY_LINK`, `recommended_intervention=NONE`, confidence 0.88 -
+one real Razorpay Test Mode link (`plink_TYIV2xy5wOT55x`). The approved
+template staged `DRAFTED`, then claimed and sent through the real Telegram
+adapter - **verified `SENT`** (real `delivery_message_id`). Never opened
+checkout, never marked money recovered, no tunnel. Neon read back
+read-only and confirmed: one case, both decisions' evidence/confidence
+correct, no 12-month expansion, `recommended_intervention=NONE` both times,
+`message_status=SENT`, `recovered_amount_minor=0`, no human review/payment
+plan triggered. All local processes stopped after readback.
+
+Verified: focused tests/test_hermes_agent.py -> 76 passed (+5). Full
+offline (--ignore=tests/test_hermes_agent.py) -> 460 passed, 3 skipped
+(+18). compileall + git diff --check clean; diff and secret scan reviewed;
+.env untouched.

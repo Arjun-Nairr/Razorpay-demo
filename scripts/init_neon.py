@@ -8,13 +8,13 @@ Creates only:
     CREATE SCHEMA IF NOT EXISTS hermes_demo
     CREATE TABLE  IF NOT EXISTS hermes_demo.ledger_state (id, data JSONB, updated_at)
     INSERT the single id=1 row with an empty ledger snapshot, ON CONFLICT DO NOTHING
-    CREATE OR REPLACE VIEW for each of the five read-only views in VIEW_DEFINITIONS
+    CREATE OR REPLACE VIEW for each of the six read-only views in VIEW_DEFINITIONS
 
 It never issues DROP / TRUNCATE / DELETE and never touches anything outside the
 `hermes_demo` schema. Safe to run repeatedly. The connection string is read from
 the environment and is never printed.
 
-The five views (see VIEW_DEFINITIONS below) are a PRESENTATION layer only, over
+The six views (see VIEW_DEFINITIONS below) are a PRESENTATION layer only, over
 the SAME single authoritative `ledger_state.data` JSONB snapshot - no data is
 duplicated or made mutable, and the authoritative `state` column never changes
 meaning. `case_summary.display_status` is derived read-only status text for
@@ -44,7 +44,7 @@ SCHEMA = _validate_schema(os.environ.get("HERMES_DEMO_SCHEMA", _DEFAULT_SCHEMA))
 
 
 def _view_sql(schema: str) -> dict[str, str]:
-    """The five read-only views, keyed by name, schema-qualified via the
+    """The six read-only views, keyed by name, schema-qualified via the
     ALREADY-VALIDATED ``schema`` (see ``_validate_schema`` - a strict
     lowercase-identifier regex, so this f-string interpolation cannot be used
     for SQL injection). Every view reads ONLY ``ledger_state.data`` - no new
@@ -279,6 +279,210 @@ FROM {schema}.ledger_state s,
      jsonb_array_elements(s.data->'audit') AS e
 WHERE s.id = 1
 ORDER BY (e->>'seq')::int
+""",
+        # demo-facing: one row per MEANINGFUL business step, chronologically,
+        # for one case at a time - a filtered/translated view of the same
+        # audit trail audit_timeline exposes raw. Reads ONLY ledger_state -
+        # no dependency on the other views, so it can be created in any order.
+        # step_number is ROW_NUMBER() over the FILTERED set's own seq order,
+        # never a hardcoded case-specific integer, so this generalises to any
+        # case_id. Implementation-only noise (DEMO_CASE_PROVENANCE,
+        # PENDING_WORK_CANCELLED, intermediate delivery "in_progress" claims,
+        # duplicate/existing-case INPUT_EVENTs) is excluded entirely.
+        "demo_case_story": f"""
+CREATE OR REPLACE VIEW {schema}.demo_case_story AS
+WITH steps AS (
+  -- PAYMENT_FAILURE_RECEIVED: only the case-opening failure, never a
+  -- duplicate/existing-case/terminal-case INPUT_EVENT (those carry a 'note').
+  SELECT
+    e->>'case_id'                                             AS case_id,
+    (e->>'seq')::int                                          AS seq,
+    'PAYMENT_FAILURE_RECEIVED'                                AS stage,
+    'Ingress'                                                 AS actor,
+    jsonb_build_object(
+      'obligation_id', e->'detail'->>'obligation_id',
+      'amount_minor', (e->'detail'->>'amount_minor')::int,
+      'reason_code', e->'detail'->>'reason_code')::text       AS input_or_evidence,
+    NULL::text                                                 AS reasoning_or_rule,
+    'case opened for insufficient_funds recovery'              AS output_or_action,
+    'RECORDED'                                                 AS status,
+    NULL::numeric                                              AS duration_ms
+  FROM {schema}.ledger_state s, jsonb_array_elements(s.data->'audit') e
+  WHERE s.id = 1 AND e->>'kind' = 'INPUT_EVENT'
+    AND e->'detail'->>'type' = 'payment.failed'
+    AND NOT (e->'detail' ? 'note')
+
+  UNION ALL
+
+  -- HERMES_DECISION: one row per AI_PROPOSAL, joined to its OWN cycle's
+  -- nearest preceding AI_MODEL_RUN for tools/history/latency evidence -
+  -- never a global first/last (same pattern as hermes_decisions above).
+  SELECT
+    p->>'case_id'                                             AS case_id,
+    (p->>'seq')::int                                          AS seq,
+    'HERMES_DECISION'                                          AS stage,
+    'Hermes'                                                   AS actor,
+    jsonb_build_object(
+      'tools_used', COALESCE((
+        SELECT jsonb_agg(er->>'tool')
+        FROM jsonb_array_elements(COALESCE(mr.detail->'hermes'->'evidence_returned', '[]'::jsonb)) er
+      ), '[]'::jsonb),
+      'history_12mo_requested', EXISTS (
+        SELECT 1 FROM jsonb_array_elements(COALESCE(mr.detail->'hermes'->'evidence_requests', '[]'::jsonb)) req
+        WHERE req->>'tool' = 'get_payment_history'
+      ))::text                                                 AS input_or_evidence,
+    p->'detail'->>'rationale'                                  AS reasoning_or_rule,
+    p->'detail'->>'action' || ' (recommend: '
+      || COALESCE(p->'detail'->>'recommended_intervention', 'NONE') || ')'
+                                                                AS output_or_action,
+    'PROPOSED'                                                 AS status,
+    (mr.detail->>'latency_ms')::numeric                        AS duration_ms
+  FROM {schema}.ledger_state s, jsonb_array_elements(s.data->'audit') p
+  LEFT JOIN LATERAL (
+    SELECT e->'detail' AS detail
+    FROM jsonb_array_elements(s.data->'audit') e
+    WHERE e->>'case_id' = p->>'case_id' AND e->>'kind' = 'AI_MODEL_RUN'
+      AND (e->>'seq')::int < (p->>'seq')::int
+    ORDER BY (e->>'seq')::int DESC
+    LIMIT 1
+  ) mr ON true
+  WHERE s.id = 1 AND p->>'kind' = 'AI_PROPOSAL'
+
+  UNION ALL
+
+  -- POLICY_AUTHORIZATION / RECOVERY_LINK_AUTHORIZED: one row per
+  -- POLICY_DECISION, named by its OWN cycle's nearest preceding proposal -
+  -- distinguishes Hermes's proposal from deterministic policy authorization.
+  SELECT
+    pd->>'case_id'                                             AS case_id,
+    (pd->>'seq')::int                                          AS seq,
+    CASE WHEN prop.action = 'CREATE_RECOVERY_LINK' THEN 'RECOVERY_LINK_AUTHORIZED'
+         ELSE 'POLICY_AUTHORIZATION' END                       AS stage,
+    'Policy'                                                   AS actor,
+    jsonb_build_object('proposed_action', prop.action)::text   AS input_or_evidence,
+    pd->'detail'->>'reason_code'                                AS reasoning_or_rule,
+    CASE WHEN pd->'detail'->>'outcome' = 'ALLOW'
+         THEN COALESCE(prop.action, 'ALLOW')
+         ELSE pd->'detail'->>'outcome' END                      AS output_or_action,
+    CASE WHEN pd->'detail'->>'outcome' = 'ALLOW' THEN 'AUTHORIZED'
+         ELSE pd->'detail'->>'outcome' END                      AS status,
+    NULL::numeric                                               AS duration_ms
+  FROM {schema}.ledger_state s, jsonb_array_elements(s.data->'audit') pd
+  LEFT JOIN LATERAL (
+    SELECT e->'detail'->>'action' AS action
+    FROM jsonb_array_elements(s.data->'audit') e
+    WHERE e->>'case_id' = pd->>'case_id' AND e->>'kind' = 'AI_PROPOSAL'
+      AND (e->>'seq')::int < (pd->>'seq')::int
+    ORDER BY (e->>'seq')::int DESC
+    LIMIT 1
+  ) prop ON true
+  WHERE s.id = 1 AND pd->>'kind' = 'POLICY_DECISION'
+
+  UNION ALL
+
+  -- PROVIDER_RETRY_SCHEDULED: only the 'evaluate' scheduling kind, never the
+  -- 'discarded'/'evaluate_retry' bookkeeping kinds (implementation noise).
+  SELECT
+    e->>'case_id'                                              AS case_id,
+    (e->>'seq')::int                                           AS seq,
+    'PROVIDER_RETRY_SCHEDULED'                                 AS stage,
+    'Recovery Engine'                                          AS actor,
+    NULL::text                                                 AS input_or_evidence,
+    'awaiting provider retry window'                           AS reasoning_or_rule,
+    'due_time=' || COALESCE(e->'detail'->>'due_time', '')      AS output_or_action,
+    'SCHEDULED'                                                AS status,
+    NULL::numeric                                              AS duration_ms
+  FROM {schema}.ledger_state s, jsonb_array_elements(s.data->'audit') e
+  WHERE s.id = 1 AND e->>'kind' = 'SCHEDULED_ACTION' AND e->'detail'->>'kind' = 'evaluate'
+
+  UNION ALL
+
+  -- PROVIDER_RETRY_FAILED: a provider-owned fact, never attributed to Hermes.
+  SELECT
+    e->>'case_id'                                              AS case_id,
+    (e->>'seq')::int                                           AS seq,
+    'PROVIDER_RETRY_FAILED'                                    AS stage,
+    'Razorpay'                                                 AS actor,
+    jsonb_build_object(
+      'reason_code', e->'detail'->>'reason_code',
+      'evidence_mode', e->'detail'->>'evidence_mode')::text    AS input_or_evidence,
+    NULL::text                                                 AS reasoning_or_rule,
+    'provider retry failed; case reactivated'                  AS output_or_action,
+    'FAILED'                                                   AS status,
+    NULL::numeric                                              AS duration_ms
+  FROM {schema}.ledger_state s, jsonb_array_elements(s.data->'audit') e
+  WHERE s.id = 1 AND e->>'kind' = 'RETRY_OUTCOME_RECORDED'
+
+  UNION ALL
+
+  -- RECOVERY_LINK_CREATED: the provider reference only - never the checkout URL.
+  SELECT
+    e->>'case_id'                                              AS case_id,
+    (e->>'seq')::int                                           AS seq,
+    'RECOVERY_LINK_CREATED'                                    AS stage,
+    'Razorpay'                                                 AS actor,
+    NULL::text                                                 AS input_or_evidence,
+    NULL::text                                                 AS reasoning_or_rule,
+    COALESCE(e->'detail'->>'reference', 'no reference recorded')
+                                                                AS output_or_action,
+    CASE WHEN e->'detail'->>'status' = 'uncertain' THEN 'UNCERTAIN' ELSE 'CREATED' END
+                                                                AS status,
+    NULL::numeric                                              AS duration_ms
+  FROM {schema}.ledger_state s, jsonb_array_elements(s.data->'audit') e
+  WHERE s.id = 1 AND e->>'kind' = 'ACTION_OUTCOME'
+    AND e->'detail'->>'action' = 'CREATE_RECOVERY_LINK'
+
+  UNION ALL
+
+  -- MESSAGE_DRAFTED: the deterministic approved-template text - never a
+  -- model-echoed / interpolated string (see adapters.py's drafting comment).
+  SELECT
+    e->>'case_id'                                              AS case_id,
+    (e->>'seq')::int                                           AS seq,
+    'MESSAGE_DRAFTED'                                          AS stage,
+    'Recovery Engine'                                          AS actor,
+    e->'detail'->>'message_intent'                             AS input_or_evidence,
+    'deterministic approved-template rendering'                AS reasoning_or_rule,
+    e->'detail'->>'message_draft'                              AS output_or_action,
+    'DRAFTED'                                                  AS status,
+    NULL::numeric                                              AS duration_ms
+  FROM {schema}.ledger_state s, jsonb_array_elements(s.data->'audit') e
+  WHERE s.id = 1 AND e->>'kind' = 'MESSAGE_DRAFTED'
+
+  UNION ALL
+
+  -- TELEGRAM_SENT: only the FINAL delivery result per intent (never an
+  -- intermediate 'in_progress' claim) - status carries the true outcome.
+  -- Parenthesised: an un-parenthesised trailing ORDER BY on a UNION ALL
+  -- branch binds to the WHOLE union, not this SELECT, and "e" is out of
+  -- scope there - this is what makes DISTINCT ON's own ORDER BY legal here.
+  (SELECT DISTINCT ON (e->'detail'->>'intent_id')
+    e->>'case_id'                                              AS case_id,
+    (e->>'seq')::int                                           AS seq,
+    'TELEGRAM_SENT'                                             AS stage,
+    'Telegram'                                                  AS actor,
+    jsonb_build_object('channel', e->'detail'->>'channel')::text
+                                                                AS input_or_evidence,
+    NULL::text                                                  AS reasoning_or_rule,
+    e->'detail'->>'message_id'                                  AS output_or_action,
+    UPPER(e->'detail'->>'outcome')                              AS status,
+    NULL::numeric                                               AS duration_ms
+  FROM {schema}.ledger_state s, jsonb_array_elements(s.data->'audit') e
+  WHERE s.id = 1 AND e->>'kind' = 'MESSAGE_DELIVERY_ATTEMPTED'
+    AND e->'detail'->>'outcome' <> 'in_progress'
+  ORDER BY e->'detail'->>'intent_id', (e->>'seq')::int DESC)
+)
+SELECT
+  case_id                                                      AS case_id,
+  ROW_NUMBER() OVER (PARTITION BY case_id ORDER BY seq)        AS step_number,
+  stage                                                         AS stage,
+  actor                                                         AS actor,
+  input_or_evidence                                             AS input_or_evidence,
+  reasoning_or_rule                                             AS reasoning_or_rule,
+  output_or_action                                              AS output_or_action,
+  status                                                         AS status,
+  duration_ms                                                   AS duration_ms
+FROM steps
 """,
     }
 

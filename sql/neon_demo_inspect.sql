@@ -41,6 +41,20 @@
 --                                    requested reason alongside what came back
 --    hermes_demo.audit_timeline    - one row per raw audit event (bounded
 --                                    `detail` JSON kept for full inspection)
+--    hermes_demo.demo_case_story   - ONE case's recovery journey, one
+--                                    meaningful business step per row
+--                                    (PAYMENT_FAILURE_RECEIVED /
+--                                    HERMES_DECISION / POLICY_AUTHORIZATION /
+--                                    RECOVERY_LINK_AUTHORIZED /
+--                                    PROVIDER_RETRY_SCHEDULED /
+--                                    PROVIDER_RETRY_FAILED /
+--                                    RECOVERY_LINK_CREATED / MESSAGE_DRAFTED /
+--                                    TELEGRAM_SENT), implementation noise
+--                                    filtered out, `step_number` derived from
+--                                    audit order after filtering - this is
+--                                    the RECOMMENDED query for recording the
+--                                    demo (see "primary recording query"
+--                                    below)
 --
 --  The raw JSON is still there if you need something these views don't
 --  surface - see "raw snapshot" at the bottom.
@@ -56,6 +70,24 @@ SELECT id,
        jsonb_array_length(data->'audit')                       AS audit_event_count
 FROM   hermes_demo.ledger_state
 WHERE  id = 1;
+
+
+-- ============================================================================
+--  RECOMMENDED Neon SQL Editor query for the recording: one case's complete
+--  recovery journey, chronologically, one meaningful business step per row.
+-- ============================================================================
+SELECT
+  step_number,
+  stage,
+  actor,
+  input_or_evidence,
+  reasoning_or_rule,
+  output_or_action,
+  status,
+  duration_ms
+FROM hermes_demo.demo_case_story
+WHERE case_id = 'case-29'
+ORDER BY step_number;
 
 
 -- ============================================================================
