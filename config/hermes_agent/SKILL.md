@@ -44,11 +44,10 @@ terms. Choose exactly one recommendation:
 - `HUMAN_FOLLOW_UP` — request human contact when safe automation is exhausted
   or the situation needs judgment outside this contract.
 
-Use `human_review_recommended=true` for every recommendation except `NONE` and
-`UPDATE_PAYMENT_METHOD`; provide a short evidence-based
-`human_review_reason`. For `NONE` and `UPDATE_PAYMENT_METHOD`, use
-`human_review_recommended=false` and `human_review_reason=null` unless an
-independent unresolved risk genuinely requires review.
+`NONE` and `UPDATE_PAYMENT_METHOD` require `human_review_recommended=false`
+and `human_review_reason=null`. Every other recommendation requires
+`human_review_recommended=true` and a short evidence-based
+`human_review_reason`.
 
 Never recommend a discount: the available case evidence does not include the
 customer value, margin, or merchant discount-policy limits needed to justify

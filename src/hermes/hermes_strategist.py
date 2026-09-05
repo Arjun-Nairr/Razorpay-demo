@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -72,6 +73,13 @@ REQUIRED_KEYS: tuple[str, ...] = (
 
 _ALL_INTERVENTIONS: frozenset[str] = frozenset(r.value for r in RecommendedIntervention)
 _NO_REVIEW_VALUES: frozenset[str] = frozenset(r.value for r in NO_REVIEW_INTERVENTIONS)
+# Same content rule engine.py enforces as final authority - checked here too,
+# inside the normal one-repair boundary (see parse_proposal), so an unsafe
+# reason gets a repair chance instead of only failing after acceptance.
+_REASON_FORBIDDEN = ("http://", "https://", "₹", "$")
+_REASON_ID_PATTERN = re.compile(
+    r"\b(pay|plink|rlnk|link|provider|sub|evt|cus|case)[_-][a-z0-9]", re.IGNORECASE
+)
 
 # The isolation settings the Hermes-Agent path WOULD have applied to every
 # fresh ``AIAgent``. Asserted verbatim by the offline tests so a later swap to
@@ -276,6 +284,15 @@ def parse_proposal(raw: str) -> StrategyProposal:
         if len(reason) > MAX_HUMAN_REVIEW_REASON_CHARS:
             raise InvalidProposal(
                 f"human_review_reason exceeds {MAX_HUMAN_REVIEW_REASON_CHARS} characters"
+            )
+        lowered = reason.lower()
+        if any(bad in lowered for bad in _REASON_FORBIDDEN):
+            raise InvalidProposal(
+                "human_review_reason must not contain a URL or amount marker"
+            )
+        if _REASON_ID_PATTERN.search(reason):
+            raise InvalidProposal(
+                "human_review_reason must not contain a payment/provider/case identifier"
             )
         reason = reason.strip()
 

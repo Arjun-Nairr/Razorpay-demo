@@ -234,19 +234,60 @@ def test_every_invalid_advisory_combination_is_rejected(intervention, hrr, reaso
 
 @pytest.mark.parametrize("reason", [
     "call http://example.com/pay",       # URL
+    "the amount was ₹500 short",         # currency/amount marker
     "see reference plink_abc123",        # provider/payment identifier
+    "case-18 had the same issue",        # case identifier
 ])
-def test_engine_rejects_unsafe_human_review_reason_content(reason):
-    """Content rules (URL / provider-identifier detection) live with the
-    engine's ``_validate_proposal`` - the same layering as ``message_intent``
-    (see parse_proposal's own docstring) - not the local schema check."""
+def test_parse_proposal_rejects_unsafe_human_review_reason_content(reason):
+    """parse_proposal (the direct-Gemini repair boundary) rejects an unsafe
+    reason itself - not only the engine's later, final check - so a bad first
+    reply gets a real repair chance instead of surfacing only after the
+    strategist already reported success."""
+    with pytest.raises(InvalidProposal):
+        parse_proposal(json.dumps(_valid_obj(
+            recommended_intervention="HUMAN_FOLLOW_UP", human_review_recommended=True,
+            human_review_reason=reason,
+        )))
+
+
+def test_unsafe_reason_enters_the_repair_path_and_is_fixed():
+    """An unsafe first reply is exactly the shape the one-repair boundary
+    exists for: propose() feeds the rejection back and accepts a corrected
+    second reply - the unsafe reason never reaches the engine."""
+    bad = _obj(recommended_intervention="HUMAN_FOLLOW_UP", human_review_recommended=True,
+               human_review_reason="see reference plink_abc123")
+    good = _obj(recommended_intervention="HUMAN_FOLLOW_UP", human_review_recommended=True,
+                human_review_reason="a safe evidence-based reason")
+    s, stub = strategist(bad, good)
+    proposal = s.propose(snapshot())
+    assert proposal.human_review_reason == "a safe evidence-based reason"
+    assert len(stub.calls) == 2  # first + exactly one repair
+    assert s.last_run_meta.repair_used is True
+
+
+def test_unsafe_reason_unfixed_after_repair_never_escapes_to_the_engine():
+    """When the repair reply is ALSO unsafe, propose() raises - the strategist
+    never returns an unsafe proposal for the engine to see."""
+    bad = _obj(recommended_intervention="HUMAN_FOLLOW_UP", human_review_recommended=True,
+               human_review_reason="call http://example.com/pay")
+    s, stub = strategist(bad, bad)
+    with pytest.raises(InvalidProposal):
+        s.propose(snapshot())
+    assert len(stub.calls) == 2  # first + one repair, never more
+    assert s.last_run_meta.validation_result.startswith("invalid:")
+
+
+def test_engine_still_rejects_unsafe_reason_as_defense_in_depth():
+    """engine._validate_proposal remains the canonical, final authority even
+    though parse_proposal already checks this - a StrategyProposal built by
+    ANY path (not only parse_proposal) must still be rejected."""
     from hermes.engine import _validate_proposal
 
     proposal = parse_proposal(json.dumps(_valid_obj(
         recommended_intervention="HUMAN_FOLLOW_UP", human_review_recommended=True,
         human_review_reason="a safe placeholder reason",
     )))
-    unsafe = dataclasses.replace(proposal, human_review_reason=reason)
+    unsafe = dataclasses.replace(proposal, human_review_reason="see reference plink_abc123")
     with pytest.raises(InvalidProposal):
         _validate_proposal(unsafe)
 

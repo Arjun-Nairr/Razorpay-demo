@@ -75,12 +75,15 @@ MAX_TOTAL_WAIT_HOURS = 72
 # Substrings a strategist must never put in message_intent - it may propose
 # reminder copy, never a URL, amount, provider id, discount, or commercial term.
 _MESSAGE_INTENT_FORBIDDEN = ("http://", "https://", "₹", "$")
-# Same rule for human_review_reason - free text, so also checked for provider/
-# payment identifier prefixes this codebase actually mints (never proof the
-# reason is otherwise honest/non-invented; that is SOUL/SKILL's job).
+# Same rule for human_review_reason - free text, so also checked for payment/
+# provider/customer/event/subscription/link/case identifier-shaped prefixes
+# this codebase actually mints (never proof the reason is otherwise honest/
+# non-invented; that is SOUL/SKILL's job). Mirrored in the isolated child and
+# the direct-Gemini strategist within their own repair boundary - this is
+# defense in depth here, the final authority, not the only check.
 _REASON_FORBIDDEN = ("http://", "https://", "₹", "$")
 _REASON_ID_PATTERN = re.compile(
-    r"\b(pay|plink|rlnk|sub|evt|cus|case)[_-][a-z0-9]", re.IGNORECASE
+    r"\b(pay|plink|rlnk|link|provider|sub|evt|cus|case)[_-][a-z0-9]", re.IGNORECASE
 )
 
 
@@ -498,16 +501,15 @@ class RecoveryEngine:
                 link_url = getattr(self._razorpay, "link_url", None)
                 url = link_url(claim.case_id) if callable(link_url) else None
                 # message_sent is ACTUAL delivery, never merely what policy
-                # AUTHORIZED (``result.message_authorized``): NO provider in
-                # this build - fake or hybrid - has a real messaging adapter,
-                # so this defaults to False regardless of authorization; only
-                # a future adapter that sets ``message_delivery_capable = True``
-                # (and genuinely sends) may ever report True. A message that
-                # DOES get authorized is instead staged as a DRAFTED template
-                # draft (see ``compute_message_status``/``apply_action_outcome``)
-                # for the later real messaging adapter to actually send.
-                capable = getattr(self._razorpay, "message_delivery_capable", False)
-                message_sent = bool(result.message_authorized) and bool(capable)
+                # AUTHORIZED (``result.message_authorized``): no messaging
+                # adapter exists yet in this build, for ANY provider - a
+                # provider capability flag is not evidence a message reached
+                # the customer. Always False here; a message that IS
+                # authorized is instead staged as a DRAFTED template draft
+                # (see ``compute_message_status``/``apply_action_outcome``).
+                # The future Telegram adapter owns the real, verified
+                # DRAFTED -> SENT transition - never inferred from capability.
+                message_sent = False
                 led.apply_action_outcome(
                     ActionIntentOutcomeCommand(
                         intent_id=result.action_intent_id,

@@ -367,6 +367,43 @@ def test_unapproved_message_then_approved_repair_succeeds(stub, tmp_path):
     p = strat.propose(_snap(retry_outcome_recorded=True))
     assert p.action is ProposalAction.CREATE_RECOVERY_LINK
     assert p.message_intent == _APPROVED_MSG
+
+
+@requires_runtime
+def test_unsafe_human_review_reason_enters_the_repair_path_and_is_fixed(stub, tmp_path):
+    """The isolated Hermes child's own validator (not only engine
+    ._validate_proposal) rejects an unsafe human_review_reason - a bad first
+    reply gets the SAME one-repair chance any other schema violation does,
+    and never escapes as a successful proposal."""
+    _, S = stub
+    bad = ('{"action":"WAIT_FOR_PROVIDER_RETRY","diagnosis":"d","rationale":"r",'
+           '"confidence":0.6,"proposed_wait_hours":24,'
+           '"recommended_intervention":"HUMAN_FOLLOW_UP","human_review_recommended":true,'
+           '"human_review_reason":"see reference plink_abc123","message_intent":null}')
+    good = ('{"action":"WAIT_FOR_PROVIDER_RETRY","diagnosis":"d","rationale":"r",'
+            '"confidence":0.6,"proposed_wait_hours":24,'
+            '"recommended_intervention":"HUMAN_FOLLOW_UP","human_review_recommended":true,'
+            '"human_review_reason":"a safe evidence-based reason","message_intent":null}')
+    S.queue = [_text(bad), _text(good)]
+    strat = _strat(stub, tmp_path)
+    p = strat.propose(_snap())
+    assert p.human_review_reason == "a safe evidence-based reason"
+    assert strat.last_run_meta.repair_used is True
+    assert strat.last_run_meta.validation_result == "repaired"
+
+
+@requires_runtime
+def test_unsafe_human_review_reason_unfixed_never_returns_a_proposal(stub, tmp_path):
+    _, S = stub
+    bad = ('{"action":"WAIT_FOR_PROVIDER_RETRY","diagnosis":"d","rationale":"r",'
+           '"confidence":0.6,"proposed_wait_hours":24,'
+           '"recommended_intervention":"HUMAN_FOLLOW_UP","human_review_recommended":true,'
+           '"human_review_reason":"call http://example.com/pay","message_intent":null}')
+    S.queue = [_text(bad), _text(bad)]
+    strat = _strat(stub, tmp_path)
+    with pytest.raises(InvalidProposal):
+        strat.propose(_snap())
+    assert strat.last_run_meta.extra["failure_category"] == "schema_invalid_after_repair"
     assert strat.last_run_meta.repair_used is True
 
 
@@ -605,6 +642,27 @@ def test_child_validate_rejects_blank_or_oversized_reason(reason):
         set(),
     )
     assert obj is None and verdict == "human_review_reason_invalid"
+
+
+@pytest.mark.parametrize("reason", [
+    "call http://example.com/pay",       # URL
+    "the amount was ₹500 short",         # currency/amount marker
+    "see reference plink_abc123",        # provider/payment identifier
+    "customer cus_9f8a raised a dispute", # customer identifier
+    "case-18 had the same issue",         # case identifier
+])
+def test_child_validate_rejects_unsafe_reason_content(reason):
+    """The isolated Hermes child's own validator - not only the engine's
+    canonical _validate_proposal - rejects a reason containing a URL,
+    currency/amount marker, or payment/provider/customer/case identifier."""
+    from hermes.hermes_agent import child_main
+
+    obj, verdict = child_main._validate(
+        _child_obj(recommended_intervention="HUMAN_FOLLOW_UP",
+                   human_review_recommended=True, human_review_reason=reason),
+        set(),
+    )
+    assert obj is None and verdict == "human_review_reason_unsafe"
 
 
 @pytest.mark.parametrize("intervention,hrr,reason", [

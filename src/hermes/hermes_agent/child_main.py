@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -55,6 +56,13 @@ _ALL_INTERVENTIONS = {
 }
 _NO_REVIEW_INTERVENTIONS = {"NONE", "UPDATE_PAYMENT_METHOD"}
 _MAX_HUMAN_REVIEW_REASON_CHARS = 300
+# Same content rule engine.py enforces as final authority - checked here too,
+# inside the normal one-repair boundary, so an unsafe reason gets a repair
+# chance instead of only failing after the child already reported success.
+_REASON_FORBIDDEN = ("http://", "https://", "₹", "$")
+_REASON_ID_PATTERN = re.compile(
+    r"\b(pay|plink|rlnk|link|provider|sub|evt|cus|case)[_-][a-z0-9]", re.IGNORECASE
+)
 # Only the actions deterministic policy can actually authorize/execute today.
 # STOP and a standalone SEND_REMINDER are deliberately NOT offered as executable
 # (policy would only BLOCK them). Reminder copy still rides along with an
@@ -241,11 +249,15 @@ def _validate(obj, approved_messages: set):
     if not isinstance(hrr, bool):
         return None, "human_review_type"
     reason = obj["human_review_reason"]
-    if reason is not None and (
-        not isinstance(reason, str) or not reason.strip()
-        or len(reason) > _MAX_HUMAN_REVIEW_REASON_CHARS
-    ):
-        return None, "human_review_reason_invalid"
+    if reason is not None:
+        if (not isinstance(reason, str) or not reason.strip()
+                or len(reason) > _MAX_HUMAN_REVIEW_REASON_CHARS):
+            return None, "human_review_reason_invalid"
+        lowered = reason.lower()
+        if any(bad in lowered for bad in _REASON_FORBIDDEN):
+            return None, "human_review_reason_unsafe"
+        if _REASON_ID_PATTERN.search(reason):
+            return None, "human_review_reason_unsafe"
     if ri in _NO_REVIEW_INTERVENTIONS:
         if hrr is not False or reason is not None:
             return None, "human_review_mismatch"

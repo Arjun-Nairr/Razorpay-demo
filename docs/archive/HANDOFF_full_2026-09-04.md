@@ -2480,3 +2480,66 @@ row (get_payment_retry_facts/SIMULATED_PROVIDER); audit_timeline 6 rows
 (INPUT_EVENT, DEMO_CASE_PROVENANCE, AI_MODEL_RUN, AI_PROPOSAL,
 POLICY_DECISION, SCHEDULED_ACTION). No source code changed; no code-change
 rule invoked. API process stopped and port confirmed free after readback.
+
+---
+
+## Iteration 23 archived detail (moved from HANDOFF.md during Iteration 24)
+
+Advisory-intervention + staged-message foundation. Separated Hermes's
+executable action from a new non-executable advisory, and replaced the
+fake-provider bug that equated policy authorization with actual message
+delivery with a real staged-draft lifecycle. No new fixture/case run; no
+Gemini/Razorpay call.
+
+Typed advisory (types.py): RecommendedIntervention enum - NONE,
+UPDATE_PAYMENT_METHOD, MANDATE_REAUTH_REVIEW, PAYMENT_PLAN_REVIEW,
+BILLING_SUPPORT_REVIEW, HUMAN_FOLLOW_UP (no value for a discount, access
+change, suspension, or freeze - those stay structurally impossible).
+StrategyProposal gains recommended_intervention (default NONE),
+human_review_recommended (default False), human_review_reason (default
+None) - existing scripted/offline proposals unaffected. engine
+._validate_proposal (canonical, all strategists) fails closed: unknown
+enum, non-boolean human_review_recommended, a reason that is blank/>300
+chars/contains a URL or a payment-provider-id-shaped token, or a
+NONE/UPDATE_PAYMENT_METHOD proposal carrying a review flag/reason (or the
+reverse for the other four values). The advisory never reaches
+authorize()'s decision logic. Live Hermes (child_main.py) and direct-Gemini
+(hermes_strategist.py) JSON contracts require all three fields explicitly
+(REQUIRED_KEYS grew from 6 to 9 keys each); both prompt versions bumped.
+
+Audit persistence (adapters.py): every AI_PROPOSAL event carries the three
+advisory fields, kept fully separate from the deterministic case-level
+human_review_required. A historical row lacking the keys reads back as
+NOT_RECORDED/null, never a rewritten NONE.
+
+Message staging: new MessageStatus lifecycle - NOT_REQUESTED / SUPPRESSED /
+AUTHORIZED / DRAFTED / SENT (reserved). Computed at ACTION_INTENT time
+(compute_message_status), advanced to DRAFTED only in apply_action_outcome
+after a CONFIRMED create_recovery_link success (never on
+ProviderActionUncertain), with a new append-only MESSAGE_DRAFTED audit
+event (case/intent correlation + the exact approved template + status -
+never a checkout URL). The draft is the approved template verbatim.
+Idempotent: a replayed apply_action_outcome returns before drafting logic
+ever runs twice.
+
+Fixed defect (later corrected further in Iteration 24 - see HANDOFF.md):
+engine.run()'s message_delivery_capable lookup defaulted to True for any
+provider without the attribute, so the default fake provider reported
+message_sent=True with no delivery adapter behind it. Iteration 23 changed
+the default to False; Iteration 24 removed the capability-flag lookup
+entirely.
+
+Neon (init_neon.py, sql/neon_demo_inspect.sql): hermes_decisions gained
+recommended_intervention/model_human_review_recommended/
+model_human_review_reason; recovery_actions gained message_intent/
+message_draft/message_status (appended at the end - CREATE OR REPLACE VIEW
+cannot reposition existing columns). Missing historical values read
+NOT_RECORDED/null/LEGACY_NOT_STAGED - never NONE/DRAFTED/SENT. Ran
+init_neon.py once (idempotent) and read back case-18/case-25: state/
+links_created/actions_taken byte-identical to before; new columns show
+recommended_intervention=NOT_RECORDED on both, message_status=
+LEGACY_NOT_STAGED on case-18's pre-milestone recovery action.
+
+Verified: focused tests/test_hermes_agent.py 41 -> 60 passed; full offline
+373 -> 404 passed, 3 skipped. compileall + git diff --check clean. No
+Gemini/Razorpay/Telegram/webhook/tunnel/new-case activity.

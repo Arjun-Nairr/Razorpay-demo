@@ -874,8 +874,8 @@ def test_real_provider_never_reports_a_message_as_sent():
 
 def test_simulated_flow_never_reports_a_message_as_sent_either():
     """The existing FakeRazorpayAdapter path has no ``message_delivery_capable``
-    attribute either - it now defaults to False like every other provider (the
-    fix for defect 5): an authorized message is staged DRAFTED, never SENT."""
+    attribute either - and it would make no difference if it did (see below):
+    an authorized message is staged DRAFTED, never SENT."""
     from hermes.adapters import FakeRazorpayAdapter as Fake
 
     rp = Fake()
@@ -894,6 +894,34 @@ def test_simulated_flow_never_reports_a_message_as_sent_either():
     assert intent.message_status == "DRAFTED"
     assert intent.message_draft == intent.message_intent
     assert proj.messages_sent == 0
+
+
+def test_a_capability_flag_is_not_evidence_of_delivery():
+    """The exact fabrication this milestone closes: engine.run() no longer
+    reads ``message_delivery_capable`` at all, from ANY provider - a provider
+    claiming it CAN deliver messages is not proof one WAS delivered. Even a
+    provider that sets it True must still land at message_sent=False /
+    DRAFTED, with the contact counter untouched."""
+
+    class _ClaimsCapableAdapter(FakeRazorpayAdapter):
+        message_delivery_capable = True  # a provider capability claim only
+
+    rp = _ClaimsCapableAdapter()
+    engine = RecoveryEngine(PgLedger(InMemorySnapshotStore()), ScriptedStrategist(), rp)
+    rp.set_retry_eligibility(OBL, True)
+    r = engine.receive(RazorpayWebhook("e_cap_f0", WebhookType.PAYMENT_FAILED, OBL, AMOUNT,
+                                       reason_code="insufficient_funds"))
+    engine.run(until=1)
+    engine.receive(RazorpayWebhook("e_cap_r1", WebhookType.PAYMENT_FAILED, OBL, AMOUNT,
+                                   reason_code="insufficient_funds"))
+    rp.set_retry_eligibility(OBL, False)
+    engine.run(until=2)
+    proj = engine.inspect(__import__("hermes.types", fromlist=["CaseQuery"]).CaseQuery(case_id=r.case_id))
+    intent = proj.action_intents[0]
+    assert intent.status == "executed"
+    assert intent.message_sent is False  # no delivery inferred from the capability flag
+    assert intent.message_status == "DRAFTED"  # staged, never SENT
+    assert proj.messages_sent == 0  # contact counter unchanged
 
 
 # === full hybrid engine harness ============================================

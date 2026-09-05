@@ -1,8 +1,8 @@
 # Cross-Agent Handoff — current-state index
 
-Last updated: 2026-09-05 (Asia/Dubai), Iteration 23. Branch
+Last updated: 2026-09-05 (Asia/Dubai), Iteration 24. Branch
 `feat/isolated-hermes-agent`, latest commit at bottom. This file stays
-**under 280 lines**: it is an index, not a log. Detail lives in the linked
+**under 240 lines**: it is an index, not a log. Detail lives in the linked
 docs; iteration-by-iteration history is in
 [`docs/archive/HANDOFF_full_2026-09-04.md`](docs/archive/HANDOFF_full_2026-09-04.md).
 
@@ -88,20 +88,12 @@ confirmation go through genuine Razorpay Test Mode calls when the
 `hybrid_test_mode` provider is selected (`RAZORPAY_PROVIDER=hybrid_test_mode`,
 independent of Hermes/Gemini mode; default remains `fake`). Native
 subscription-retry signals and historical-data retrieval are **not**
-implemented - retry eligibility always stays simulated. Iterations 15-17
-(first cut, five-defect correction, two small gap fixes) are archived.
-
-- **`HybridPaymentProvider`** composes `FakeRazorpayAdapter` (retry eligibility
-  only) with the real adapter (link creation + capture confirmation).
-- **`POST /webhooks/razorpay-test`** (mounted only when `real_webhook_secret`
-  is configured) verifies a genuine `payment_link.paid` envelope against a
-  **separate** secret via separate code - signature first, then envelope/
-  contradiction checks, then this case's persisted link correlation, then one
-  independent provider readback, then `engine.receive`. The simulated
-  `/webhooks/razorpay` route is untouched.
-- **User-only setup**: DONE - Test Mode key pair, webhook (`payment_link.paid`
-  only), `.env` flags. Manual Test Mode checkout was **deliberately not
-  completed** (see Iteration 18 below).
+implemented - retry eligibility always stays simulated. Mechanics
+(`HybridPaymentProvider` composition, the separately-secured
+`POST /webhooks/razorpay-test` route) and Iterations 15-17 (first cut,
+five-defect correction, two small gap fixes) are archived. User-only setup
+(Test Mode key pair, webhook, `.env` flags) is DONE; manual Test Mode
+checkout was deliberately not completed (see Iteration 18 below).
 
 ## Iterations 18-20 — live case-18, Neon views, relay hardening
 
@@ -137,90 +129,62 @@ for the full narrative.
 
 ## Iteration 23 — advisory-intervention + staged-message foundation
 
-Separated Hermes's executable `action` from a new **non-executable
-advisory**, and replaced the fake-provider bug that equated policy
-authorization with actual message delivery with a real staged-draft
-lifecycle. No new fixture/case run; no Gemini/Razorpay call.
+Condensed; full detail archived. Separated Hermes's executable `action`
+from a new non-executable `RecommendedIntervention` advisory (6 values, no
+discount/access/suspension/freeze value exists); `StrategyProposal` gained
+`recommended_intervention`/`human_review_recommended`/`human_review_reason`
+(safe defaults, existing proposals unaffected); `engine._validate_proposal`
+fails closed on the full combination rule. New `MessageStatus` lifecycle
+(`NOT_REQUESTED`/`SUPPRESSED`/`AUTHORIZED`/`DRAFTED`/`SENT`-reserved) staged
+via a new `MESSAGE_DRAFTED` audit event. Neon's `hermes_decisions`/
+`recovery_actions` views extended (historical rows read `NOT_RECORDED`/
+`LEGACY_NOT_STAGED`, never a false positive). See
+[`docs/archive/HANDOFF_full_2026-09-04.md`](docs/archive/HANDOFF_full_2026-09-04.md)
+for the full narrative.
 
-- **Typed advisory** (`types.py`): `RecommendedIntervention` enum - `NONE`,
-  `UPDATE_PAYMENT_METHOD`, `MANDATE_REAUTH_REVIEW`, `PAYMENT_PLAN_REVIEW`,
-  `BILLING_SUPPORT_REVIEW`, `HUMAN_FOLLOW_UP` (no value for a discount,
-  access change, suspension, or freeze - those stay structurally
-  impossible). `StrategyProposal` gains `recommended_intervention`
-  (default `NONE`), `human_review_recommended` (default `False`),
-  `human_review_reason` (default `None`) - existing scripted/offline
-  proposals are unaffected. `engine._validate_proposal` (canonical, all
-  strategists) fails closed: unknown enum, non-boolean
-  `human_review_recommended`, a reason that is blank/>300 chars/contains a
-  URL or a payment-provider-id-shaped token, or a NONE/UPDATE_PAYMENT_METHOD
-  proposal carrying a review flag/reason (or the reverse for the other four
-  values) all raise `InvalidProposal`. The advisory never reaches
-  `authorize()`'s decision logic - it cannot change authorization, execute
-  an effect, change case state/pricing/access, spend a budget, or count as
-  recovered. Live Hermes (`child_main.py`) and direct-Gemini
-  (`hermes_strategist.py`) JSON contracts now require all three fields
-  explicitly (`REQUIRED_KEYS` grew from 6 to 9 keys each); both prompt
-  versions bumped.
-- **Audit persistence** (`adapters.py`): every `AI_PROPOSAL` event now
-  carries `recommended_intervention`/`human_review_recommended`/
-  `human_review_reason` alongside the existing fields. Kept fully separate
-  from the deterministic case-level `human_review_required`. A historical
-  row lacking the keys reads back as `NOT_RECORDED`/`null`, never a
-  rewritten `NONE`.
-- **Message staging**: new `MessageStatus` lifecycle -`NOT_REQUESTED` /
-  `SUPPRESSED` / `AUTHORIZED` / `DRAFTED` / `SENT` (reserved, never set this
-  milestone) - computed once at `ACTION_INTENT` time
-  (`compute_message_status`) and advanced to `DRAFTED` only in
-  `apply_action_outcome`, only after a CONFIRMED `create_recovery_link`
-  success (never on `ProviderActionUncertain`), with a new append-only
-  `MESSAGE_DRAFTED` audit event (case/intent correlation + the exact
-  approved template + status - never a checkout URL). The draft is the
-  approved template verbatim - deterministic code, never the model, does
-  the "rendering" (identity, since the templates already carry no
-  URL/amount/id). Idempotent: a replayed `apply_action_outcome` returns
-  before the drafting logic ever runs twice.
-- **Fixed defect**: `engine.run()`'s `message_delivery_capable` lookup
-  defaulted to `True` for any provider without the attribute, so the
-  DEFAULT `fake` provider reported `message_sent=True` with no delivery
-  adapter behind it. Now defaults to `False` like every other provider.
-  `test_case3.py`/`test_demo_flow.py`/`test_razorpay_test_mode.py` updated
-  honestly (previously asserted the bug as "unchanged behaviour").
-- **Neon** (`init_neon.py`, `sql/neon_demo_inspect.sql`): `hermes_decisions`
-  gained `recommended_intervention`/`model_human_review_recommended`/
-  `model_human_review_reason` (appended at the end - `CREATE OR REPLACE
-  VIEW` cannot reposition existing columns); `recovery_actions` gained
-  `message_intent`/`message_draft`/`message_status`. Missing historical
-  values read `NOT_RECORDED` / `null` / `LEGACY_NOT_STAGED` - never `NONE`/
-  `DRAFTED`/`SENT`. No checkout URL exposed by either new column set.
-- **Hardening** (carried forward): blank/whitespace-only SOUL/SKILL now
-  fails closed like missing/unreadable; the system-prompt ordering test now
-  asserts SOUL -> SKILL -> case context -> tool descriptions -> output
-  contract.
+## Iteration 24 — correction-only: fabricated-delivery + instruction fixes
 
-Ran `python scripts/init_neon.py` once (idempotent `CREATE OR REPLACE VIEW`
-only) and read all five views back for **case-18** and **case-25**: state
-(`active`/`waiting`), `links_created` (1/0), `actions_taken` (1/0) all
-byte-identical to before the view update; new columns show
-`recommended_intervention=NOT_RECORDED` on both, `message_status=
-LEGACY_NOT_STAGED` on case-18's pre-milestone recovery action.
+Three review findings closed; no new fixture/case, no live call.
+
+- **Removed the last fabricated-delivery path** (`engine.py`): Iteration 23
+  made `message_sent` default `False` only for a provider *missing*
+  `message_delivery_capable`; a provider that SET it `True` would still have
+  been read. That lookup is now removed entirely - `message_sent` is always
+  `False` here, unconditionally, until a real (Telegram) adapter owns a
+  verified `DRAFTED -> SENT` transition. New regression
+  (`test_a_capability_flag_is_not_evidence_of_delivery`) proves a provider
+  claiming `message_delivery_capable=True` still yields `message_sent=False`,
+  `message_status=DRAFTED`, and an unchanged contact counter.
+- **Fixed a real instruction contradiction** (`SKILL.md`): removed the
+  "unless an independent unresolved risk genuinely requires review"
+  exception, which contradicted the `NONE`/`UPDATE_PAYMENT_METHOD` rule
+  `engine._validate_proposal` actually enforces. The rule is now exactly:
+  `NONE`/`UPDATE_PAYMENT_METHOD` require `human_review_recommended=false`
+  and `reason=null`; every other value requires `true` + a nonblank reason
+  - no exception, matching the code precisely.
+- **Aligned repair-boundary validation**: both `child_main._validate()`
+  (isolated Hermes) and `hermes_strategist.parse_proposal()` (direct
+  Gemini) now reject an unsafe `human_review_reason` (URL, currency/amount
+  marker, or a payment/provider/customer/event/subscription/link/case
+  identifier-shaped token) themselves, inside their own one-repair
+  boundary - not only later, once, in `engine._validate_proposal` (kept as
+  canonical defense-in-depth). New tests prove an unsafe first reply enters
+  the existing repair path and is either fixed or bounded-fails - it can
+  never reach the engine unsafe.
 
 ## Verified evidence
 
 Pre-Iteration-21 evidence is archived - see
 [`docs/archive/HANDOFF_full_2026-09-04.md`](docs/archive/HANDOFF_full_2026-09-04.md).
 
-- **Iteration 21**: focused `tests/test_hermes_agent.py` -> **41 passed**;
-  full offline -> **373 passed, 3 skipped**.
-- **Iteration 22**: no source change; evidence is the live Neon readback
-  (archived above).
-- **Iteration 23**: focused `tests/test_hermes_agent.py` -> **60 passed**
-  (+19: blank-file rejection, full ordering, `child_main._validate` advisory
-  coverage). Full offline (`--ignore=tests/test_hermes_agent.py`) -> **404
-  passed, 3 skipped** (+31 advisory/message-lifecycle/Neon-view tests).
-  `compileall` + `git diff --check` clean; diff and secret scan reviewed,
-  confined to the files listed above. Live: `init_neon.py` view update +
-  case-18/case-25 readback (above) - no Gemini/Razorpay/Telegram/webhook/
-  tunnel/new-case activity.
+- **Iteration 21**: focused **41 passed**; full offline **373 passed, 3 skipped**.
+- **Iteration 22**: no source change; live Neon readback (archived above).
+- **Iteration 23**: focused **60 passed**; full offline **404 passed, 3 skipped**.
+- **Iteration 24**: focused `tests/test_hermes_agent.py` -> **67 passed**
+  (+7). Full offline (`--ignore=tests/test_hermes_agent.py`) -> **410
+  passed, 3 skipped** (+6). `compileall` + `git diff --check` clean; diff
+  and secret scan reviewed. No Gemini/Razorpay/Telegram/webhook/tunnel/
+  new-case activity.
 
 ## Inspecting the persisted proof
 
@@ -255,10 +219,13 @@ actually wired to `hermes-runtime` + `hybrid_test_mode` + enabled.
 
 ## Next action
 
-Codex authors Rule 2 for chronically-late payment behavior in `SKILL.md`;
-Claude Code then implements the wiring (if any) and runs that exemplar
-through the same live path `case-25` used. No further live action planned
-against `case-18`/`case-25`. Keep future `HANDOFF.md` updates under 280 lines.
+These corrections are complete; the branch is ready for the **Telegram
+delivery adapter** (owning the real, verified `DRAFTED -> SENT` transition -
+see Iteration 24), followed by one golden reliable-customer end-to-end case
+through that adapter. The chronically-late and mixed-history exemplars
+remain deferred until after that. The dashboard stays the final
+presentation layer, updated last. No further live action planned against
+`case-18`/`case-25`. Keep future `HANDOFF.md` updates under 240 lines.
 
 ## Working-document links
 
