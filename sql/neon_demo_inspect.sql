@@ -86,7 +86,7 @@ SELECT
   status,
   duration_ms
 FROM hermes_demo.demo_case_story
-WHERE case_id = 'case-29'
+WHERE case_id = 'case-40'
 ORDER BY step_number;
 
 

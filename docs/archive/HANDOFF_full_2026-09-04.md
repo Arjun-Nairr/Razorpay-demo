@@ -2726,3 +2726,34 @@ scripts/init_neon.py and tests/ touched.
   compileall + git diff --check clean; secret scan clean; no Python source
   outside scripts/init_neon.py and tests/ touched. Live: init_neon.py
   applied the new view; case-29 read back read-only; no case data written.
+
+## Iteration 28 — demo_case_story truthfulness correction + reliable-customer-only template
+
+`demo_case_story` (`scripts/init_neon.py`, presentation only): (1)
+`PROVIDER_RETRY_FAILED`'s actor now derives from `evidence_mode`
+(`Payment provider (simulated)` / `Razorpay Test Mode` / `Payment provider
+(unverified)`) - never a bare `Razorpay` for a simulated retry; (2)
+`HERMES_DECISION.input_or_evidence` passes through the persisted
+`evidence_returned` records verbatim (tool/source/actual coverage per
+tool); (3) the Telegram stage name matches the true outcome
+(`TELEGRAM_SENT` / `TELEGRAM_DELIVERY_FAILED` /
+`TELEGRAM_DELIVERY_UNCERTAIN`), never a fixed `SENT` label.
+
+Locked the approved customer template to one fixed reliable-customer
+reminder (`message_templates.py`; `ScriptedStrategist` matched). For the
+isolated real Hermes runtime only (`hermes_agent_strategist.py`), a new
+`_reliable_customer_from_evidence` gate - derived ONLY from the initial
+3-month window's disclosed prior obligations, never a fixture label -
+decides whether the template is offered to the child (`approved_messages:
+[]` when not reliable); any non-null `message_intent` returned anyway is
+rejected fail-closed (`message_intent_not_permitted`). The recovery URL
+still appends only at the delivery boundary, never by Hermes (regression
+added). Corrected the stale "no customer message is actually sent" claim in
+`POLICY_SPEC.md` (superseded by Iteration 26's verified Telegram send).
+
+Verified: focused tests/test_neon_views.py -> 54 passed (+3); focused
+tests/test_hermes_agent.py -> 83 passed (+7). Full offline
+(--ignore=tests/test_hermes_agent.py) -> 477 passed, 3 skipped. compileall
++ git diff --check clean; secret scan clean. Live: corrected view applied;
+case-29 read back read-only, confirmed; no case data written, no
+Gemini/Razorpay/Telegram call.
