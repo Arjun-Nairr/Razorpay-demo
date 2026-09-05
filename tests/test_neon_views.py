@@ -53,6 +53,7 @@ EXPECTED_COLUMNS = {
         "model_human_review_recommended", "model_human_review_reason",
         "policy_outcome", "policy_reason", "authorized",
         "failure_category", "failure_stage",
+        "payment_plan_eligible", "payment_plan_prior_difficulty_count",
     ],
     "recovery_actions": [
         "case_id", "intent_id", "created_logical_time", "proposed_action",
@@ -60,6 +61,8 @@ EXPECTED_COLUMNS = {
         "action_evidence_mode", "message_authorized", "message_sent",
         "message_intent", "message_draft", "message_status",
         "case_state", "human_review_required", "uncertain_reason",
+        "delivery_channel", "delivery_status", "delivery_message_id",
+        "delivery_attempted_time",
     ],
     "hermes_evidence": [
         "case_id", "model_run_seq", "tool", "source", "actual_coverage",
@@ -256,6 +259,22 @@ def test_message_draft_column_never_selects_a_url():
     sql = VIEWS["recovery_actions"]
     assert "message_draft" in sql
     assert not re.search(r"->>'url'\s+AS\s+message_draft\b", sql)
+
+
+def test_delivery_columns_never_select_a_url_token_or_chat_id():
+    """The Telegram delivery evidence columns expose only channel/outcome/
+    sanitized message id/attempt time - never the checkout URL and never a
+    field named after a token or chat id (none exists on the ledger side
+    either - see ActionIntent, which never stores one)."""
+    sql = VIEWS["recovery_actions"]
+    for col in ("delivery_channel", "delivery_status", "delivery_message_id",
+                "delivery_attempted_time"):
+        assert col in sql
+    assert not re.search(r"->>'url'\s+AS\s+delivery_\w+", sql)
+    # no OUTPUT COLUMN is ever named after a token/chat id (prose comments
+    # mentioning the words are fine - only a real "AS <col>" would leak one).
+    assert not re.search(r"AS\s+\w*token\w*", sql, re.IGNORECASE)
+    assert not re.search(r"AS\s+\w*chat_id\w*", sql, re.IGNORECASE)
 
 
 def test_checkout_url_present_not_the_url_itself():

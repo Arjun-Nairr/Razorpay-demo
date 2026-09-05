@@ -23,7 +23,12 @@ from hermes.telegram_delivery import (
     fetch_chat_id_candidates,
     verify_bot,
 )
-from hermes.types import DeliveryReceipt, RazorpayWebhook, WebhookType
+from hermes.types import (
+    ClaimMessageDeliveryCommand,
+    DeliveryReceipt,
+    RazorpayWebhook,
+    WebhookType,
+)
 
 TEST_KEY_ID = "rzp_test_abc123"
 AMOUNT = 1_000_000
@@ -358,12 +363,167 @@ def test_message_delivery_audit_event_never_exposes_url_or_token():
     from hermes.types import AuditQuery
     events = [r for r in engine.inspect(AuditQuery(case_id=case_id)).records
               if r.kind == "MESSAGE_DELIVERY_ATTEMPTED"]
-    assert len(events) == 1
-    detail = events[0].detail
-    assert set(detail) == {"intent_id", "case_id", "channel", "outcome", "message_id", "attempted_time"}
-    assert "https://rzp.io/l/18" not in str(detail)
-    assert "rzp_test_abc123" not in str(detail)
-    assert detail["channel"] == "telegram" and detail["outcome"] == "sent"
+    assert len(events) == 2  # the durable claim, then the final outcome
+    assert [e.detail["outcome"] for e in events] == ["in_progress", "sent"]
+    for e in events:
+        detail = e.detail
+        assert set(detail) == {"intent_id", "case_id", "channel", "outcome", "message_id", "attempted_time"}
+        assert "https://rzp.io/l/18" not in str(detail)
+        assert "rzp_test_abc123" not in str(detail)
+        assert detail["channel"] == "telegram"
+
+
+def test_concurrent_claim_only_one_caller_gets_work():
+    """Two callers racing on the SAME eligible intent: only the first
+    ledger-level claim succeeds - the second must never be told to call
+    the adapter."""
+    engine, provider, led = _hybrid_engine(
+        http_post=lambda url, **k: {"id": "plink_20", "short_url": "https://rzp.io/l/20"}
+    )
+    case_id = _drive_to_drafted_link(engine, provider)
+    intent_id = led.case_projection(case_id=case_id).action_intents[0].intent_id
+
+    first = led.claim_message_delivery(
+        ClaimMessageDeliveryCommand(intent_id=intent_id, case_id=case_id, now=3, channel="telegram")
+    )
+    second = led.claim_message_delivery(
+        ClaimMessageDeliveryCommand(intent_id=intent_id, case_id=case_id, now=3, channel="telegram")
+    )
+    assert first.claimed is True
+    assert second.claimed is False
+
+
+def test_deliver_drafted_message_never_calls_adapter_when_pre_claimed():
+    """If the intent is already claimed (by another process/thread), the
+    engine-level orchestration must not call the adapter either."""
+    engine, provider, led = _hybrid_engine(
+        http_post=lambda url, **k: {"id": "plink_21", "short_url": "https://rzp.io/l/21"}
+    )
+    case_id = _drive_to_drafted_link(engine, provider)
+    intent_id = led.case_projection(case_id=case_id).action_intents[0].intent_id
+    led.claim_message_delivery(
+        ClaimMessageDeliveryCommand(intent_id=intent_id, case_id=case_id, now=3, channel="telegram")
+    )
+
+    delivery = _StubDelivery(DeliveryReceipt(outcome="sent", message_id="1"))
+    result = deliver_drafted_message(led, case_id, delivery, now=4)
+    assert result is None  # already in_progress - not even eligible to attempt a claim
+    assert delivery.calls == 0
+
+
+@pytest.mark.parametrize("outcome", ["failed", "uncertain"])
+def test_replay_after_failed_or_uncertain_never_becomes_eligible_again(outcome):
+    engine, provider, led = _hybrid_engine(
+        http_post=lambda url, **k: {"id": "plink_22", "short_url": "https://rzp.io/l/22"}
+    )
+    case_id = _drive_to_drafted_link(engine, provider)
+    first = _StubDelivery(DeliveryReceipt(outcome=outcome))
+    deliver_drafted_message(led, case_id, first, now=3)
+    assert first.calls == 1
+
+    second = _StubDelivery(DeliveryReceipt(outcome="sent", message_id="1"))
+    result = deliver_drafted_message(led, case_id, second, now=4)
+    assert result is None  # no eligible (delivery_outcome is None) intent left
+    assert second.calls == 0  # never called - the claim gate is permanently closed
+
+    proj = led.case_projection(case_id=case_id)
+    assert proj.action_intents[0].message_status == "DRAFTED"
+    assert proj.messages_sent == 0
+
+
+def test_crash_after_claim_is_reconciled_to_uncertain_not_retried():
+    """A claim with no recorded outcome (the process died mid-call) must be
+    swept to a safe, non-retryable 'uncertain' - never left claimable, never
+    silently resolved as sent."""
+    engine, provider, led = _hybrid_engine(
+        http_post=lambda url, **k: {"id": "plink_23", "short_url": "https://rzp.io/l/23"}
+    )
+    case_id = _drive_to_drafted_link(engine, provider)
+    intent_id = led.case_projection(case_id=case_id).action_intents[0].intent_id
+    claim = led.claim_message_delivery(
+        ClaimMessageDeliveryCommand(intent_id=intent_id, case_id=case_id, now=3, channel="telegram")
+    )
+    assert claim.claimed is True
+    assert led.case_projection(case_id=case_id).action_intents[0].delivery_outcome == "in_progress"
+
+    n = engine.reconcile_uncertain_intents()
+    assert n == 1
+    proj = led.case_projection(case_id=case_id)
+    intent = proj.action_intents[0]
+    assert intent.delivery_outcome == "uncertain"
+    assert intent.message_status == "DRAFTED"
+    assert proj.messages_sent == 0
+
+    delivery = _StubDelivery(DeliveryReceipt(outcome="sent", message_id="1"))
+    result = deliver_drafted_message(led, case_id, delivery, now=5)
+    assert result is None and delivery.calls == 0  # still never automatically retried
+
+
+@pytest.mark.parametrize("bad_message_id", [None, "", "   ", "not-digits", "1" * 40])
+def test_forged_sent_without_a_valid_message_id_becomes_uncertain(bad_message_id):
+    engine, provider, led = _hybrid_engine(
+        http_post=lambda url, **k: {"id": "plink_24", "short_url": "https://rzp.io/l/24"}
+    )
+    case_id = _drive_to_drafted_link(engine, provider)
+    delivery = _StubDelivery(DeliveryReceipt(outcome="sent", message_id=bad_message_id))
+    deliver_drafted_message(led, case_id, delivery, now=3)
+
+    proj = led.case_projection(case_id=case_id)
+    intent = proj.action_intents[0]
+    assert intent.message_status == "DRAFTED"  # never SENT on a forged/malformed receipt
+    assert intent.delivery_outcome == "uncertain"
+    assert intent.delivery_message_id is None
+    assert proj.messages_sent == 0
+
+
+def test_forged_failed_receipt_carrying_a_message_id_drops_it():
+    engine, provider, led = _hybrid_engine(
+        http_post=lambda url, **k: {"id": "plink_25", "short_url": "https://rzp.io/l/25"}
+    )
+    case_id = _drive_to_drafted_link(engine, provider)
+    delivery = _StubDelivery(DeliveryReceipt(outcome="failed", message_id="999"))
+    deliver_drafted_message(led, case_id, delivery, now=3)
+
+    proj = led.case_projection(case_id=case_id)
+    intent = proj.action_intents[0]
+    assert intent.delivery_outcome == "failed"
+    assert intent.delivery_message_id is None  # a failed outcome never carries an id
+    assert intent.message_status == "DRAFTED"
+
+
+def test_unknown_outcome_value_is_sanitized_to_uncertain():
+    engine, provider, led = _hybrid_engine(
+        http_post=lambda url, **k: {"id": "plink_26", "short_url": "https://rzp.io/l/26"}
+    )
+    case_id = _drive_to_drafted_link(engine, provider)
+    delivery = _StubDelivery(DeliveryReceipt(outcome="delivered!", message_id="1"))
+    deliver_drafted_message(led, case_id, delivery, now=3)
+
+    proj = led.case_projection(case_id=case_id)
+    intent = proj.action_intents[0]
+    assert intent.delivery_outcome == "uncertain"
+    assert intent.message_status == "DRAFTED"
+
+
+def test_ledger_apply_message_delivery_rejects_unclaimed_intent():
+    """apply_message_delivery is never accepted without a matching prior
+    claim - the ledger's own boundary check, independent of the engine's
+    orchestration."""
+    from hermes.types import MessageDeliveryCommand
+
+    engine, provider, led = _hybrid_engine(
+        http_post=lambda url, **k: {"id": "plink_27", "short_url": "https://rzp.io/l/27"}
+    )
+    case_id = _drive_to_drafted_link(engine, provider)
+    intent_id = led.case_projection(case_id=case_id).action_intents[0].intent_id
+
+    result = led.apply_message_delivery(MessageDeliveryCommand(
+        intent_id=intent_id, case_id=case_id, now=3, channel="telegram",
+        outcome="sent", message_id="1",
+    ))
+    assert result.reason == "not_claimed"
+    proj = led.case_projection(case_id=case_id)
+    assert proj.action_intents[0].message_status == "DRAFTED"  # untouched
 
 
 # === product scope: a single failure alone cannot recommend a payment plan =

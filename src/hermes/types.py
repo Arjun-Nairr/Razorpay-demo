@@ -391,10 +391,36 @@ class DeliveryOutcome(StrEnum):
     """The result of one real message-delivery attempt (e.g. Telegram) -
     never inferred, always reported by the adapter itself."""
 
+    IN_PROGRESS = "in_progress"  # durably claimed; the network call has not
+    # yet returned. A crash here is reconciled to UNCERTAIN, never silently
+    # retried and never left claimable again - see
+    # ``RecoveryEngine.reconcile_uncertain_intents``.
     SENT = "sent"          # the channel returned a verified success + message id
     FAILED = "failed"      # the channel clearly rejected/could not deliver
     UNCERTAIN = "uncertain"  # network/timeout/malformed response - genuinely unknown;
     # never auto-retried (the channel gives no native idempotency guarantee)
+
+
+_MAX_DELIVERY_MESSAGE_ID_CHARS = 32
+
+
+def sanitize_delivery_receipt(outcome: str, message_id: str | None) -> tuple[str, str | None]:
+    """Defense-in-depth validation of a raw ``(outcome, message_id)`` pair,
+    applied at BOTH the orchestration and ledger boundaries. An unknown
+    outcome, or a ``sent`` outcome without a nonblank/bounded/digit-only
+    message id, is downgraded to ``uncertain`` with the id dropped - never
+    ``sent``. A non-``sent`` outcome never carries a message id either way.
+    """
+    if outcome not in (DeliveryOutcome.SENT.value, DeliveryOutcome.FAILED.value,
+                       DeliveryOutcome.UNCERTAIN.value):
+        return DeliveryOutcome.UNCERTAIN.value, None
+    if outcome != DeliveryOutcome.SENT.value:
+        return outcome, None
+    if (not isinstance(message_id, str) or not message_id.strip()
+            or len(message_id) > _MAX_DELIVERY_MESSAGE_ID_CHARS
+            or not message_id.strip().isdigit()):
+        return DeliveryOutcome.UNCERTAIN.value, None
+    return DeliveryOutcome.SENT.value, message_id.strip()
 
 
 @dataclass(frozen=True)
@@ -461,6 +487,7 @@ class ApplyResult:
     idempotency_key: str | None = None
     should_execute: bool = False  # a FRESH pending intent needs its fake effect run
     message_authorized: bool = False  # the bundled message_intent specifically cleared policy
+    claimed: bool = False  # a durable delivery claim was newly taken by THIS call
 
 
 # --- ledger writes: immutable commands ----------------------------------
@@ -574,12 +601,31 @@ class ActionIntentOutcomeCommand:
 
 
 @dataclass(frozen=True)
+class ClaimMessageDeliveryCommand:
+    """Atomically claims the right to attempt ONE real delivery for an
+    intent, BEFORE the network call - the durable gate that stops two
+    concurrent callers from both calling the adapter. Only an executed
+    ``CREATE_RECOVERY_LINK`` intent, currently ``DRAFTED``, with a confirmed
+    checkout URL and no prior delivery attempt of any kind (never
+    ``in_progress``/``sent``/``failed``/``uncertain``), may be claimed."""
+
+    intent_id: str
+    case_id: str
+    now: int
+    channel: str  # e.g. "telegram"
+
+
+@dataclass(frozen=True)
 class MessageDeliveryCommand:
-    """Records one real message-delivery attempt for an already-DRAFTED
-    action intent. Idempotent: replaying against an intent already marked
-    ``sent`` is a no-op - a verified delivery is never repeated. A
-    ``failed``/``uncertain`` outcome is recorded but never flips the intent
-    to ``sent`` and never auto-retries."""
+    """Records the final result of one real message-delivery attempt for an
+    intent this SAME channel already claimed (``delivery_outcome ==
+    "in_progress"``) - never accepted otherwise. Idempotent: replaying
+    against an intent already marked ``sent`` is a no-op - a verified
+    delivery is never repeated. A ``failed``/``uncertain`` outcome is
+    recorded but never flips the intent to ``sent`` and never re-arms it for
+    an automatic retry - a fresh claim is required, and the claim gate is
+    permanently closed once any outcome (including ``failed``/``uncertain``)
+    is recorded."""
 
     intent_id: str
     case_id: str

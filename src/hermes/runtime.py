@@ -197,6 +197,16 @@ def build_provider(settings: Settings):
     return HybridPaymentProvider(FakeRazorpayAdapter(), real)
 
 
+def build_delivery(settings: Settings):
+    """The real message-delivery adapter - independent of ``build_provider``
+    and of ``settings`` (Telegram reads only its own three env vars, per its
+    own module contract). Always safe: disabled/unconfigured returns
+    ``NullTelegramAdapter``, which never claims delivery."""
+    from .telegram_delivery import build_delivery_adapter
+
+    return build_delivery_adapter()
+
+
 def build_engine(
     settings: Settings, *, ledger=None, razorpay=None
 ) -> RecoveryEngine:
@@ -278,4 +288,5 @@ def build_app(settings: Settings):
             settings.mode, "scripted-offline"),
         on_shutdown=ledger.close, ledger=ledger,
         real_webhook_secret=real_secret,
+        delivery=build_delivery(settings),
     )

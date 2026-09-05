@@ -68,6 +68,7 @@ _PARENT_FAIL_ABNORMAL_EXIT = "abnormal_child_exit"
 _PARENT_FAIL_CHILD = "child_reported_failure"
 _PARENT_FAIL_PROPOSAL_SHAPE = "proposal_shape"
 _PARENT_FAIL_INSTRUCTION_LOAD = "instruction_load_failed"
+_PARENT_FAIL_PAYMENT_PLAN_INELIGIBLE = "payment_plan_ineligible"
 
 # Only the actions deterministic policy can authorize + execute today. This is
 # what the child advertises as the "allowed actions" catalog. STOP and a
@@ -253,6 +254,39 @@ def _evidence_bundle(
     }
 
 
+# A single insufficient-funds failure must never justify a payment-plan
+# recommendation by itself - this many PRIOR (never the current, still-open
+# failure) completed late/failed obligations are required.
+_MIN_PRIOR_DIFFICULTY_FOR_PAYMENT_PLAN = 2
+
+
+def _payment_plan_eligibility(evidence_bundle: dict, history_tool_called: bool) -> dict:
+    """Deterministic ``PAYMENT_PLAN_REVIEW`` eligibility fact, derived ONLY
+    from the SAME synthetic payment records actually disclosed to Hermes for
+    THIS decision - never from model text, diagnosis, rationale, or an
+    archetype label. Counts PRIOR (never the current, still-open failure)
+    completed obligations that were late or themselves failed.
+
+    The 12-month window counts only when Hermes actually called
+    ``get_payment_history`` for this decision - an unused expansion
+    capability discloses nothing, so it cannot establish eligibility.
+    Otherwise only the initial 3-month window (always disclosed) counts.
+    """
+    disclosed = (
+        list(evidence_bundle["history_12m"]["rows"])
+        if history_tool_called and evidence_bundle["history_12m"].get("rows")
+        else list(evidence_bundle["initial_context"]["payment_history_3m"].get("records", []))
+    )
+    # The current, still-open failure is always the last disclosed row (by
+    # construction of the synthetic history) - never itself a "prior" obligation.
+    prior = disclosed[:-1] if disclosed else []
+    prior_difficulty_count = sum(1 for r in prior if r.get("outcome") != "paid_on_time")
+    return {
+        "eligible": prior_difficulty_count >= _MIN_PRIOR_DIFFICULTY_FOR_PAYMENT_PLAN,
+        "prior_difficulty_count": prior_difficulty_count,
+    }
+
+
 _ACTION_MAP = {a.value: a for a in ProposalAction}
 
 
@@ -420,6 +454,10 @@ class HermesAgentStrategist:
                           "failure_stage": "instruction_load"}
             raise
 
+        evidence_bundle = _evidence_bundle(
+            snap, history_available=self._history_available,
+            history_months_available=self._history_months_available,
+        )
         job = {
             "mode": "mock" if self._mock_base_url else "gemini",
             "deadline_s": self._deadline_s,
@@ -427,10 +465,7 @@ class HermesAgentStrategist:
             "soul_text": soul_text,
             "skill_text": skill_text,
             "approved_messages": list(APPROVED_MESSAGE_INTENT_LIST),
-            "evidence_bundle": _evidence_bundle(
-                snap, history_available=self._history_available,
-                history_months_available=self._history_months_available,
-            ),
+            "evidence_bundle": evidence_bundle,
         }
         if self._mock_base_url:
             job["mock"] = {"base_url": self._mock_base_url, "model": self._mock_model}
@@ -490,7 +525,35 @@ class HermesAgentStrategist:
             audit.setdefault("failure_category", _PARENT_FAIL_CHILD)
             raise InvalidProposal("Hermes decision failed (see audit failure_category)")
 
-        return _to_proposal(payload.get("proposal"), audit)
+        # Deterministic PAYMENT_PLAN_REVIEW eligibility fact, computed from
+        # the SAME synthetic records disclosed for this decision - never
+        # from the model's own text. Persisted regardless of outcome (audit
+        # is already meta.extra) so Neon can explain an accept OR a reject.
+        history_tool_called = any(
+            e.get("tool") == "get_payment_history"
+            for e in (audit.get("evidence_returned") or [])
+        )
+        eligibility = _payment_plan_eligibility(evidence_bundle, history_tool_called)
+        audit["payment_plan_eligible"] = eligibility["eligible"]
+        audit["payment_plan_prior_difficulty_count"] = eligibility["prior_difficulty_count"]
+
+        proposal_obj = payload.get("proposal")
+        if (
+            isinstance(proposal_obj, dict)
+            and proposal_obj.get("recommended_intervention") == "PAYMENT_PLAN_REVIEW"
+            and not eligibility["eligible"]
+        ):
+            # Fail closed BEFORE persistence as an accepted advisory: no
+            # rationale, however convincing, substitutes for the disclosed
+            # evidence this demo requires.
+            audit["failure_category"] = _PARENT_FAIL_PAYMENT_PLAN_INELIGIBLE
+            meta.validation_result = "invalid:payment_plan_ineligible"
+            raise InvalidProposal(
+                "Hermes recommended PAYMENT_PLAN_REVIEW without the required "
+                "disclosed evidence of repeated prior difficulty"
+            )
+
+        return _to_proposal(proposal_obj, audit)
 
 
 def _parse_result(stdout: str) -> dict | None:

@@ -40,6 +40,7 @@ from .types import (
     CaseProjection,
     CaseSnapshot,
     CaseState,
+    ClaimMessageDeliveryCommand,
     DeliveryOutcome,
     DiscardWorkCommand,
     EvaluationCommand,
@@ -58,6 +59,7 @@ from .types import (
     TERMINAL_STATES,
     WorkClaim,
     compute_message_status,
+    sanitize_delivery_receipt,
     valid_payment_id,
 )
 
@@ -858,25 +860,64 @@ class InMemoryLedger:
         )
         return ApplyResult(ok=True, terminal=True, reason="uncertain")
 
-    def apply_message_delivery(self, cmd: MessageDeliveryCommand) -> ApplyResult:
-        """Record one real delivery attempt (any outcome). Idempotent: an
-        intent already ``sent`` is left alone - a verified delivery is never
-        repeated, and this never runs the adapter itself (the caller already
-        decided not to re-call a sent intent). A ``failed``/``uncertain``
-        outcome is recorded but never flips ``message_status`` to ``sent``
-        and never schedules an automatic retry.
+    def claim_message_delivery(self, cmd: ClaimMessageDeliveryCommand) -> ApplyResult:
+        """Atomically claim the right to attempt ONE real delivery, BEFORE
+        any network call. Eligible only once: executed
+        ``CREATE_RECOVERY_LINK``, currently ``DRAFTED``, a confirmed
+        checkout URL, and no delivery attempt of any kind yet
+        (``delivery_outcome is None``). A second/concurrent claimant (or a
+        replay after ANY prior outcome - success, failure, or uncertain)
+        gets ``claimed=False`` and must never call the adapter.
         """
         intent = self._action_intents.get(cmd.intent_id)
         if intent is None or intent.case_id != cmd.case_id:
             return ApplyResult(ok=False, reason="unknown_intent")
-        if intent.message_status == MessageStatus.SENT.value:
-            return ApplyResult(ok=True, reason="already_sent")
+        eligible = (
+            intent.action == ProposalAction.CREATE_RECOVERY_LINK.value
+            and intent.status == "executed"
+            and intent.message_status == MessageStatus.DRAFTED.value
+            and bool(intent.url)
+            and intent.delivery_outcome is None
+        )
+        if not eligible:
+            return ApplyResult(ok=True, claimed=False, reason="not_eligible")
         case = self._cases[intent.case_id]
         intent.delivery_channel = cmd.channel
-        intent.delivery_outcome = cmd.outcome
+        intent.delivery_outcome = DeliveryOutcome.IN_PROGRESS.value
         intent.delivery_attempted_time = cmd.now
-        sent = cmd.outcome == DeliveryOutcome.SENT.value
-        intent.delivery_message_id = cmd.message_id if sent else None
+        self._append(
+            cmd.now, case.case_id, AUDIT_MESSAGE_DELIVERY_ATTEMPTED,
+            {
+                "intent_id": intent.intent_id, "case_id": case.case_id,
+                "channel": cmd.channel, "outcome": DeliveryOutcome.IN_PROGRESS.value,
+                "message_id": None, "attempted_time": cmd.now,
+            },
+        )
+        return ApplyResult(ok=True, claimed=True, reason="claimed")
+
+    def apply_message_delivery(self, cmd: MessageDeliveryCommand) -> ApplyResult:
+        """Record the final result of one real delivery attempt. Accepted
+        ONLY for an intent this same channel already claimed
+        (``delivery_outcome == "in_progress"``) - a replay, or a call with
+        no matching claim, is a safe no-op that never touches state or the
+        audit trail again. Sanitizes ``(outcome, message_id)`` as defense in
+        depth (the orchestration layer already does the same check): only
+        a genuinely valid ``sent`` + message id ever flips ``message_status``
+        to ``sent``; anything else is recorded as ``failed``/``uncertain``
+        and the claim gate stays permanently closed - no automatic retry.
+        """
+        intent = self._action_intents.get(cmd.intent_id)
+        if intent is None or intent.case_id != cmd.case_id:
+            return ApplyResult(ok=False, reason="unknown_intent")
+        if intent.delivery_outcome != DeliveryOutcome.IN_PROGRESS.value:
+            return ApplyResult(ok=True, reason="not_claimed")
+        case = self._cases[intent.case_id]
+        outcome, message_id = sanitize_delivery_receipt(cmd.outcome, cmd.message_id)
+        intent.delivery_channel = cmd.channel
+        intent.delivery_outcome = outcome
+        intent.delivery_attempted_time = cmd.now
+        intent.delivery_message_id = message_id
+        sent = outcome == DeliveryOutcome.SENT.value
         if sent:
             intent.message_status = MessageStatus.SENT.value
             intent.message_sent = True
@@ -887,9 +928,8 @@ class InMemoryLedger:
             cmd.now, case.case_id, AUDIT_MESSAGE_DELIVERY_ATTEMPTED,
             {
                 "intent_id": intent.intent_id, "case_id": case.case_id,
-                "channel": cmd.channel, "outcome": cmd.outcome,
-                "message_id": intent.delivery_message_id,
-                "attempted_time": cmd.now,
+                "channel": cmd.channel, "outcome": outcome,
+                "message_id": message_id, "attempted_time": cmd.now,
             },
         )
         return ApplyResult(ok=True, terminal=False)

@@ -19,6 +19,7 @@ from .types import (
     CaptureInfo,
     CaseProjection,
     CaseSnapshot,
+    ClaimMessageDeliveryCommand,
     DeliveryReceipt,
     DiscardWorkCommand,
     EvaluationCommand,
@@ -120,9 +121,16 @@ class Ledger(Protocol):
     # intent found at startup): marks the intent ``uncertain`` and the case
     # ``escalated`` - idempotent, never recovered, never retried automatically.
 
+    def claim_message_delivery(self, cmd: ClaimMessageDeliveryCommand) -> ApplyResult: ...
+    # Atomically claims the right to attempt ONE delivery BEFORE any network
+    # call. ``result.claimed`` is False for a second/concurrent claimant, or
+    # a replay after any prior outcome - the caller must never call the
+    # adapter without ``claimed=True``.
+
     def apply_message_delivery(self, cmd: MessageDeliveryCommand) -> ApplyResult: ...
-    # Records one real delivery attempt (any outcome). Idempotent: a replay
-    # against an intent already ``sent`` is a no-op - never a second message.
+    # Records the final outcome for an intent THIS channel already claimed.
+    # Idempotent: a replay against an intent already ``sent``, or with no
+    # matching claim, is a no-op - never a second message.
 
     def discard_work(self, cmd: DiscardWorkCommand) -> ApplyResult: ...
 

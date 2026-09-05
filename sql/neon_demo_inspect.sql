@@ -73,6 +73,7 @@ ORDER  BY created_logical_time;
 SELECT case_id, intent_id, proposed_action, execution_status, provider_reference,
        checkout_url_present, action_evidence_mode, message_authorized, message_sent,
        message_intent, message_draft, message_status,
+       delivery_channel, delivery_status, delivery_message_id, delivery_attempted_time,
        case_state, human_review_required, uncertain_reason
 FROM   hermes_demo.recovery_actions
 ORDER  BY created_logical_time;
@@ -82,6 +83,7 @@ SELECT case_id, decision_number, logical_time, model, hermes_runtime_revision,
        execution_duration_seconds, latency_ms, validation_result, repair_used,
        confidence, confidence_band, proposed_action, recommended_intervention,
        model_human_review_recommended, model_human_review_reason,
+       payment_plan_eligible, payment_plan_prior_difficulty_count,
        policy_outcome, authorized
 FROM   hermes_demo.hermes_decisions
 ORDER  BY logical_time DESC;

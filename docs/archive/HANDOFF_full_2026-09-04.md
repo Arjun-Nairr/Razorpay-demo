@@ -2582,3 +2582,45 @@ either fixed or bounded-failed - it could never reach the engine unsafe.
 
 Verified: focused tests/test_hermes_agent.py 60 -> 67 passed; full offline
 404 -> 410 passed, 3 skipped. compileall + git diff --check clean.
+
+---
+
+## Iteration 25 archived detail (moved from HANDOFF.md during Iteration 26)
+
+Product scope lock + narrowed advisory + Telegram delivery foundation. No
+live case run; no Gemini/Razorpay/Telegram/Neon call.
+
+Product scope locked (api.py): only the normalized reason
+insufficient_funds may create a case. Any other/missing PAYMENT_FAILED
+reason is acknowledged (2xx, so the provider never retry-storms) but never
+reaches engine.receive - no case, retry, link, recommendation, or message -
+returning outcome: ignored_unsupported_failure_reason. Signature
+verification and event-id idempotency are unaffected; a redelivered ignored
+event is still safely acknowledged.
+
+Advisory narrowed to NONE/PAYMENT_PLAN_REVIEW (types.py, child_main.py,
+hermes_strategist.py, SKILL.md): the other four values (UPDATE_PAYMENT_
+METHOD, MANDATE_REAUTH_REVIEW, BILLING_SUPPORT_REVIEW, HUMAN_FOLLOW_UP) were
+removed from the live typed/model contract - never reconstructed from
+persisted JSONB, so historical Neon rows stayed exactly as recorded.
+
+Telegram delivery foundation: new telegram_delivery.py (TelegramConfig/
+TelegramAdapter/NullTelegramAdapter), a narrow MessageDeliveryAdapter
+protocol, and engine.deliver_drafted_message (a free function -
+RecoveryEngine's own surface stayed receive/run/inspect). Disabled by
+default; config read only from TELEGRAM_ENABLED/TELEGRAM_BOT_TOKEN/
+TELEGRAM_CHAT_ID. Delivered only an already-authorized, already-DRAFTED
+message for an executed CREATE_RECOVERY_LINK with a CONFIRMED REAL_TEST_MODE
+checkout URL; the URL was appended to the approved template only at the
+delivery boundary. message_status advanced DRAFTED -> SENT only on a
+verified success with a message id; failed/uncertain were recorded (new
+append-only MESSAGE_DELIVERY_ATTEMPTED audit event) but never auto-retried.
+scripts/telegram_setup.py verified the bot (getMe) and listed chat-id
+candidates (getUpdates) without printing secrets or writing .env.
+
+This iteration's two known gaps (no atomic claim-before-send; no
+deterministic PAYMENT_PLAN_REVIEW eligibility check) were closed in
+Iteration 26 - see HANDOFF.md.
+
+Verified: focused tests/test_hermes_agent.py 67 -> 71 passed; full offline
+410 -> 442 passed, 3 skipped. compileall + git diff --check clean.

@@ -33,6 +33,7 @@ from .types import (
     CaptureCommand,
     CaseQuery,
     CaseSnapshot,
+    ClaimMessageDeliveryCommand,
     DiscardWorkCommand,
     EvaluationCommand,
     IntakeCommand,
@@ -57,6 +58,7 @@ from .types import (
     TERMINAL_STATES,
     WebhookType,
     WorkClaim,
+    sanitize_delivery_receipt,
     valid_payment_id,
 )
 
@@ -261,15 +263,19 @@ def deliver_drafted_message(
     ``RecoveryEngine`` method (its public surface stays exactly ``receive``/
     ``run``/``inspect``) - matching ``authorize()``'s existing shape.
 
+    Claim-before-send: a durable ``claim_message_delivery`` call marks the
+    attempt ``in_progress`` BEFORE the adapter is ever invoked. A second or
+    concurrent caller - or a replay after any prior outcome (success,
+    failure, or uncertain) - gets ``claimed=False`` back and must never call
+    the adapter; this function enforces that by returning immediately.
     Deterministic code builds the final text HERE, from the exact staged
     draft plus the confirmed Payment Link checkout URL - Hermes never sees
     or generates the URL, and the URL is never itself persisted in the
-    draft/audit trail. Returns ``None`` (nothing to do) when no intent is
-    eligible - in particular, a ``SIMULATED`` link (no confirmed
-    ``REAL_TEST_MODE`` checkout URL) is never delivered. Idempotent: an
-    intent already ``sent`` is filtered out here, so a replay never calls
-    the adapter - never a second real message - and a ``failed``/
-    ``uncertain`` result is recorded but never automatically retried.
+    draft/audit trail. Returns ``None`` when no intent is eligible at all -
+    in particular, a ``SIMULATED`` link (no confirmed ``REAL_TEST_MODE``
+    checkout URL) is never delivered. The receipt is sanitized here too
+    (defense in depth over the ledger's own check): only a genuinely valid
+    ``sent`` + message id can ever become ``SENT``.
     """
     proj = ledger.case_projection(case_id=case_id)
     intent = next(
@@ -277,16 +283,23 @@ def deliver_drafted_message(
          if i.action == ProposalAction.CREATE_RECOVERY_LINK.value
          and i.status == "executed"
          and i.message_status == MessageStatus.DRAFTED.value
+         and i.delivery_outcome is None
          and i.url),
         None,
     )
     if intent is None:
         return None
+    claim = ledger.claim_message_delivery(ClaimMessageDeliveryCommand(
+        intent_id=intent.intent_id, case_id=case_id, now=now, channel="telegram",
+    ))
+    if not claim.claimed:
+        return claim  # lost the race, or already resolved - never call the adapter
     text = f"{intent.message_draft}\n\n{intent.url}"
     receipt = delivery.deliver(text=text)
+    outcome, message_id = sanitize_delivery_receipt(receipt.outcome, receipt.message_id)
     return ledger.apply_message_delivery(MessageDeliveryCommand(
         intent_id=intent.intent_id, case_id=case_id, now=now,
-        channel="telegram", outcome=receipt.outcome, message_id=receipt.message_id,
+        channel="telegram", outcome=outcome, message_id=message_id,
     ))
 
 
@@ -587,23 +600,41 @@ class RecoveryEngine:
         local state alone; this never guesses either way - it marks every
         still-``pending`` intent found ``uncertain`` (same safe stop as the
         in-run path) so it surfaces for manual review instead of staying
-        silently stuck. Idempotent - a second call finds nothing left to do.
-        Returns the number of intents reconciled.
+        silently stuck.
+
+        The same crash shape applies to a durably-claimed message delivery
+        (``delivery_outcome == "in_progress"``, see
+        ``deliver_drafted_message``): the claim gate closes it to further
+        automatic attempts already, but a crash before the real outcome
+        landed leaves it ``in_progress`` forever without this sweep. Both
+        are resolved to a genuinely safe, non-retryable ``uncertain`` state
+        for human review - never guessed, never retried.
+
+        Idempotent - a second call finds nothing left to do. Returns the
+        number of intents reconciled (either kind).
         """
         led = self._ledger
         n = 0
         for case_id in led.case_ids():
             proj = led.case_projection(case_id=case_id)
             for intent in proj.action_intents:
-                if intent.action != "CREATE_RECOVERY_LINK" or intent.status != "pending":
-                    continue
-                led.apply_action_intent_uncertain(
-                    ActionIntentUncertainCommand(
-                        intent_id=intent.intent_id, case_id=case_id,
-                        now=self._clock, reason="restart_found_pending_intent",
+                if intent.action == "CREATE_RECOVERY_LINK" and intent.status == "pending":
+                    led.apply_action_intent_uncertain(
+                        ActionIntentUncertainCommand(
+                            intent_id=intent.intent_id, case_id=case_id,
+                            now=self._clock, reason="restart_found_pending_intent",
+                        )
                     )
-                )
-                n += 1
+                    n += 1
+                elif intent.delivery_outcome == "in_progress":
+                    led.apply_message_delivery(
+                        MessageDeliveryCommand(
+                            intent_id=intent.intent_id, case_id=case_id,
+                            now=self._clock, channel=intent.delivery_channel or "telegram",
+                            outcome="uncertain",
+                        )
+                    )
+                    n += 1
         return n
 
     # -- inspect -------------------------------------------------

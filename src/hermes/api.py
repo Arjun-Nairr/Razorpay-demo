@@ -60,8 +60,9 @@ from .demo_fixtures import (
     failure_envelope,
     mint_demo_ids,
 )
-from .engine import RecoveryEngine
+from .engine import RecoveryEngine, deliver_drafted_message
 from .razorpay_test_mode import RealWebhookError, handle_payment_link_paid_webhook
+from .telegram_delivery import NullTelegramAdapter
 from .types import AuditQuery, CaseQuery, NoteEventCommand, RazorpayWebhook, WebhookType
 
 _SUPPORTED_EVENTS: dict[str, WebhookType] = {
@@ -287,7 +288,8 @@ _DEMO_ERR_UNKNOWN_CASE = "unknown demo case"
 _DEMO_ERR_BAD_STEP = "step must be one of: advance, retry_failed, capture"
 _DEMO_ERR_RUN_BUSY = "a recovery run is already in progress; retry shortly"
 _DEMO_ERR_NO_LINK = "no authorized recovery link to pay"
-_DEMO_STEPS = ("advance", "retry_failed", "capture")
+_DEMO_ERR_NO_LEDGER = "message delivery requires a persisted ledger"
+_DEMO_STEPS = ("advance", "retry_failed", "capture", "deliver_message")
 
 
 def _run_json(report: Any) -> dict:
@@ -310,6 +312,7 @@ def create_app(
     on_shutdown: "Callable[[], None] | None" = None,
     ledger: Any | None = None,
     real_webhook_secret: str | None = None,
+    delivery: Any | None = None,
 ) -> FastAPI:
     """Build the ingress app around an injected engine and config.
 
@@ -336,6 +339,11 @@ def create_app(
     HANDOFF.md for a concrete ingress-rule example). Omit to leave this route
     unmounted entirely (the default, offline-safe state).
 
+    ``delivery`` (a ``MessageDeliveryAdapter``, e.g. a real
+    ``TelegramAdapter``) backs ``POST /demo/step {"step": "deliver_message"}``
+    - entirely separate from ``razorpay``. Omitted or ``None`` defaults to
+    ``NullTelegramAdapter``, which never claims delivery.
+
     Concurrency: the ledger serialises its own operations; a slow model call in
     ``engine.run`` happens between ledger ops and holds no lock, so webhook
     intake never waits for Gemini. A single non-blocking ``run_lock`` enforces
@@ -359,6 +367,7 @@ def create_app(
     app.state.config = config
     app.state.razorpay = razorpay
     app.state.ledger = ledger
+    app.state.delivery = delivery or NullTelegramAdapter()
     app.state.mode_label = mode_label
     app.state.merchant_context = dict(merchant_context or {})
     app.state.demo_serial = max(1, int(demo_serial_start)) - 1
@@ -398,6 +407,10 @@ def create_app(
             "mode": app.state.mode_label,
             "payment_provider": payment_provider,
             "payment_provider_test_mode_enabled": bool(getattr(provider, "test_mode_enabled", False)),
+            # Non-secret capability flag only - never the token/chat id.
+            "message_delivery_channel": (
+                "none" if isinstance(app.state.delivery, NullTelegramAdapter) else "telegram"
+            ),
         }
 
     # -- public webhook: signature over raw bytes BEFORE any parsing ----
@@ -517,6 +530,27 @@ def create_app(
                 return {"step": step, "capture": body}
 
             return await run_in_threadpool(_sync_capture)
+
+        if step == "deliver_message":
+            def _sync_deliver() -> dict:
+                _resolve_obl()  # 404 if the case is unknown
+                if app.state.ledger is None:
+                    raise HTTPException(status_code=503, detail=_DEMO_ERR_NO_LEDGER)
+                result = deliver_drafted_message(
+                    app.state.ledger, case_id, app.state.delivery, now=engine.logical_time,
+                )
+                if result is None or not result.claimed and result.reason == "not_eligible":
+                    # Nothing eligible, or lost the race to claim it - the
+                    # adapter was never called either way.
+                    return {"step": step, "delivery": {"attempted": False}}
+                # A claim WAS taken and the adapter WAS called. The caller
+                # reads the recorded outcome back via GET /demo/case/{id}
+                # (action_intents[].message_status / delivery_outcome) -
+                # never repeated here beyond a bare success/fail signal, and
+                # never the checkout URL, template text, or a credential.
+                return {"step": step, "delivery": {"attempted": True, "ok": result.ok}}
+
+            return await run_in_threadpool(_sync_deliver)
 
         # advance / retry_failed both drive engine.run -> one runner at a time.
         if not app.state.run_lock.acquire(blocking=False):

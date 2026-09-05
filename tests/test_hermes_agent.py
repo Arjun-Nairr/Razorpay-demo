@@ -374,7 +374,11 @@ def test_unsafe_human_review_reason_enters_the_repair_path_and_is_fixed(stub, tm
     """The isolated Hermes child's own validator (not only engine
     ._validate_proposal) rejects an unsafe human_review_reason - a bad first
     reply gets the SAME one-repair chance any other schema violation does,
-    and never escapes as a successful proposal."""
+    and never escapes as a successful proposal. The repaired reply retracts
+    the (on this reliable-customer snapshot, ineligible) advisory entirely -
+    proving the CONTENT-safety repair independently of the separate
+    deterministic eligibility gate (see test_hermes_agent_strategist tests
+    for that gate's own coverage)."""
     _, S = stub
     bad = ('{"action":"WAIT_FOR_PROVIDER_RETRY","diagnosis":"d","rationale":"r",'
            '"confidence":0.6,"proposed_wait_hours":24,'
@@ -382,12 +386,12 @@ def test_unsafe_human_review_reason_enters_the_repair_path_and_is_fixed(stub, tm
            '"human_review_reason":"see reference plink_abc123","message_intent":null}')
     good = ('{"action":"WAIT_FOR_PROVIDER_RETRY","diagnosis":"d","rationale":"r",'
             '"confidence":0.6,"proposed_wait_hours":24,'
-            '"recommended_intervention":"PAYMENT_PLAN_REVIEW","human_review_recommended":true,'
-            '"human_review_reason":"a safe evidence-based reason","message_intent":null}')
+            '"recommended_intervention":"NONE","human_review_recommended":false,'
+            '"human_review_reason":null,"message_intent":null}')
     S.queue = [_text(bad), _text(good)]
     strat = _strat(stub, tmp_path)
     p = strat.propose(_snap())
-    assert p.human_review_reason == "a safe evidence-based reason"
+    assert p.recommended_intervention.value == "NONE"
     assert strat.last_run_meta.repair_used is True
     assert strat.last_run_meta.validation_result == "repaired"
 
@@ -502,6 +506,94 @@ def test_no_result_line_is_a_bounded_failure(monkeypatch, tmp_path):
     with pytest.raises(InvalidProposal):
         s.propose(_snap())
     assert s.last_run_meta.extra["failure_category"] == "no_result_line"
+
+
+# === deterministic PAYMENT_PLAN_REVIEW eligibility (offline, no runtime) ===
+
+
+def test_payment_plan_eligibility_false_for_reliable_customer_default_fixture():
+    """The reliable-customer default snapshot's disclosed 3-month window is
+    two on-time payments plus the current (not-prior) failure - zero
+    qualifying prior difficulty."""
+    bundle = mod._evidence_bundle(_snap())
+    result = mod._payment_plan_eligibility(bundle, history_tool_called=False)
+    assert result == {"eligible": False, "prior_difficulty_count": 0}
+
+
+def test_payment_plan_eligibility_current_failure_never_counts_as_prior():
+    bundle = {
+        "initial_context": {"payment_history_3m": {"records": [
+            {"due": "2026-09-01", "paid": None, "outcome": "failed_insufficient_funds"},
+        ]}},
+        "history_12m": {"rows": []},
+    }
+    result = mod._payment_plan_eligibility(bundle, history_tool_called=False)
+    assert result == {"eligible": False, "prior_difficulty_count": 0}
+
+
+def test_payment_plan_eligibility_true_with_two_prior_late_or_failed():
+    bundle = {
+        "initial_context": {"payment_history_3m": {"records": [
+            {"due": "2026-07-01", "paid": "2026-07-05", "outcome": "paid_4_days_late"},
+            {"due": "2026-08-01", "paid": None, "outcome": "failed_insufficient_funds"},
+            {"due": "2026-09-01", "paid": None, "outcome": "failed_insufficient_funds"},  # current
+        ]}},
+        "history_12m": {"rows": []},
+    }
+    result = mod._payment_plan_eligibility(bundle, history_tool_called=False)
+    assert result == {"eligible": True, "prior_difficulty_count": 2}
+
+
+def test_payment_plan_eligibility_12_month_only_counts_if_tool_actually_called():
+    """A clean 3-month window with a chronic 12-month history behind it must
+    NOT establish eligibility unless Hermes actually called
+    get_payment_history for this decision - an unused capability discloses
+    nothing."""
+    bundle = {
+        "initial_context": {"payment_history_3m": {"records": [
+            {"due": "2026-08-01", "paid": "2026-08-01", "outcome": "paid_on_time"},
+            {"due": "2026-09-01", "paid": None, "outcome": "failed_insufficient_funds"},  # current
+        ]}},
+        "history_12m": {"rows": [
+            {"due": "2026-03-01", "paid": None, "outcome": "failed_insufficient_funds"},
+            {"due": "2026-05-01", "paid": "2026-05-09", "outcome": "paid_8_days_late"},
+            {"due": "2026-08-01", "paid": "2026-08-01", "outcome": "paid_on_time"},
+            {"due": "2026-09-01", "paid": None, "outcome": "failed_insufficient_funds"},  # current
+        ]},
+    }
+    not_called = mod._payment_plan_eligibility(bundle, history_tool_called=False)
+    assert not_called == {"eligible": False, "prior_difficulty_count": 0}
+    called = mod._payment_plan_eligibility(bundle, history_tool_called=True)
+    assert called == {"eligible": True, "prior_difficulty_count": 2}
+
+
+def test_hostile_payment_plan_recommendation_on_reliable_case_is_rejected(monkeypatch, tmp_path):
+    """The live model must not be able to recommend PAYMENT_PLAN_REVIEW from
+    a single insufficient-funds failure merely by writing a convincing
+    rationale - the reliable-customer fixture's disclosed evidence has zero
+    qualifying prior difficulty, so this fails closed BEFORE persistence as
+    an accepted advisory, regardless of what the model claims."""
+    hostile_payload = _SENTINEL + json.dumps({
+        "ok": True,
+        "proposal": {
+            "action": "WAIT_FOR_PROVIDER_RETRY", "diagnosis": "d",
+            "rationale": "This customer has a long history of struggling to pay on "
+                         "time and clearly needs a payment plan.",
+            "confidence": 0.9, "proposed_wait_hours": 24,
+            "recommended_intervention": "PAYMENT_PLAN_REVIEW",
+            "human_review_recommended": True,
+            "human_review_reason": "recurring affordability difficulty",
+            "message_intent": None,
+        },
+        "audit": {"validation_result": "valid", "evidence_returned": []},
+    })
+    s = _parent_only(monkeypatch, tmp_path, hostile_payload, rc=0)
+    with pytest.raises(InvalidProposal):
+        s.propose(_snap())
+    ex = s.last_run_meta.extra
+    assert ex["failure_category"] == "payment_plan_ineligible"
+    assert ex["payment_plan_eligible"] is False
+    assert ex["payment_plan_prior_difficulty_count"] == 0
 
 
 def test_wrong_revision_refuses_to_launch(tmp_path):

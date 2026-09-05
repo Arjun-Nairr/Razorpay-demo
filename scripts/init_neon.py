@@ -160,7 +160,13 @@ SELECT
   COALESCE(p->'detail'->>'recommended_intervention', 'NOT_RECORDED')
                                                              AS recommended_intervention,
   (p->'detail'->>'human_review_recommended')::boolean       AS model_human_review_recommended,
-  p->'detail'->>'human_review_reason'                       AS model_human_review_reason
+  p->'detail'->>'human_review_reason'                       AS model_human_review_reason,
+  -- deterministic (never model-derived) PAYMENT_PLAN_REVIEW eligibility fact -
+  -- explains WHY a recommendation was allowed or rejected; null/NOT_RECORDED
+  -- on a historical row that predates this fact.
+  (mr.detail->'hermes'->>'payment_plan_eligible')::boolean  AS payment_plan_eligible,
+  (mr.detail->'hermes'->>'payment_plan_prior_difficulty_count')::int
+                                                             AS payment_plan_prior_difficulty_count
 FROM {schema}.ledger_state s,
      jsonb_array_elements(s.data->'audit') AS p
 LEFT JOIN LATERAL (
@@ -203,7 +209,13 @@ SELECT
   -- EXISTING view's existing output columns, only append new ones.
   i.value->>'message_intent'                                AS message_intent,
   i.value->>'message_draft'                                 AS message_draft,
-  COALESCE(i.value->>'message_status', 'LEGACY_NOT_STAGED') AS message_status
+  COALESCE(i.value->>'message_status', 'LEGACY_NOT_STAGED') AS message_status,
+  -- real message-delivery evidence (e.g. Telegram) - never the checkout URL,
+  -- template text, token, or chat id; null on a row with no attempt yet.
+  i.value->>'delivery_channel'                              AS delivery_channel,
+  i.value->>'delivery_outcome'                              AS delivery_status,
+  i.value->>'delivery_message_id'                           AS delivery_message_id,
+  (i.value->>'delivery_attempted_time')::int                AS delivery_attempted_time
 FROM {schema}.ledger_state s,
      jsonb_each(s.data->'action_intents') AS i(intent_id, value)
 LEFT JOIN LATERAL (

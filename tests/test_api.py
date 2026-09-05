@@ -284,6 +284,59 @@ def test_unsupported_shape_missing_subscription_rejected():
     assert eng.inspect(BatchQuery()).cases == 0
 
 
+# --- message delivery step (Telegram seam) ------------------------------
+
+
+def _demo_client():
+    """``/demo/*`` needs an explicit ``razorpay=`` provider (``make_client()``
+    above omits it - it only ever drives the webhook routes)."""
+    eng = make_engine()
+    app = create_app(engine=eng, config=ApiConfig(webhook_secret=SECRET),
+                     razorpay=FakeRazorpayAdapter())
+    return TestClient(app), eng
+
+
+def test_deliver_message_unknown_case_is_404():
+    tc, _ = _demo_client()
+    r = tc.post("/demo/step", json={"case_id": "no-such-case", "step": "deliver_message"})
+    assert r.status_code == 404
+
+
+def test_deliver_message_defaults_to_null_adapter_and_never_claims():
+    """No ``delivery=`` was passed to ``create_app`` - the default
+    ``NullTelegramAdapter`` must never claim delivery for a real case, even
+    if one existed. Structural/wiring smoke test only (the adapter and
+    engine orchestration are covered in tests/test_telegram_delivery.py)."""
+    ledger = InMemoryLedger()
+    eng = RecoveryEngine(ledger, ScriptedStrategist(), FakeRazorpayAdapter())
+    app = create_app(engine=eng, config=ApiConfig(webhook_secret=SECRET),
+                     razorpay=FakeRazorpayAdapter(), ledger=ledger)
+    tc = TestClient(app)
+    cid = tc.post("/demo/case").json()["case_id"]
+    resp = tc.post("/demo/step", json={"case_id": cid, "step": "deliver_message"})
+    assert resp.status_code == 200
+    assert resp.json()["delivery"] == {"attempted": False}  # nothing DRAFTED yet
+
+
+def test_health_reports_no_message_delivery_channel_by_default():
+    tc, _ = make_client()
+    assert tc.get("/health").json()["message_delivery_channel"] == "none"
+
+
+def test_health_reports_telegram_channel_when_delivery_injected():
+    from hermes.telegram_delivery import TelegramAdapter, TelegramConfig
+
+    eng = make_engine()
+    app = create_app(
+        engine=eng, config=ApiConfig(webhook_secret=SECRET), razorpay=FakeRazorpayAdapter(),
+        delivery=TelegramAdapter(TelegramConfig.from_env({
+            "TELEGRAM_ENABLED": "1", "TELEGRAM_BOT_TOKEN": "1:x", "TELEGRAM_CHAT_ID": "1",
+        })),
+    )
+    body = TestClient(app).get("/health").json()
+    assert body["message_delivery_channel"] == "telegram"
+
+
 # --- product scope lock: insufficient-funds only -----------------------
 
 
