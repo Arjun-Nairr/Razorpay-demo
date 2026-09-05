@@ -2685,3 +2685,44 @@ Verified: focused tests/test_hermes_agent.py -> 76 passed (+5). Full
 offline (--ignore=tests/test_hermes_agent.py) -> 460 passed, 3 skipped
 (+18). compileall + git diff --check clean; diff and secret scan reviewed;
 .env untouched.
+
+## Iteration 27 — demo-visibility Neon view (presentation only, no engine change)
+
+New read-only view `hermes_demo.demo_case_story` (`scripts/init_neon.py`):
+one row per MEANINGFUL business step for one case, chronologically -
+`PAYMENT_FAILURE_RECEIVED` / `HERMES_DECISION` / `POLICY_AUTHORIZATION` /
+`RECOVERY_LINK_AUTHORIZED` / `PROVIDER_RETRY_SCHEDULED` /
+`PROVIDER_RETRY_FAILED` / `RECOVERY_LINK_CREATED` / `MESSAGE_DRAFTED` /
+`TELEGRAM_SENT`. Columns: `case_id, step_number, stage, actor,
+input_or_evidence, reasoning_or_rule, output_or_action, status,
+duration_ms`; `step_number` is `ROW_NUMBER()` over the filtered, per-case,
+seq-ordered set - never hardcoded, so it generalises to any case.
+Provenance bookkeeping, `PENDING_WORK_CANCELLED`, and intermediate Telegram
+`in_progress` claims are excluded; only the final delivery outcome per
+intent surfaces. The five existing views are unchanged; no new table; no
+engine/Hermes/Telegram/fixture change; no live Gemini/Razorpay/Telegram
+call; no new case. `sql/neon_demo_inspect.sql` gained the recommended
+recording query. Applied live via `init_neon.py` and read back read-only:
+**case-29** returns exactly the 10-step story above in order, both Hermes
+decisions present with tools/rationale/confidence, no 12-month expansion,
+both recommendations `NONE`, Telegram `SENT` (message id present, no
+URL/token/chat id), no recovered-money claim (view has no such column).
+Older cases (`case-1/6/11/18/25`) remain readable through the same view.
+
+Verified: focused tests/test_neon_views.py -> 51 passed (+12). compileall +
+git diff --check clean; secret scan clean; no Python source outside
+scripts/init_neon.py and tests/ touched.
+
+### Verified evidence detail (Iterations 26-27)
+
+- Iteration 26: focused tests/test_hermes_agent.py -> 76 passed (+5). Full
+  offline (--ignore=tests/test_hermes_agent.py) -> 460 passed, 3 skipped
+  (+18: claim-before-send, eligibility, Neon columns, delivery-step API).
+  compileall + git diff --check clean; diff and secret scan reviewed; .env
+  untouched. Live: one golden case (case-29) - real Gemini x2, one real
+  Razorpay Test Mode link, one verified Telegram send - Neon read back
+  read-only, confirmed.
+- Iteration 27: focused tests/test_neon_views.py -> 51 passed (+12).
+  compileall + git diff --check clean; secret scan clean; no Python source
+  outside scripts/init_neon.py and tests/ touched. Live: init_neon.py
+  applied the new view; case-29 read back read-only; no case data written.

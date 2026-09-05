@@ -69,6 +69,7 @@ _PARENT_FAIL_CHILD = "child_reported_failure"
 _PARENT_FAIL_PROPOSAL_SHAPE = "proposal_shape"
 _PARENT_FAIL_INSTRUCTION_LOAD = "instruction_load_failed"
 _PARENT_FAIL_PAYMENT_PLAN_INELIGIBLE = "payment_plan_ineligible"
+_PARENT_FAIL_MESSAGE_NOT_PERMITTED = "message_intent_not_permitted"
 
 # Only the actions deterministic policy can authorize + execute today. This is
 # what the child advertises as the "allowed actions" catalog. STOP and a
@@ -287,6 +288,24 @@ def _payment_plan_eligibility(evidence_bundle: dict, history_tool_called: bool) 
     }
 
 
+def _reliable_customer_from_evidence(evidence_bundle: dict) -> bool:
+    """Deterministic gate for offering/accepting the approved customer
+    template - derived ONLY from the prior completed obligations actually
+    disclosed in the INITIAL three-month window (never the 12-month
+    expansion, and never a fixture/archetype label such as ``is_demo_case``).
+
+    Reliable means: at least one prior completed obligation is disclosed, and
+    every one of them is ``paid_on_time`` - no prior late or failed
+    obligation. The current, still-open failure is always the last disclosed
+    row (by construction) and is never itself a "prior" obligation.
+    """
+    records = evidence_bundle["initial_context"]["payment_history_3m"].get("records", [])
+    prior = records[:-1] if records else []
+    if not prior:
+        return False  # no disclosed prior completed obligation - not provably reliable
+    return all(r.get("outcome") == "paid_on_time" for r in prior)
+
+
 _ACTION_MAP = {a.value: a for a in ProposalAction}
 
 
@@ -458,13 +477,18 @@ class HermesAgentStrategist:
             snap, history_available=self._history_available,
             history_months_available=self._history_months_available,
         )
+        # The approved template is offered ONLY when the disclosed initial
+        # 3-month evidence itself proves a reliable customer - never decided
+        # from is_demo_case or any other fixture label. An unreliable/
+        # ambiguous history gets an empty catalog: nothing to attach.
+        customer_reliable = _reliable_customer_from_evidence(evidence_bundle)
         job = {
             "mode": "mock" if self._mock_base_url else "gemini",
             "deadline_s": self._deadline_s,
             "max_iterations": MAX_MODEL_ITERATIONS,
             "soul_text": soul_text,
             "skill_text": skill_text,
-            "approved_messages": list(APPROVED_MESSAGE_INTENT_LIST),
+            "approved_messages": list(APPROVED_MESSAGE_INTENT_LIST) if customer_reliable else [],
             "evidence_bundle": evidence_bundle,
         }
         if self._mock_base_url:
@@ -551,6 +575,22 @@ class HermesAgentStrategist:
             raise InvalidProposal(
                 "Hermes recommended PAYMENT_PLAN_REVIEW without the required "
                 "disclosed evidence of repeated prior difficulty"
+            )
+
+        # The child was never offered an approved template when the customer
+        # was not proven reliable (empty ``approved_messages`` above) - a
+        # non-null message_intent here anyway is rejected fail-closed, never
+        # silently dropped or waved through as if it were approved.
+        if (
+            not customer_reliable
+            and isinstance(proposal_obj, dict)
+            and proposal_obj.get("message_intent") is not None
+        ):
+            audit["failure_category"] = _PARENT_FAIL_MESSAGE_NOT_PERMITTED
+            meta.validation_result = "invalid:message_intent_not_permitted"
+            raise InvalidProposal(
+                "Hermes returned a message_intent without the required disclosed "
+                "evidence of a reliable customer"
             )
 
         return _to_proposal(proposal_obj, audit)

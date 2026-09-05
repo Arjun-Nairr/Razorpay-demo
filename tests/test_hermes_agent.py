@@ -596,6 +596,112 @@ def test_hostile_payment_plan_recommendation_on_reliable_case_is_rejected(monkey
     assert ex["payment_plan_prior_difficulty_count"] == 0
 
 
+# === reliable-customer gate for the approved customer template (offline) ===
+
+
+def test_reliable_customer_true_when_all_prior_completed_on_time():
+    bundle = {"initial_context": {"payment_history_3m": {"records": [
+        {"due": "2026-07-01", "paid": "2026-07-01", "outcome": "paid_on_time"},
+        {"due": "2026-08-01", "paid": "2026-08-01", "outcome": "paid_on_time"},
+        {"due": "2026-09-01", "paid": None, "outcome": "failed_insufficient_funds"},  # current
+    ]}}}
+    assert mod._reliable_customer_from_evidence(bundle) is True
+
+
+def test_reliable_customer_false_when_no_prior_completed_obligation_disclosed():
+    """No disclosed history at all (unknown case, or history unavailable) is
+    ambiguous, never assumed reliable."""
+    bundle = {"initial_context": {"payment_history_3m": {"available": False}}}
+    assert mod._reliable_customer_from_evidence(bundle) is False
+    only_current = {"initial_context": {"payment_history_3m": {"records": [
+        {"due": "2026-09-01", "paid": None, "outcome": "failed_insufficient_funds"},
+    ]}}}
+    assert mod._reliable_customer_from_evidence(only_current) is False
+
+
+def test_reliable_customer_false_when_any_prior_late_or_failed():
+    bundle = {"initial_context": {"payment_history_3m": {"records": [
+        {"due": "2026-07-01", "paid": "2026-07-01", "outcome": "paid_on_time"},
+        {"due": "2026-08-01", "paid": "2026-08-05", "outcome": "paid_4_days_late"},
+        {"due": "2026-09-01", "paid": None, "outcome": "failed_insufficient_funds"},  # current
+    ]}}}
+    assert mod._reliable_customer_from_evidence(bundle) is False
+
+
+def test_reliable_customer_ignores_the_12_month_window():
+    """The gate is defined ONLY over the initial 3-month window - a clean
+    12-month history behind an ambiguous 3-month window must not flip it."""
+    bundle = {
+        "initial_context": {"payment_history_3m": {"available": False}},
+        "history_12m": {"rows": [
+            {"due": "2026-06-01", "paid": "2026-06-01", "outcome": "paid_on_time"},
+            {"due": "2026-09-01", "paid": None, "outcome": "failed_insufficient_funds"},
+        ]},
+    }
+    assert mod._reliable_customer_from_evidence(bundle) is False
+
+
+def _capturing_strategist(monkeypatch, tmp_path, proposal_overrides: dict) -> tuple:
+    """A parent-only HermesAgentStrategist whose fake subprocess captures the
+    job it was sent and returns a fixed proposal payload."""
+    captured = {}
+    base = {
+        "action": "WAIT_FOR_PROVIDER_RETRY", "diagnosis": "d", "rationale": "r",
+        "confidence": 0.6, "proposed_wait_hours": 24,
+        "recommended_intervention": "NONE", "human_review_recommended": False,
+        "human_review_reason": None, "message_intent": None,
+    }
+    base.update(proposal_overrides)
+
+    def _fake_run(*args, **kwargs):
+        captured["job"] = json.loads(kwargs["input"])
+        return _fake_proc(_SENTINEL + json.dumps({
+            "ok": True, "proposal": base,
+            "audit": {"validation_result": "valid", "evidence_returned": []},
+        }), rc=0)
+
+    monkeypatch.setattr(mod.subprocess, "run", _fake_run)
+    strat = HermesAgentStrategist(
+        mock_base_url="http://127.0.0.1:1/v1", home=tmp_path / "h",
+        checkout=_fake_checkout(tmp_path), python=__import__("sys").executable,
+        verify_revision=False,
+    )
+    return strat, captured
+
+
+def test_approved_template_offered_and_accepted_for_reliable_history(monkeypatch, tmp_path):
+    """The reliable-customer default fixture's 3-month window (two on-time
+    payments + the current failure) both offers the single approved template
+    to the child AND accepts it back on the returned proposal."""
+    strat, captured = _capturing_strategist(
+        monkeypatch, tmp_path, {"message_intent": _APPROVED_MSG}
+    )
+    p = strat.propose(_snap())
+    assert captured["job"]["approved_messages"] == [_APPROVED_MSG]
+    assert p.message_intent == _APPROVED_MSG
+
+
+def test_no_template_offered_for_unknown_or_ambiguous_history(monkeypatch, tmp_path):
+    """An unknown case (no disclosed history) gets an empty approved-messages
+    catalog - nothing to attach."""
+    strat, captured = _capturing_strategist(monkeypatch, tmp_path, {})
+    strat.propose(_snap(is_demo_case=False))
+    assert captured["job"]["approved_messages"] == []
+
+
+def test_message_intent_from_child_rejected_fail_closed_when_not_reliable(monkeypatch, tmp_path):
+    """Even if the child returns the exact approved text anyway, it is
+    rejected fail-closed when the disclosed evidence never proved a reliable
+    customer - the parent's own gate is the final authority, not the child."""
+    strat, captured = _capturing_strategist(
+        monkeypatch, tmp_path, {"message_intent": _APPROVED_MSG}
+    )
+    with pytest.raises(InvalidProposal):
+        strat.propose(_snap(is_demo_case=False))
+    assert captured["job"]["approved_messages"] == []
+    assert strat.last_run_meta.extra["failure_category"] == "message_intent_not_permitted"
+
+
 def test_wrong_revision_refuses_to_launch(tmp_path):
     with pytest.raises(HermesRuntimeUnavailable):
         HermesAgentStrategist(home=tmp_path / "h", verify_revision=True, checkout=tmp_path)

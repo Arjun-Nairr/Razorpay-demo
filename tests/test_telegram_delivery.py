@@ -304,10 +304,17 @@ def test_successful_delivery_marks_sent_and_increments_contact_counter():
     intent_before = led.case_projection(case_id=case_id).action_intents[0]
     assert intent_before.message_status == "DRAFTED" and intent_before.url
 
+    # the staged draft itself never carries the URL - Hermes never generates
+    # it; only the engine appends it, and only at the delivery boundary.
+    assert intent_before.message_draft is not None
+    assert "https://rzp.io/l/15" not in intent_before.message_draft
+    assert intent_before.message_draft.startswith(intent_before.message_intent)
+
     delivery = _StubDelivery(DeliveryReceipt(outcome="sent", message_id="777"))
     result = deliver_drafted_message(led, case_id, delivery, now=3)
     assert result.ok is True and delivery.calls == 1
     assert "https://rzp.io/l/15" in delivery._last_text  # url added ONLY at the boundary
+    assert delivery._last_text == f"{intent_before.message_draft}\n\n{intent_before.url}"
 
     proj = led.case_projection(case_id=case_id)
     intent = proj.action_intents[0]

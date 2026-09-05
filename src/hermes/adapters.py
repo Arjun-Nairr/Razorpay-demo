@@ -10,6 +10,7 @@ No method here performs an external network call.
 
 from __future__ import annotations
 
+from .message_templates import APPROVED_MESSAGE_INTENT_LIST
 from .types import (
     AUDIT_ACTION_INTENT,
     AUDIT_ACTION_OUTCOME,
@@ -167,8 +168,7 @@ class ScriptedStrategist:
             "uniquely correlated recovery link as an alternate collection path "
             "and let policy decide whether a reminder may accompany it.",
             confidence=0.74,
-            message_intent="Your last payment attempt did not go through. "
-            "Please use the secure link we sent to complete it.",
+            message_intent=APPROVED_MESSAGE_INTENT_LIST[0],
         ),
     }
 

@@ -115,9 +115,11 @@ true at once. So:
 
 Real model output may only reuse a **deterministic approved template** for
 `message_intent` (see `src/hermes/message_templates.py`). The engine rejects
-any other `message_intent` as invalid strategist output. No customer message is
-actually sent in this build; the recovery intervention is simulated and
-labelled `SIMULATED`.
+any other `message_intent` as invalid strategist output. A verified real
+delivery (Telegram) now exists behind an explicit claim-before-send gate
+(Iteration 26); the recovery link itself remains simulated unless the
+`hybrid_test_mode` provider is selected, and every event stays labelled
+`SIMULATED` or `REAL_TEST_MODE` accordingly.
 
 ## Policy evaluation order
 

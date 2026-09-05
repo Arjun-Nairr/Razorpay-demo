@@ -322,11 +322,11 @@ WITH steps AS (
     (p->>'seq')::int                                          AS seq,
     'HERMES_DECISION'                                          AS stage,
     'Hermes'                                                   AS actor,
+    -- what Hermes actually received: the persisted evidence_returned records
+    -- verbatim (tool, source, actual coverage per tool - never fabricated or
+    -- re-derived here) plus whether a 12-month history lookup was requested.
     jsonb_build_object(
-      'tools_used', COALESCE((
-        SELECT jsonb_agg(er->>'tool')
-        FROM jsonb_array_elements(COALESCE(mr.detail->'hermes'->'evidence_returned', '[]'::jsonb)) er
-      ), '[]'::jsonb),
+      'evidence_returned', COALESCE(mr.detail->'hermes'->'evidence_returned', '[]'::jsonb),
       'history_12mo_requested', EXISTS (
         SELECT 1 FROM jsonb_array_elements(COALESCE(mr.detail->'hermes'->'evidence_requests', '[]'::jsonb)) req
         WHERE req->>'tool' = 'get_payment_history'
@@ -397,12 +397,18 @@ WITH steps AS (
 
   UNION ALL
 
-  -- PROVIDER_RETRY_FAILED: a provider-owned fact, never attributed to Hermes.
+  -- PROVIDER_RETRY_FAILED: a provider-owned fact, never attributed to Hermes -
+  -- and never labelled "Razorpay" unless evidence_mode actually says so
+  -- (today's retry integration is simulated-only; see RAZORPAY_TEST_SLICE.md).
   SELECT
     e->>'case_id'                                              AS case_id,
     (e->>'seq')::int                                           AS seq,
     'PROVIDER_RETRY_FAILED'                                    AS stage,
-    'Razorpay'                                                 AS actor,
+    CASE e->'detail'->>'evidence_mode'
+      WHEN 'REAL_TEST_MODE' THEN 'Razorpay Test Mode'
+      WHEN 'SIMULATED' THEN 'Payment provider (simulated)'
+      ELSE 'Payment provider (unverified)'
+    END                                                        AS actor,
     jsonb_build_object(
       'reason_code', e->'detail'->>'reason_code',
       'evidence_mode', e->'detail'->>'evidence_mode')::text    AS input_or_evidence,
@@ -451,15 +457,21 @@ WITH steps AS (
 
   UNION ALL
 
-  -- TELEGRAM_SENT: only the FINAL delivery result per intent (never an
-  -- intermediate 'in_progress' claim) - status carries the true outcome.
+  -- TELEGRAM_SENT / TELEGRAM_DELIVERY_FAILED / TELEGRAM_DELIVERY_UNCERTAIN:
+  -- only the FINAL delivery result per intent (never an intermediate
+  -- 'in_progress' claim) - the stage name itself carries the true outcome,
+  -- never a fixed "SENT" label regardless of what actually happened.
   -- Parenthesised: an un-parenthesised trailing ORDER BY on a UNION ALL
   -- branch binds to the WHOLE union, not this SELECT, and "e" is out of
   -- scope there - this is what makes DISTINCT ON's own ORDER BY legal here.
   (SELECT DISTINCT ON (e->'detail'->>'intent_id')
     e->>'case_id'                                              AS case_id,
     (e->>'seq')::int                                           AS seq,
-    'TELEGRAM_SENT'                                             AS stage,
+    CASE e->'detail'->>'outcome'
+      WHEN 'sent' THEN 'TELEGRAM_SENT'
+      WHEN 'failed' THEN 'TELEGRAM_DELIVERY_FAILED'
+      ELSE 'TELEGRAM_DELIVERY_UNCERTAIN'
+    END                                                          AS stage,
     'Telegram'                                                  AS actor,
     jsonb_build_object('channel', e->'detail'->>'channel')::text
                                                                 AS input_or_evidence,

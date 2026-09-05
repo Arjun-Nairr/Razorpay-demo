@@ -367,6 +367,32 @@ def test_demo_case_story_chronological_ordering_uses_audit_seq():
     assert "ORDER BY seq" in sql or "ORDER BY case_id ORDER BY seq" in sql
 
 
+def test_demo_case_story_simulated_retry_is_not_attributed_to_razorpay():
+    """PROVIDER_RETRY_FAILED's actor must come from evidence_mode, never a
+    bare literal 'Razorpay' - a simulated retry is never provider-attributed."""
+    sql = VIEWS["demo_case_story"]
+    assert "'Payment provider (simulated)'" in sql
+    assert "'Razorpay Test Mode'" in sql
+    assert "'Payment provider (unverified)'" in sql
+    assert not re.search(r"'PROVIDER_RETRY_FAILED'\s+AS\s+stage,\s*\n\s*'Razorpay'", sql)
+
+
+def test_demo_case_story_hermes_decision_evidence_includes_source_and_coverage():
+    """input_or_evidence must pass through the persisted evidence_returned
+    records (tool/source/coverage) verbatim, not just a bare tool-name list."""
+    sql = VIEWS["demo_case_story"]
+    assert "'evidence_returned', COALESCE(mr.detail->'hermes'->'evidence_returned'" in sql
+    assert "'history_12mo_requested'" in sql
+
+
+def test_demo_case_story_telegram_stage_matches_true_outcome():
+    """A failed/uncertain delivery must never surface as TELEGRAM_SENT."""
+    sql = VIEWS["demo_case_story"]
+    assert "'TELEGRAM_SENT'" in sql
+    assert "'TELEGRAM_DELIVERY_FAILED'" in sql
+    assert "'TELEGRAM_DELIVERY_UNCERTAIN'" in sql
+
+
 def test_demo_case_story_old_cases_remain_readable():
     """No WHERE clause filters to a specific case_id inside the view itself -
     any case_id (old or new) is readable by filtering the SELECT from it."""

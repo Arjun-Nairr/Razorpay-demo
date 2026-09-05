@@ -1,9 +1,8 @@
 # Cross-Agent Handoff — current-state index
 
-Last updated: 2026-09-05 (Asia/Dubai), Iteration 27. Branch
-`feat/isolated-hermes-agent`, latest commit at bottom. This file stays
-**at or below 230 lines**: it is an index, not a log. Detail lives in the linked
-docs; iteration-by-iteration history is in
+Last updated: 2026-09-05 (Asia/Dubai), Iteration 28. Branch
+`feat/isolated-hermes-agent`, latest commit at bottom. **At or below 230
+lines** - an index, not a log. Iteration-by-iteration history is in
 [`docs/archive/HANDOFF_full_2026-09-04.md`](docs/archive/HANDOFF_full_2026-09-04.md).
 
 ## What this is
@@ -24,8 +23,7 @@ Read `HANDOFF.md` first, then only the files the current task names. Contracts:
 [`RAZORPAY_TEST_SLICE.md`](RAZORPAY_TEST_SLICE.md) (this slice's verified
 provider facts + contract),
 [`HERMES_RAZORPAY_RESEARCH.md`](HERMES_RAZORPAY_RESEARCH.md) +
-[`HERMES_ISOLATED_AGENT_RESEARCH.md`](HERMES_ISOLATED_AGENT_RESEARCH.md)
-(external-runtime constraints),
+[`HERMES_ISOLATED_AGENT_RESEARCH.md`](HERMES_ISOLATED_AGENT_RESEARCH.md) (external-runtime constraints),
 [`FOUNDATION_ARCHITECTURE.md`](FOUNDATION_ARCHITECTURE.md) (module contract),
 [`SCENARIO_MATRIX.md`](SCENARIO_MATRIX.md) (scenarios; three deferred
 exemplars now supersede the earlier five-case plan - see backlog §5).
@@ -126,26 +124,44 @@ back read-only, confirmed.
 
 ## Iteration 27 — demo-visibility Neon view (presentation only, no engine change)
 
-New read-only view `hermes_demo.demo_case_story` (`scripts/init_neon.py`):
-one row per MEANINGFUL business step for one case, chronologically -
-`PAYMENT_FAILURE_RECEIVED` / `HERMES_DECISION` / `POLICY_AUTHORIZATION` /
-`RECOVERY_LINK_AUTHORIZED` / `PROVIDER_RETRY_SCHEDULED` /
-`PROVIDER_RETRY_FAILED` / `RECOVERY_LINK_CREATED` / `MESSAGE_DRAFTED` /
-`TELEGRAM_SENT`. Columns: `case_id, step_number, stage, actor,
-input_or_evidence, reasoning_or_rule, output_or_action, status,
-duration_ms`; `step_number` is `ROW_NUMBER()` over the filtered, per-case,
-seq-ordered set - never hardcoded, so it generalises to any case.
-Provenance bookkeeping, `PENDING_WORK_CANCELLED`, and intermediate Telegram
-`in_progress` claims are excluded; only the final delivery outcome per
-intent surfaces. The five existing views are unchanged; no new table; no
-engine/Hermes/Telegram/fixture change; no live Gemini/Razorpay/Telegram
-call; no new case. `sql/neon_demo_inspect.sql` gained the recommended
-recording query. Applied live via `init_neon.py` and read back read-only:
-**case-29** returns exactly the 10-step story above in order, both Hermes
-decisions present with tools/rationale/confidence, no 12-month expansion,
-both recommendations `NONE`, Telegram `SENT` (message id present, no
-URL/token/chat id), no recovered-money claim (view has no such column).
-Older cases (`case-1/6/11/18/25`) remain readable through the same view.
+Condensed; full detail archived, see
+[`docs/archive/HANDOFF_full_2026-09-04.md`](docs/archive/HANDOFF_full_2026-09-04.md).
+New read-only view `hermes_demo.demo_case_story`: one row per MEANINGFUL
+business step for one case, chronologically, `step_number` computed via
+`ROW_NUMBER()` over the filtered/per-case/seq-ordered set (never
+hardcoded). Implementation noise excluded; five existing views unchanged;
+no engine/Hermes/Telegram/fixture change; no new case. Corrected in
+Iteration 28 below - see there for the current truthful shape.
+
+## Iteration 28 — demo_case_story truthfulness correction + reliable-customer-only template
+
+`demo_case_story` (`scripts/init_neon.py`, presentation only): (1)
+`PROVIDER_RETRY_FAILED`'s actor now derives from `evidence_mode`
+(`Payment provider (simulated)` / `Razorpay Test Mode` / `Payment provider
+(unverified)`) - never a bare `Razorpay` for a simulated retry; (2)
+`HERMES_DECISION.input_or_evidence` passes through the persisted
+`evidence_returned` records verbatim (tool/source/actual coverage per
+tool); (3) the Telegram stage name matches the true outcome
+(`TELEGRAM_SENT` / `TELEGRAM_DELIVERY_FAILED` /
+`TELEGRAM_DELIVERY_UNCERTAIN`), never a fixed `SENT` label.
+
+Locked the approved customer template to one fixed reliable-customer
+reminder (`message_templates.py`; `ScriptedStrategist` matched). For the
+isolated real Hermes runtime only (`hermes_agent_strategist.py`), a new
+`_reliable_customer_from_evidence` gate - derived ONLY from the initial
+3-month window's disclosed prior obligations, never a fixture label -
+decides whether the template is offered to the child (`approved_messages:
+[]` when not reliable); any non-null `message_intent` returned anyway is
+rejected fail-closed (`message_intent_not_permitted`). The recovery URL
+still appends only at the delivery boundary, never by Hermes (regression
+added). Corrected the stale "no customer message is actually sent" claim in
+`POLICY_SPEC.md` (superseded by Iteration 26's verified Telegram send).
+
+Verified below. Live: `init_neon.py` applied the corrected view;
+**case-29** read back read-only, unchanged - retry actor now `Payment
+provider (simulated)`, both Hermes decisions show `evidence_returned`, its
+successful delivery remains `TELEGRAM_SENT`. No case data written; no
+Gemini/Razorpay/Telegram call.
 
 ## Verified evidence
 
@@ -154,18 +170,14 @@ Pre-Iteration-21 evidence is archived - see
 Iterations 21/23/24/25 focused/full counts: 41/373, 60/404, 67/410,
 71/442 (all passed, 3 skipped where applicable; 22 made no source change).
 
-- **Iteration 26**: focused `tests/test_hermes_agent.py` -> **76 passed**
-  (+5). Full offline (`--ignore=tests/test_hermes_agent.py`) -> **460
-  passed, 3 skipped** (+18: claim-before-send, eligibility, Neon columns,
-  delivery-step API). `compileall` + `git diff --check` clean; diff and
-  secret scan reviewed; `.env` untouched. Live: one golden case (`case-29`)
-  - real Gemini x2, one real Razorpay Test Mode link, one verified Telegram
-  send - Neon read back read-only, confirmed above.
-- **Iteration 27**: focused `tests/test_neon_views.py` -> **51 passed**
-  (+12). `compileall` + `git diff --check` clean; secret scan clean; no
-  Python source outside `scripts/init_neon.py` and `tests/` touched. Live:
-  `init_neon.py` applied the new view; `case-29` read back read-only as
-  above; no case data written.
+- **Iterations 26-27**: passed counts and live evidence archived, see
+  [`docs/archive/HANDOFF_full_2026-09-04.md`](docs/archive/HANDOFF_full_2026-09-04.md).
+- **Iteration 28**: focused `tests/test_neon_views.py` -> **54 passed**
+  (+3); focused `tests/test_hermes_agent.py` -> **83 passed** (+7). Full
+  offline (`--ignore=tests/test_hermes_agent.py`) -> **477 passed, 3
+  skipped**. `compileall` + `git diff --check` clean; secret scan clean.
+  Live: corrected view applied; `case-29` read back read-only, confirmed
+  above; no case data written, no Gemini/Razorpay/Telegram call.
 
 ## Inspecting the persisted proof
 
@@ -197,13 +209,13 @@ relay/tunnel is currently running.
 ## Next action
 
 The golden reliable-customer case is done and verified (`case-29`); the
-demo-facing `demo_case_story` view is done and verified. Next: author and
-run the chronically-late exemplar (a new synthetic fixture with >= 2 prior
-late/failed obligations, so `PAYMENT_PLAN_REVIEW` can genuinely trigger),
-then the mixed-history exemplar (12-month expansion path). The dashboard
-remains the final presentation layer, built last. No further live action
-planned against `case-18`/`case-25`/`case-29`. Keep future updates at or
-below 230 lines.
+demo-facing `demo_case_story` view is done, corrected, and verified. Next:
+author and run the chronically-late exemplar (a new synthetic fixture with
+>= 2 prior late/failed obligations, so `PAYMENT_PLAN_REVIEW` can genuinely
+trigger), then the mixed-history exemplar (12-month expansion path). The
+dashboard remains the final presentation layer, built last. No further
+live action planned against `case-18`/`case-25`/`case-29`. Keep future
+updates at or below 230 lines.
 
 ## Working-document links
 
