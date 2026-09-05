@@ -47,7 +47,7 @@ def sign(raw: bytes, secret: str = SECRET) -> str:
 
 
 def failure_envelope(*, event="payment.failed", sub="sub_SIM_0001", pay="pay_SIM_1",
-                     amount=1_000_000, currency="INR", reason="bank_temporary_error"):
+                     amount=1_000_000, currency="INR", reason="insufficient_funds"):
     return {
         "event": event,
         "payload": {
@@ -281,6 +281,55 @@ def test_unsupported_shape_missing_subscription_rejected():
             "payload": {"payment": {"entity": {"id": "pay_1", "amount": 100}}}}
     r = post_webhook(tc, body, event_id="evt_noshape")
     assert r.status_code == 422
+    assert eng.inspect(BatchQuery()).cases == 0
+
+
+# --- product scope lock: insufficient-funds only -----------------------
+
+
+def test_unsupported_failure_reason_is_acknowledged_and_creates_no_case():
+    """The demonstrated product is insufficient-funds-only. A well-formed
+    failure for any OTHER reason is safely acknowledged (2xx, so the
+    provider never retry-storms) but never reaches engine.receive - no
+    case, retry, link, recommendation, or message of any kind."""
+    tc, eng = make_client()
+    r = post_webhook(tc, failure_envelope(reason="bank_temporary_error"),
+                     event_id="evt_other_reason")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["outcome"] == "ignored_unsupported_failure_reason"
+    assert body["case_id"] is None and body["accepted"] is True
+    assert eng.inspect(BatchQuery()).cases == 0
+    assert eng.inspect(AuditQuery()).records == ()
+
+
+def test_missing_failure_reason_is_acknowledged_and_creates_no_case():
+    tc, eng = make_client()
+    body = {
+        "event": "payment.failed",
+        "payload": {
+            "payment": {"entity": {"id": "pay_1", "amount": 100, "currency": "INR"}},
+            "subscription": {"entity": {"id": "sub_1"}},
+        },
+    }
+    r = post_webhook(tc, body, event_id="evt_no_reason")
+    assert r.status_code == 200
+    assert r.json()["outcome"] == "ignored_unsupported_failure_reason"
+    assert eng.inspect(BatchQuery()).cases == 0
+
+
+def test_unsupported_reason_redelivery_stays_idempotent_with_no_effect():
+    """A provider redelivering the SAME ignored event is still safely
+    acknowledged, still creates nothing, and signature/event-id handling is
+    unaffected - no duplicate-effect risk because no effect ever occurs."""
+    tc, eng = make_client()
+    first = post_webhook(tc, failure_envelope(reason="bank_temporary_error"),
+                         event_id="evt_redelivered")
+    second = post_webhook(tc, failure_envelope(reason="bank_temporary_error"),
+                          event_id="evt_redelivered")
+    assert first.status_code == second.status_code == 200
+    assert first.json()["outcome"] == second.json()["outcome"] \
+        == "ignored_unsupported_failure_reason"
     assert eng.inspect(BatchQuery()).cases == 0
 
 

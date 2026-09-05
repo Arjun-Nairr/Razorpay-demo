@@ -189,13 +189,12 @@ def test_blank_message_intent_is_normalised_to_none():
 # --- typed advisory contract (recommended_intervention / human_review_*) ---
 
 
-@pytest.mark.parametrize("value", [
-    "NONE", "UPDATE_PAYMENT_METHOD", "MANDATE_REAUTH_REVIEW",
-    "PAYMENT_PLAN_REVIEW", "BILLING_SUPPORT_REVIEW", "HUMAN_FOLLOW_UP",
-])
+@pytest.mark.parametrize("value", ["NONE", "PAYMENT_PLAN_REVIEW"])
 def test_every_valid_advisory_enum_is_accepted(value):
+    """Narrowed to this demo's product scope: NONE and PAYMENT_PLAN_REVIEW
+    only."""
     over = {"recommended_intervention": value}
-    if value in ("NONE", "UPDATE_PAYMENT_METHOD"):
+    if value == "NONE":
         over.update(human_review_recommended=False, human_review_reason=None)
     else:
         over.update(human_review_recommended=True, human_review_reason="evidence-based reason")
@@ -203,9 +202,15 @@ def test_every_valid_advisory_enum_is_accepted(value):
     assert proposal.recommended_intervention.value == value
 
 
-def test_unknown_advisory_value_is_rejected():
+@pytest.mark.parametrize("value", [
+    "OFFER_DISCOUNT", "UPDATE_PAYMENT_METHOD", "MANDATE_REAUTH_REVIEW",
+    "BILLING_SUPPORT_REVIEW", "HUMAN_FOLLOW_UP",
+])
+def test_unknown_advisory_value_is_rejected(value):
+    """Includes every intervention this demo's earlier, broader draft once
+    offered - narrowing the live contract must reject them too."""
     with pytest.raises(InvalidProposal):
-        parse_proposal(json.dumps(_valid_obj(recommended_intervention="OFFER_DISCOUNT")))
+        parse_proposal(json.dumps(_valid_obj(recommended_intervention=value)))
 
 
 @pytest.mark.parametrize("bad_bool", [1, 0, "true", "false", None])
@@ -217,11 +222,10 @@ def test_human_review_recommended_rejects_non_boolean_truthiness(bad_bool):
 @pytest.mark.parametrize("intervention,hrr,reason", [
     ("NONE", True, None),                                    # must be false
     ("NONE", False, "some reason"),                          # reason must be null
-    ("UPDATE_PAYMENT_METHOD", True, "some reason"),
-    ("MANDATE_REAUTH_REVIEW", False, "some reason"),          # must be true
-    ("MANDATE_REAUTH_REVIEW", True, None),                    # reason required
+    ("PAYMENT_PLAN_REVIEW", False, "some reason"),            # must be true
+    ("PAYMENT_PLAN_REVIEW", True, None),                      # reason required
     ("PAYMENT_PLAN_REVIEW", True, "   "),                     # blank reason
-    ("BILLING_SUPPORT_REVIEW", True, "x" * 301),              # oversized reason
+    ("PAYMENT_PLAN_REVIEW", True, "x" * 301),                 # oversized reason
 ])
 def test_every_invalid_advisory_combination_is_rejected(intervention, hrr, reason):
     with pytest.raises(InvalidProposal):
@@ -245,7 +249,7 @@ def test_parse_proposal_rejects_unsafe_human_review_reason_content(reason):
     strategist already reported success."""
     with pytest.raises(InvalidProposal):
         parse_proposal(json.dumps(_valid_obj(
-            recommended_intervention="HUMAN_FOLLOW_UP", human_review_recommended=True,
+            recommended_intervention="PAYMENT_PLAN_REVIEW", human_review_recommended=True,
             human_review_reason=reason,
         )))
 
@@ -254,9 +258,9 @@ def test_unsafe_reason_enters_the_repair_path_and_is_fixed():
     """An unsafe first reply is exactly the shape the one-repair boundary
     exists for: propose() feeds the rejection back and accepts a corrected
     second reply - the unsafe reason never reaches the engine."""
-    bad = _obj(recommended_intervention="HUMAN_FOLLOW_UP", human_review_recommended=True,
+    bad = _obj(recommended_intervention="PAYMENT_PLAN_REVIEW", human_review_recommended=True,
                human_review_reason="see reference plink_abc123")
-    good = _obj(recommended_intervention="HUMAN_FOLLOW_UP", human_review_recommended=True,
+    good = _obj(recommended_intervention="PAYMENT_PLAN_REVIEW", human_review_recommended=True,
                 human_review_reason="a safe evidence-based reason")
     s, stub = strategist(bad, good)
     proposal = s.propose(snapshot())
@@ -268,7 +272,7 @@ def test_unsafe_reason_enters_the_repair_path_and_is_fixed():
 def test_unsafe_reason_unfixed_after_repair_never_escapes_to_the_engine():
     """When the repair reply is ALSO unsafe, propose() raises - the strategist
     never returns an unsafe proposal for the engine to see."""
-    bad = _obj(recommended_intervention="HUMAN_FOLLOW_UP", human_review_recommended=True,
+    bad = _obj(recommended_intervention="PAYMENT_PLAN_REVIEW", human_review_recommended=True,
                human_review_reason="call http://example.com/pay")
     s, stub = strategist(bad, bad)
     with pytest.raises(InvalidProposal):
@@ -284,7 +288,7 @@ def test_engine_still_rejects_unsafe_reason_as_defense_in_depth():
     from hermes.engine import _validate_proposal
 
     proposal = parse_proposal(json.dumps(_valid_obj(
-        recommended_intervention="HUMAN_FOLLOW_UP", human_review_recommended=True,
+        recommended_intervention="PAYMENT_PLAN_REVIEW", human_review_recommended=True,
         human_review_reason="a safe placeholder reason",
     )))
     unsafe = dataclasses.replace(proposal, human_review_reason="see reference plink_abc123")
@@ -307,7 +311,7 @@ def test_advisory_never_changes_the_engine_authorization_path():
                                                   proposed_wait_hours=1)))
     p_review = parse_proposal(json.dumps(_valid_obj(
         action="WAIT_FOR_PROVIDER_RETRY", proposed_wait_hours=1,
-        recommended_intervention="HUMAN_FOLLOW_UP", human_review_recommended=True,
+        recommended_intervention="PAYMENT_PLAN_REVIEW", human_review_recommended=True,
         human_review_reason="evidence-based reason",
     )))
     d_none = authorize(p_none, snap, 10, fact)

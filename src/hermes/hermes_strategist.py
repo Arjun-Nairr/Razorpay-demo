@@ -150,16 +150,18 @@ Return ONLY a single JSON object, no prose, with exactly these keys:
                          integer >= 1 and MUST NOT exceed "wait_hours_remaining"
                          from the snapshot)
   "recommended_intervention": a SEPARATE, non-executable advisory - one of
-                         NONE, UPDATE_PAYMENT_METHOD, MANDATE_REAUTH_REVIEW,
-                         PAYMENT_PLAN_REVIEW, BILLING_SUPPORT_REVIEW,
-                         HUMAN_FOLLOW_UP. It never authorizes anything and
-                         never recommends a discount, access change,
-                         suspension, or freeze.
-  "human_review_recommended": true/false. MUST be false for NONE and
-                         UPDATE_PAYMENT_METHOD; MUST be true for every other
-                         recommended_intervention.
-  "human_review_reason": null for NONE/UPDATE_PAYMENT_METHOD; otherwise a
-                         short (<= {MAX_HUMAN_REVIEW_REASON_CHARS} char),
+                         NONE, PAYMENT_PLAN_REVIEW. It never authorizes
+                         anything and never recommends a discount, access
+                         change, suspension, or freeze. PAYMENT_PLAN_REVIEW
+                         requires REPEATED payment-history evidence of
+                         recurring affordability/timing difficulty, not
+                         supported by a technical/provider explanation - a
+                         single insufficient-funds failure alone never
+                         justifies it.
+  "human_review_recommended": true/false. MUST be false for NONE; MUST be
+                         true for PAYMENT_PLAN_REVIEW.
+  "human_review_reason": null for NONE; otherwise a short
+                         (<= {MAX_HUMAN_REVIEW_REASON_CHARS} char),
                          evidence-based reason - never a URL, amount, or
                          payment/provider identifier, never an invented fact.
   "message_intent": EITHER null, OR one of these approved strings COPIED VERBATIM

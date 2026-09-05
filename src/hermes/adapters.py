@@ -15,6 +15,7 @@ from .types import (
     AUDIT_ACTION_OUTCOME,
     AUDIT_AI_PROPOSAL,
     AUDIT_INPUT_EVENT,
+    AUDIT_MESSAGE_DELIVERY_ATTEMPTED,
     AUDIT_MESSAGE_DRAFTED,
     AUDIT_PAYMENT_CONFIRMATION,
     AUDIT_PENDING_WORK_CANCELLED,
@@ -39,10 +40,12 @@ from .types import (
     CaseProjection,
     CaseSnapshot,
     CaseState,
+    DeliveryOutcome,
     DiscardWorkCommand,
     EvaluationCommand,
     IntakeCommand,
     IntakeResult,
+    MessageDeliveryCommand,
     MessageStatus,
     NoteEventCommand,
     PolicyOutcome,
@@ -306,6 +309,9 @@ class InMemoryLedger:
                     reference=i.reference, message_sent=i.message_sent, url=i.url,
                     message_intent=i.message_intent, message_draft=i.message_draft,
                     message_status=i.message_status,
+                    delivery_channel=i.delivery_channel, delivery_outcome=i.delivery_outcome,
+                    delivery_message_id=i.delivery_message_id,
+                    delivery_attempted_time=i.delivery_attempted_time,
                 )
                 for i in self._action_intents.values()
                 if i.case_id == c.case_id
@@ -851,6 +857,42 @@ class InMemoryLedger:
             {"state": CaseState.ESCALATED.value, "reason": cmd.reason},
         )
         return ApplyResult(ok=True, terminal=True, reason="uncertain")
+
+    def apply_message_delivery(self, cmd: MessageDeliveryCommand) -> ApplyResult:
+        """Record one real delivery attempt (any outcome). Idempotent: an
+        intent already ``sent`` is left alone - a verified delivery is never
+        repeated, and this never runs the adapter itself (the caller already
+        decided not to re-call a sent intent). A ``failed``/``uncertain``
+        outcome is recorded but never flips ``message_status`` to ``sent``
+        and never schedules an automatic retry.
+        """
+        intent = self._action_intents.get(cmd.intent_id)
+        if intent is None or intent.case_id != cmd.case_id:
+            return ApplyResult(ok=False, reason="unknown_intent")
+        if intent.message_status == MessageStatus.SENT.value:
+            return ApplyResult(ok=True, reason="already_sent")
+        case = self._cases[intent.case_id]
+        intent.delivery_channel = cmd.channel
+        intent.delivery_outcome = cmd.outcome
+        intent.delivery_attempted_time = cmd.now
+        sent = cmd.outcome == DeliveryOutcome.SENT.value
+        intent.delivery_message_id = cmd.message_id if sent else None
+        if sent:
+            intent.message_status = MessageStatus.SENT.value
+            intent.message_sent = True
+            case.messages_sent += 1
+            case.last_contact_time = cmd.now
+            case.version += 1
+        self._append(
+            cmd.now, case.case_id, AUDIT_MESSAGE_DELIVERY_ATTEMPTED,
+            {
+                "intent_id": intent.intent_id, "case_id": case.case_id,
+                "channel": cmd.channel, "outcome": cmd.outcome,
+                "message_id": intent.delivery_message_id,
+                "attempted_time": cmd.now,
+            },
+        )
+        return ApplyResult(ok=True, terminal=False)
 
     # -- internals -------------------------------------------------
 

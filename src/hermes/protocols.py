@@ -19,10 +19,12 @@ from .types import (
     CaptureInfo,
     CaseProjection,
     CaseSnapshot,
+    DeliveryReceipt,
     DiscardWorkCommand,
     EvaluationCommand,
     IntakeCommand,
     IntakeResult,
+    MessageDeliveryCommand,
     NoteEventCommand,
     ProviderRetryFact,
     StrategistFailureCommand,
@@ -57,6 +59,19 @@ class PaymentProvider(Protocol):
     # actual Payment Link and requires both. Returns the provider's own
     # correlation id (a real adapter returns its Payment Link id, e.g.
     # "plink_..." - never a payment id).
+
+
+class MessageDeliveryAdapter(Protocol):
+    """Real customer-message delivery - a seam entirely separate from
+    ``PaymentProvider``. Telegram is the first (and, this milestone, only)
+    implementation. ``text`` is already fully constructed by deterministic
+    code (approved template + confirmed checkout URL, added only at the
+    delivery boundary) - an adapter never sees or builds the URL itself, and
+    never receives Hermes's raw proposal. Disabled/unconfigured
+    implementations must return a ``DeliveryReceipt`` with outcome
+    ``"failed"`` - never silently claim delivery."""
+
+    def deliver(self, *, text: str) -> DeliveryReceipt: ...
 
 
 class Ledger(Protocol):
@@ -104,6 +119,10 @@ class Ledger(Protocol):
     # Safe stop for a ``ProviderActionUncertain`` (or a still-``pending``
     # intent found at startup): marks the intent ``uncertain`` and the case
     # ``escalated`` - idempotent, never recovered, never retried automatically.
+
+    def apply_message_delivery(self, cmd: MessageDeliveryCommand) -> ApplyResult: ...
+    # Records one real delivery attempt (any outcome). Idempotent: a replay
+    # against an intent already ``sent`` is a no-op - never a second message.
 
     def discard_work(self, cmd: DiscardWorkCommand) -> ApplyResult: ...
 

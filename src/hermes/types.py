@@ -111,25 +111,22 @@ class RecommendedIntervention(StrEnum):
     """A non-executable advisory the strategist may attach to its proposal -
     never an action, never a change to money/terms/access. Deterministic
     policy has no notion of these values; they exist purely as evidence for a
-    human, surfaced via audit/Neon only. No enum value exists for a discount,
-    access change, suspension, or freeze - those can never be recommended."""
+    human, surfaced via audit/Neon only. Narrowed to this demo's product
+    scope (insufficient-funds recovery only): no enum value exists for a
+    discount, access change, suspension, freeze, or any of the other
+    intervention categories a broader product might one day need."""
 
     NONE = "NONE"
-    UPDATE_PAYMENT_METHOD = "UPDATE_PAYMENT_METHOD"
-    MANDATE_REAUTH_REVIEW = "MANDATE_REAUTH_REVIEW"
     PAYMENT_PLAN_REVIEW = "PAYMENT_PLAN_REVIEW"
-    BILLING_SUPPORT_REVIEW = "BILLING_SUPPORT_REVIEW"
-    HUMAN_FOLLOW_UP = "HUMAN_FOLLOW_UP"
 
 
 # Interventions that must NEVER carry a human-review recommendation/reason.
 NO_REVIEW_INTERVENTIONS: frozenset[RecommendedIntervention] = frozenset({
-    RecommendedIntervention.NONE, RecommendedIntervention.UPDATE_PAYMENT_METHOD,
+    RecommendedIntervention.NONE,
 })
 # Interventions that MUST carry human_review_recommended=True + a nonblank reason.
 REVIEW_REQUIRED_INTERVENTIONS: frozenset[RecommendedIntervention] = frozenset({
-    RecommendedIntervention.MANDATE_REAUTH_REVIEW, RecommendedIntervention.PAYMENT_PLAN_REVIEW,
-    RecommendedIntervention.BILLING_SUPPORT_REVIEW, RecommendedIntervention.HUMAN_FOLLOW_UP,
+    RecommendedIntervention.PAYMENT_PLAN_REVIEW,
 })
 MAX_HUMAN_REVIEW_REASON_CHARS = 300
 
@@ -137,8 +134,8 @@ MAX_HUMAN_REVIEW_REASON_CHARS = 300
 class MessageStatus(StrEnum):
     """Lifecycle of a CREATE_RECOVERY_LINK's bundled ``message_intent`` draft -
     distinct from ``PolicyDecision.message_authorized`` (a pre-effect policy
-    fact) and from actual delivery (no adapter exists yet; see engine.run's
-    ``message_delivery_capable`` handling)."""
+    fact) and from actual delivery (owned by the real messaging adapter, e.g.
+    Telegram - never inferred from a provider capability flag)."""
 
     NOT_REQUESTED = "NOT_REQUESTED"  # no message_intent was proposed
     SUPPRESSED = "SUPPRESSED"        # proposed, but policy would not authorize it
@@ -366,6 +363,11 @@ class ActionIntent:
     message_draft: str | None = None  # deterministic rendering (== message_intent
     # verbatim; never a model-generated URL/amount/id) - set only once DRAFTED
     message_status: str = MessageStatus.NOT_REQUESTED.value
+    # --- real delivery evidence (e.g. Telegram) - sanitized only ----------
+    delivery_channel: str | None = None  # e.g. "telegram"; None until attempted
+    delivery_outcome: str | None = None  # a DeliveryOutcome value, or None
+    delivery_message_id: str | None = None  # sanitized; set only when outcome == "sent"
+    delivery_attempted_time: int | None = None  # logical hour of the last attempt
 
 
 # Audit event kinds (append-only trail).
@@ -382,6 +384,29 @@ AUDIT_ACTION_INTENT = "ACTION_INTENT"  # a durable action intent was persisted, 
 AUDIT_ACTION_OUTCOME = "ACTION_OUTCOME"  # the fake effect executed; intent marked complete
 AUDIT_AI_MODEL_RUN = "AI_MODEL_RUN"  # decision-linked model metadata (model, latency, validation)
 AUDIT_MESSAGE_DRAFTED = "MESSAGE_DRAFTED"  # a deterministic draft was rendered + staged (never sent)
+AUDIT_MESSAGE_DELIVERY_ATTEMPTED = "MESSAGE_DELIVERY_ATTEMPTED"  # one real delivery attempt (any outcome)
+
+
+class DeliveryOutcome(StrEnum):
+    """The result of one real message-delivery attempt (e.g. Telegram) -
+    never inferred, always reported by the adapter itself."""
+
+    SENT = "sent"          # the channel returned a verified success + message id
+    FAILED = "failed"      # the channel clearly rejected/could not deliver
+    UNCERTAIN = "uncertain"  # network/timeout/malformed response - genuinely unknown;
+    # never auto-retried (the channel gives no native idempotency guarantee)
+
+
+@dataclass(frozen=True)
+class DeliveryReceipt:
+    """Typed, sanitized result from a ``MessageDeliveryAdapter.deliver()``
+    call. Never carries a token, chat id, or raw provider response - only a
+    fixed outcome, a bounded sanitized message id (only when sent), and a
+    fixed non-secret reason category (never a raw exception/API message)."""
+
+    outcome: str  # a DeliveryOutcome value
+    message_id: str | None = None
+    reason: str | None = None
 
 
 # --- ledger reads: frozen snapshots ---------------------------------------
@@ -549,6 +574,22 @@ class ActionIntentOutcomeCommand:
 
 
 @dataclass(frozen=True)
+class MessageDeliveryCommand:
+    """Records one real message-delivery attempt for an already-DRAFTED
+    action intent. Idempotent: replaying against an intent already marked
+    ``sent`` is a no-op - a verified delivery is never repeated. A
+    ``failed``/``uncertain`` outcome is recorded but never flips the intent
+    to ``sent`` and never auto-retries."""
+
+    intent_id: str
+    case_id: str
+    now: int
+    channel: str  # e.g. "telegram"
+    outcome: str  # a DeliveryOutcome value
+    message_id: str | None = None  # sanitized; meaningful only when outcome == "sent"
+
+
+@dataclass(frozen=True)
 class ActionIntentUncertainCommand:
     """Marks an already-persisted, still-``pending`` action intent as
     ``uncertain`` (a ``ProviderActionUncertain`` was raised, or this intent
@@ -618,6 +659,10 @@ class ActionIntentProjection:
     message_intent: str | None = None
     message_draft: str | None = None
     message_status: str = MessageStatus.NOT_REQUESTED.value
+    delivery_channel: str | None = None
+    delivery_outcome: str | None = None
+    delivery_message_id: str | None = None
+    delivery_attempted_time: int | None = None
 
 
 @dataclass(frozen=True)

@@ -50,11 +50,9 @@ _ALL_ACTIONS = {
 }
 # A separate, non-executable advisory - never authorizes anything and never
 # offers a discount / access-change / suspension / freeze (no enum for those).
-_ALL_INTERVENTIONS = {
-    "NONE", "UPDATE_PAYMENT_METHOD", "MANDATE_REAUTH_REVIEW",
-    "PAYMENT_PLAN_REVIEW", "BILLING_SUPPORT_REVIEW", "HUMAN_FOLLOW_UP",
-}
-_NO_REVIEW_INTERVENTIONS = {"NONE", "UPDATE_PAYMENT_METHOD"}
+# Narrowed to this demo's product scope (insufficient-funds recovery only).
+_ALL_INTERVENTIONS = {"NONE", "PAYMENT_PLAN_REVIEW"}
+_NO_REVIEW_INTERVENTIONS = {"NONE"}
 _MAX_HUMAN_REVIEW_REASON_CHARS = 300
 # Same content rule engine.py enforces as final authority - checked here too,
 # inside the normal one-repair boundary, so an unsafe reason gets a repair
@@ -299,7 +297,7 @@ def _system_prompt(soul_text: str, skill_text: str, ctx: dict, approved_messages
         + ". Never authorizes anything; never a discount, access change, "
           "suspension, or freeze.\n"
           "- human_review_recommended must be false with human_review_reason null "
-          "for NONE/UPDATE_PAYMENT_METHOD, and true with a nonblank "
+          "for NONE, and true with a nonblank "
           f"human_review_reason (<= {_MAX_HUMAN_REVIEW_REASON_CHARS} chars, no URL/"
           "amount/payment identifier, no invented fact) for every other "
           "recommended_intervention."

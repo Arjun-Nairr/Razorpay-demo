@@ -18,7 +18,7 @@ from __future__ import annotations
 import re
 
 from .message_templates import is_approved_message_intent
-from .protocols import Ledger, PaymentProvider, Strategist
+from .protocols import Ledger, MessageDeliveryAdapter, PaymentProvider, Strategist
 from .types import (
     AUDIT_AI_MODEL_RUN,
     AUDIT_INPUT_EVENT,
@@ -27,6 +27,7 @@ from .types import (
     NO_REVIEW_INTERVENTIONS,
     ActionIntentOutcomeCommand,
     ActionIntentUncertainCommand,
+    ApplyResult,
     AuditQuery,
     BatchQuery,
     CaptureCommand,
@@ -36,6 +37,8 @@ from .types import (
     EvaluationCommand,
     IntakeCommand,
     InvalidProposal,
+    MessageDeliveryCommand,
+    MessageStatus,
     NoteEventCommand,
     PolicyDecision,
     PolicyOutcome,
@@ -246,6 +249,45 @@ def _suppress_message_reason(case: CaseSnapshot, now: int) -> str | None:
     if case.last_contact_time is not None and now - case.last_contact_time < MESSAGE_COOLDOWN_HOURS:
         return "cooldown"
     return None
+
+
+def deliver_drafted_message(
+    ledger: Ledger, case_id: str, delivery: MessageDeliveryAdapter, now: int,
+) -> ApplyResult | None:
+    """Attempt real delivery of an already-authorized, already-``DRAFTED``
+    message for this case's executed ``CREATE_RECOVERY_LINK`` action intent.
+
+    A free function over the public ``Ledger`` seam - not a
+    ``RecoveryEngine`` method (its public surface stays exactly ``receive``/
+    ``run``/``inspect``) - matching ``authorize()``'s existing shape.
+
+    Deterministic code builds the final text HERE, from the exact staged
+    draft plus the confirmed Payment Link checkout URL - Hermes never sees
+    or generates the URL, and the URL is never itself persisted in the
+    draft/audit trail. Returns ``None`` (nothing to do) when no intent is
+    eligible - in particular, a ``SIMULATED`` link (no confirmed
+    ``REAL_TEST_MODE`` checkout URL) is never delivered. Idempotent: an
+    intent already ``sent`` is filtered out here, so a replay never calls
+    the adapter - never a second real message - and a ``failed``/
+    ``uncertain`` result is recorded but never automatically retried.
+    """
+    proj = ledger.case_projection(case_id=case_id)
+    intent = next(
+        (i for i in proj.action_intents
+         if i.action == ProposalAction.CREATE_RECOVERY_LINK.value
+         and i.status == "executed"
+         and i.message_status == MessageStatus.DRAFTED.value
+         and i.url),
+        None,
+    )
+    if intent is None:
+        return None
+    text = f"{intent.message_draft}\n\n{intent.url}"
+    receipt = delivery.deliver(text=text)
+    return ledger.apply_message_delivery(MessageDeliveryCommand(
+        intent_id=intent.intent_id, case_id=case_id, now=now,
+        channel="telegram", outcome=receipt.outcome, message_id=receipt.message_id,
+    ))
 
 
 class RecoveryEngine:

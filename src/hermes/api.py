@@ -50,6 +50,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 
 from .demo_fixtures import (
+    CASE3_REASON,
     CASE3_STEP_HOURS,
     DEMO_PROVENANCE_KIND,
     MerchantContext,
@@ -68,6 +69,12 @@ _SUPPORTED_EVENTS: dict[str, WebhookType] = {
     "payment.captured": WebhookType.PAYMENT_CAPTURED,
 }
 _ALLOWED_EVIDENCE_MODE = "SIMULATED"
+# Product scope lock: an agentic recovery orchestrator for SaaS subscription
+# payments declined for insufficient funds - not a general payment-failure
+# engine. Any other (or missing) normalized failure reason is acknowledged
+# safely (2xx, so the provider never retry-storms) but never reaches
+# engine.receive - no case, no Hermes run, no effect of any kind.
+_OUTCOME_UNSUPPORTED_REASON = "ignored_unsupported_failure_reason"
 _HEX_SHA256 = re.compile(r"\A[0-9a-fA-F]{64}\Z")
 _ISO_CURRENCY = re.compile(r"\A[A-Z]{3}\Z")
 
@@ -252,6 +259,19 @@ def _ingest(
         webhook = normalize_event(body, event_id, config, mctx)
     except _UnsupportedEvent:
         raise HTTPException(status_code=422, detail=_ERR_UNSUPPORTED_EVENT)
+    if webhook.type is WebhookType.PAYMENT_FAILED and webhook.reason_code != CASE3_REASON:
+        # Fail closed BEFORE Hermes ever runs: any other or missing reason
+        # (including None) creates no case, retry, link, recommendation, or
+        # message. Still a normal 2xx so the provider does not retry-storm -
+        # signature verification and event-id handling above are unaffected.
+        return {
+            "accepted": True,
+            "duplicate": False,
+            "case_id": None,
+            "event_id": event_id,
+            "evidence_mode": webhook.evidence_mode,
+            "outcome": _OUTCOME_UNSUPPORTED_REASON,
+        }
     result = engine.receive(webhook)  # durable intake only
     return {
         "accepted": result.accepted,

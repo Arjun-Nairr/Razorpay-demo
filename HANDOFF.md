@@ -1,6 +1,6 @@
 # Cross-Agent Handoff — current-state index
 
-Last updated: 2026-09-05 (Asia/Dubai), Iteration 24. Branch
+Last updated: 2026-09-05 (Asia/Dubai), Iteration 25. Branch
 `feat/isolated-hermes-agent`, latest commit at bottom. This file stays
 **under 240 lines**: it is an index, not a log. Detail lives in the linked
 docs; iteration-by-iteration history is in
@@ -8,9 +8,10 @@ docs; iteration-by-iteration history is in
 
 ## What this is
 
-A selection-quality **AI Revenue Recovery Agent** demo (SaaS subscription
-payment recovery, above Razorpay). One deep `RecoveryEngine` (`receive` / `run`
-/ `inspect`); the AI *proposes* a typed strategy, deterministic policy
+**An agentic recovery orchestrator for SaaS subscription payments declined
+for insufficient funds** - not a general payment-failure engine (locked in
+Iteration 25; see below). One deep `RecoveryEngine` (`receive` / `run` /
+`inspect`); the AI *proposes* a typed strategy, deterministic policy
 *authorizes* every effect, Neon stores current projections + an append-only
 audit ledger. Case 3 (insufficient funds) is the proven vertical slice, now
 HYBRID: real Razorpay Test Mode behind the same seam (see below).
@@ -71,13 +72,8 @@ Unchanged this iteration - full detail in the archive. Summary: one `propose`
 the pinned installed Hermes interpreter; three case-scoped read tools; budgets
 (6 tool calls, 8 model iterations shared with repair, 90s subprocess deadline,
 one in-flight decision); bounded/allowlisted audit metadata, no raw
-transcripts.
-
-## Startup & connectivity (Iterations 13–15)
-
-Unchanged - full narrative in the archive (IPv6/TLS/encoding root causes,
-bounded startup budget incl. DNS + first read, no fresh grace period after
-the budget is spent).
+transcripts. Startup/connectivity fixes (Iterations 13-15: IPv6/TLS/encoding
+root causes, bounded startup budget) are archived, also unchanged.
 
 ## Razorpay Test Mode — HYBRID slice
 
@@ -95,96 +91,75 @@ five-defect correction, two small gap fixes) are archived. User-only setup
 (Test Mode key pair, webhook, `.env` flags) is DONE; manual Test Mode
 checkout was deliberately not completed (see Iteration 18 below).
 
-## Iterations 18-20 — live case-18, Neon views, relay hardening
+## Iterations 18-24 — case-18, Neon views, SOUL wiring, advisory + corrections
 
-Condensed; full detail archived. Iteration 18: one live HYBRID attempt via a
-loopback-only relay + SSH tunnel - real Hermes/Gemini decisions, one real
-Razorpay Test Mode link (**case-18**), **stopped before payment** on a
-Codex/user scope change (demo doesn't need a completed checkout). Iteration
-19: `/health` reports provider-mode flags, `run_one_hybrid_case.py` fails
-closed unless real; five read-only Neon views added to `init_neon.py`
-(`case_summary`, `hermes_decisions`, `recovery_actions`, `hermes_evidence`,
-`audit_timeline`); views read back and confirmed correct for case-18/case-11.
-Iteration 20: three `webhook_relay.py` hardening defects closed (absolute
-read deadline vs. drip-feed, premature-EOF rejection, log-method allowlist),
-offline only. See
-[`docs/archive/HANDOFF_full_2026-09-04.md`](docs/archive/HANDOFF_full_2026-09-04.md)
-for full narrative.
+Fully condensed; full narrative archived - see
+[`docs/archive/HANDOFF_full_2026-09-04.md`](docs/archive/HANDOFF_full_2026-09-04.md).
+In order: one live HYBRID attempt stopped before payment (**case-18**);
+`/health` provider-mode flags + five read-only Neon views
+(`case_summary`/`hermes_decisions`/`recovery_actions`/`hermes_evidence`/
+`audit_timeline`); `webhook_relay.py` hardening; Codex's
+`config/hermes_agent/SOUL.md` wired beside `SKILL.md` into the isolated
+child's prompt; one live consistent-history case (**case-25**,
+`WAIT_FOR_PROVIDER_RETRY`/`ALLOW`/`waiting`); the non-executable
+`RecommendedIntervention` advisory contract + `MessageStatus`
+(`NOT_REQUESTED`/`SUPPRESSED`/`AUTHORIZED`/`DRAFTED`/`SENT`-reserved)
+lifecycle added, with a `MESSAGE_DRAFTED` audit event; then correction-only
+fixes (a fabricated-delivery gap in `engine.py`, a `SKILL.md` instruction
+contradiction, repair-boundary validation alignment).
 
-## Iterations 21-22 — SOUL wiring + one live consistent-history exemplar
+## Iteration 25 — product scope lock + narrowed advisory + Telegram foundation
 
-Condensed; full detail archived. Iteration 21: wired Codex's
-`config/hermes_agent/SOUL.md` beside `SKILL.md` Rule 1 into the isolated
-child's ephemeral prompt (SOUL -> SKILL -> case context -> tool/output
-contract); `__init__` fails closed if either file is missing/unreadable/not
-UTF-8; fresh `last_run_meta` assigned before re-reading them so a load
-failure can't inherit a prior run's metadata. Iteration 22: one real
-consistent-history case (**case-25**) run through live Gemini via the
-existing `/demo/case` + `/demo/step advance` path, stopped after one
-decision - `WAIT_FOR_PROVIDER_RETRY`/`ALLOW`/`waiting`, confidence 0.55
-medium, one `get_payment_retry_facts` call, zero links/messages, persisted
-to and read back from all five Neon views. See
-[`docs/archive/HANDOFF_full_2026-09-04.md`](docs/archive/HANDOFF_full_2026-09-04.md)
-for the full narrative.
+No live case run; no Gemini/Razorpay/Telegram/Neon call.
 
-## Iteration 23 — advisory-intervention + staged-message foundation
-
-Condensed; full detail archived. Separated Hermes's executable `action`
-from a new non-executable `RecommendedIntervention` advisory (6 values, no
-discount/access/suspension/freeze value exists); `StrategyProposal` gained
-`recommended_intervention`/`human_review_recommended`/`human_review_reason`
-(safe defaults, existing proposals unaffected); `engine._validate_proposal`
-fails closed on the full combination rule. New `MessageStatus` lifecycle
-(`NOT_REQUESTED`/`SUPPRESSED`/`AUTHORIZED`/`DRAFTED`/`SENT`-reserved) staged
-via a new `MESSAGE_DRAFTED` audit event. Neon's `hermes_decisions`/
-`recovery_actions` views extended (historical rows read `NOT_RECORDED`/
-`LEGACY_NOT_STAGED`, never a false positive). See
-[`docs/archive/HANDOFF_full_2026-09-04.md`](docs/archive/HANDOFF_full_2026-09-04.md)
-for the full narrative.
-
-## Iteration 24 — correction-only: fabricated-delivery + instruction fixes
-
-Three review findings closed; no new fixture/case, no live call.
-
-- **Removed the last fabricated-delivery path** (`engine.py`): Iteration 23
-  made `message_sent` default `False` only for a provider *missing*
-  `message_delivery_capable`; a provider that SET it `True` would still have
-  been read. That lookup is now removed entirely - `message_sent` is always
-  `False` here, unconditionally, until a real (Telegram) adapter owns a
-  verified `DRAFTED -> SENT` transition. New regression
-  (`test_a_capability_flag_is_not_evidence_of_delivery`) proves a provider
-  claiming `message_delivery_capable=True` still yields `message_sent=False`,
-  `message_status=DRAFTED`, and an unchanged contact counter.
-- **Fixed a real instruction contradiction** (`SKILL.md`): removed the
-  "unless an independent unresolved risk genuinely requires review"
-  exception, which contradicted the `NONE`/`UPDATE_PAYMENT_METHOD` rule
-  `engine._validate_proposal` actually enforces. The rule is now exactly:
-  `NONE`/`UPDATE_PAYMENT_METHOD` require `human_review_recommended=false`
-  and `reason=null`; every other value requires `true` + a nonblank reason
-  - no exception, matching the code precisely.
-- **Aligned repair-boundary validation**: both `child_main._validate()`
-  (isolated Hermes) and `hermes_strategist.parse_proposal()` (direct
-  Gemini) now reject an unsafe `human_review_reason` (URL, currency/amount
-  marker, or a payment/provider/customer/event/subscription/link/case
-  identifier-shaped token) themselves, inside their own one-repair
-  boundary - not only later, once, in `engine._validate_proposal` (kept as
-  canonical defense-in-depth). New tests prove an unsafe first reply enters
-  the existing repair path and is either fixed or bounded-fails - it can
-  never reach the engine unsafe.
+- **Product scope locked** (`api.py`): only the normalized reason
+  `insufficient_funds` may create a case. Any other/missing
+  `PAYMENT_FAILED` reason is acknowledged (2xx, so the provider never
+  retry-storms) but never reaches `engine.receive` - no case, retry, link,
+  recommendation, or message - returning `outcome:
+  "ignored_unsupported_failure_reason"`. Signature verification and
+  event-id idempotency are unaffected; a redelivered ignored event is still
+  safely acknowledged (nothing to duplicate, since nothing ever happened).
+- **Advisory narrowed to `NONE`/`PAYMENT_PLAN_REVIEW`** (`types.py`,
+  `child_main.py`, `hermes_strategist.py`, `SKILL.md`): the other four
+  values are removed from the live typed/model contract (never
+  reconstructed from persisted JSONB, so historical Neon rows stay exactly
+  as recorded - just no longer producible going forward).
+  `PAYMENT_PLAN_REVIEW` requires repeated payment-history evidence of a
+  recurring affordability/timing difficulty not explained by a technical/
+  provider cause; a single failure never justifies it alone.
+- **Telegram delivery foundation** (`telegram_delivery.py`, new
+  `MessageDeliveryAdapter` protocol, `engine.deliver_drafted_message` free
+  function - `RecoveryEngine`'s own surface stays `receive`/`run`/
+  `inspect`): disabled by default, config read only from `TELEGRAM_ENABLED`/
+  `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` (`.env.example` updated, `.env`
+  untouched). Delivers only an already-authorized, already-`DRAFTED`
+  message for an executed `CREATE_RECOVERY_LINK` with a CONFIRMED
+  `REAL_TEST_MODE` checkout URL (never a `SIMULATED` link); the URL is
+  appended to the approved template only at this boundary - Hermes never
+  sees or generates it, and it never enters the stored draft/audit trail.
+  `message_status` advances `DRAFTED -> SENT` only on a verified success
+  with a message id; `failed`/`uncertain` are recorded (new append-only
+  `MESSAGE_DELIVERY_ATTEMPTED` audit event, sanitized fields only) but
+  never auto-retried and never claim `SENT`. Idempotent: an intent already
+  `SENT` is filtered out before the adapter is ever called again - a replay
+  can never send a second message. `scripts/telegram_setup.py` verifies the
+  bot (`getMe`) and lists chat-id candidates (`getUpdates`) without ever
+  printing a secret value or writing `.env`; no test makes a real network
+  call.
 
 ## Verified evidence
 
 Pre-Iteration-21 evidence is archived - see
 [`docs/archive/HANDOFF_full_2026-09-04.md`](docs/archive/HANDOFF_full_2026-09-04.md).
+Iterations 21/23/24 focused/full counts: 41/373, 60/404, 67/410 (all
+passed, 3 skipped where applicable; 22 made no source change).
 
-- **Iteration 21**: focused **41 passed**; full offline **373 passed, 3 skipped**.
-- **Iteration 22**: no source change; live Neon readback (archived above).
-- **Iteration 23**: focused **60 passed**; full offline **404 passed, 3 skipped**.
-- **Iteration 24**: focused `tests/test_hermes_agent.py` -> **67 passed**
-  (+7). Full offline (`--ignore=tests/test_hermes_agent.py`) -> **410
-  passed, 3 skipped** (+6). `compileall` + `git diff --check` clean; diff
-  and secret scan reviewed. No Gemini/Razorpay/Telegram/webhook/tunnel/
-  new-case activity.
+- **Iteration 25**: focused `tests/test_hermes_agent.py` -> **71 passed**
+  (+4). Full offline (`--ignore=tests/test_hermes_agent.py`) -> **442
+  passed, 3 skipped** (+32: scope-lock, Telegram, advisory-narrowing).
+  `compileall` + `git diff --check` clean; diff and secret scan reviewed.
+  No Gemini/Razorpay/Telegram/Neon call; no case created.
 
 ## Inspecting the persisted proof
 
@@ -219,13 +194,14 @@ actually wired to `hermes-runtime` + `hybrid_test_mode` + enabled.
 
 ## Next action
 
-These corrections are complete; the branch is ready for the **Telegram
-delivery adapter** (owning the real, verified `DRAFTED -> SENT` transition -
-see Iteration 24), followed by one golden reliable-customer end-to-end case
-through that adapter. The chronically-late and mixed-history exemplars
-remain deferred until after that. The dashboard stays the final
-presentation layer, updated last. No further live action planned against
-`case-18`/`case-25`. Keep future `HANDOFF.md` updates under 240 lines.
+The Telegram adapter is built but **not yet live-verified**. Exact next
+step: the user completes Telegram setup (BotFather token + chat id in
+`.env`; see chat for the numbered guide), then Claude Code verifies it
+(`scripts/telegram_setup.py`) - no case run yet. After that: one golden
+reliable-customer end-to-end case, live, through Telegram. Chronically-late
+and mixed-history exemplars remain deferred until after that; the dashboard
+stays the final presentation layer, built last. No further live action
+planned against `case-18`/`case-25`. Keep future updates under 240 lines.
 
 ## Working-document links
 

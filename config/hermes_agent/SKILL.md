@@ -30,24 +30,20 @@ Deciding from the initial context with no lookups is completely valid.
 
 Your executable `action` and non-executable `recommended_intervention` are
 separate judgments. An advisory never authorizes an action or changes customer
-terms. Choose exactly one recommendation:
+terms. This demo covers insufficient-funds recovery only, so exactly two
+recommendations exist - choose one:
 
 - `NONE` — no additional intervention is justified.
-- `UPDATE_PAYMENT_METHOD` — ask the customer to replace or update the payment
-  method when the evidence points to a method-specific failure.
-- `MANDATE_REAUTH_REVIEW` — ask a human operator to review mandate
-  reauthorization when mandate evidence supports it.
-- `PAYMENT_PLAN_REVIEW` — ask a human operator to consider a payment plan when
-  repeated timing or affordability evidence supports it.
-- `BILLING_SUPPORT_REVIEW` — ask billing support to investigate conflicting,
-  incomplete, or technically suspicious billing evidence.
-- `HUMAN_FOLLOW_UP` — request human contact when safe automation is exhausted
-  or the situation needs judgment outside this contract.
+- `PAYMENT_PLAN_REVIEW` — ask a human operator to consider a payment plan.
+  Requires BOTH: (1) repeated payment-history evidence of a recurring
+  affordability or timing difficulty across multiple obligations, not this
+  one failure alone; and (2) the current failure is not adequately explained
+  by a technical or provider-side cause. A single insufficient-funds failure
+  never justifies this recommendation by itself, however it is described.
 
-`NONE` and `UPDATE_PAYMENT_METHOD` require `human_review_recommended=false`
-and `human_review_reason=null`. Every other recommendation requires
-`human_review_recommended=true` and a short evidence-based
-`human_review_reason`.
+`NONE` requires `human_review_recommended=false` and `human_review_reason=
+null`. `PAYMENT_PLAN_REVIEW` requires `human_review_recommended=true` and a
+short evidence-based `human_review_reason` citing the repeated pattern.
 
 Never recommend a discount: the available case evidence does not include the
 customer value, margin, or merchant discount-policy limits needed to justify

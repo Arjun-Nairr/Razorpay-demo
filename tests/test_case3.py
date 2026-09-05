@@ -458,7 +458,7 @@ def test_advisory_is_persisted_in_ai_proposal_audit_event(razorpay):
     eligible(razorpay)
     ledger = InMemoryLedger()
     engine = RecoveryEngine(ledger, _AdvisoryStrategist(
-        recommended_intervention=RecommendedIntervention.HUMAN_FOLLOW_UP,
+        recommended_intervention=RecommendedIntervention.PAYMENT_PLAN_REVIEW,
         human_review_recommended=True,
         human_review_reason="evidence is thin; a human should look",
     ), razorpay)
@@ -467,13 +467,13 @@ def test_advisory_is_persisted_in_ai_proposal_audit_event(razorpay):
 
     proposals = [rec.detail for rec in engine.inspect(AuditQuery(case_id=r.case_id)).records
                  if rec.kind == "AI_PROPOSAL"]
-    assert proposals[-1]["recommended_intervention"] == "HUMAN_FOLLOW_UP"
+    assert proposals[-1]["recommended_intervention"] == "PAYMENT_PLAN_REVIEW"
     assert proposals[-1]["human_review_recommended"] is True
     assert proposals[-1]["human_review_reason"] == "evidence is thin; a human should look"
 
 
 def test_advisory_never_changes_authorization_or_executes_an_effect():
-    """A HUMAN_FOLLOW_UP advisory alongside an otherwise-identical WAIT
+    """A PAYMENT_PLAN_REVIEW advisory alongside an otherwise-identical WAIT
     proposal must authorize/schedule EXACTLY as a NONE advisory would - the
     advisory is evidence only, never authority."""
     rp1, rp2 = FakeRazorpayAdapter(), FakeRazorpayAdapter()
@@ -481,7 +481,7 @@ def test_advisory_never_changes_authorization_or_executes_an_effect():
     eligible(rp2, obligation="sub_advised")
     plain = RecoveryEngine(InMemoryLedger(), _AdvisoryStrategist(), rp1)
     advised = RecoveryEngine(InMemoryLedger(), _AdvisoryStrategist(
-        recommended_intervention=RecommendedIntervention.HUMAN_FOLLOW_UP,
+        recommended_intervention=RecommendedIntervention.PAYMENT_PLAN_REVIEW,
         human_review_recommended=True, human_review_reason="a reason",
     ), rp2)
 

@@ -378,11 +378,11 @@ def test_unsafe_human_review_reason_enters_the_repair_path_and_is_fixed(stub, tm
     _, S = stub
     bad = ('{"action":"WAIT_FOR_PROVIDER_RETRY","diagnosis":"d","rationale":"r",'
            '"confidence":0.6,"proposed_wait_hours":24,'
-           '"recommended_intervention":"HUMAN_FOLLOW_UP","human_review_recommended":true,'
+           '"recommended_intervention":"PAYMENT_PLAN_REVIEW","human_review_recommended":true,'
            '"human_review_reason":"see reference plink_abc123","message_intent":null}')
     good = ('{"action":"WAIT_FOR_PROVIDER_RETRY","diagnosis":"d","rationale":"r",'
             '"confidence":0.6,"proposed_wait_hours":24,'
-            '"recommended_intervention":"HUMAN_FOLLOW_UP","human_review_recommended":true,'
+            '"recommended_intervention":"PAYMENT_PLAN_REVIEW","human_review_recommended":true,'
             '"human_review_reason":"a safe evidence-based reason","message_intent":null}')
     S.queue = [_text(bad), _text(good)]
     strat = _strat(stub, tmp_path)
@@ -397,7 +397,7 @@ def test_unsafe_human_review_reason_unfixed_never_returns_a_proposal(stub, tmp_p
     _, S = stub
     bad = ('{"action":"WAIT_FOR_PROVIDER_RETRY","diagnosis":"d","rationale":"r",'
            '"confidence":0.6,"proposed_wait_hours":24,'
-           '"recommended_intervention":"HUMAN_FOLLOW_UP","human_review_recommended":true,'
+           '"recommended_intervention":"PAYMENT_PLAN_REVIEW","human_review_recommended":true,'
            '"human_review_reason":"call http://example.com/pay","message_intent":null}')
     S.queue = [_text(bad), _text(bad)]
     strat = _strat(stub, tmp_path)
@@ -600,12 +600,14 @@ def _child_obj(**over) -> dict:
 
 
 def test_child_validate_accepts_every_valid_advisory_enum():
+    """Narrowed to this demo's product scope: NONE and PAYMENT_PLAN_REVIEW
+    only - no discount/access/suspension/freeze value, and no method-update/
+    reauth/billing/follow-up categories a broader product might add later."""
     from hermes.hermes_agent import child_main
 
-    for value in ("NONE", "UPDATE_PAYMENT_METHOD", "MANDATE_REAUTH_REVIEW",
-                  "PAYMENT_PLAN_REVIEW", "BILLING_SUPPORT_REVIEW", "HUMAN_FOLLOW_UP"):
+    for value in ("NONE", "PAYMENT_PLAN_REVIEW"):
         over = {"recommended_intervention": value}
-        if value in ("NONE", "UPDATE_PAYMENT_METHOD"):
+        if value == "NONE":
             over.update(human_review_recommended=False, human_review_reason=None)
         else:
             over.update(human_review_recommended=True, human_review_reason="a reason")
@@ -613,11 +615,18 @@ def test_child_validate_accepts_every_valid_advisory_enum():
         assert verdict == "valid", value
 
 
-def test_child_validate_rejects_unknown_advisory():
+@pytest.mark.parametrize("value", [
+    "OFFER_DISCOUNT", "UPDATE_PAYMENT_METHOD", "MANDATE_REAUTH_REVIEW",
+    "BILLING_SUPPORT_REVIEW", "HUMAN_FOLLOW_UP",
+])
+def test_child_validate_rejects_unknown_advisory(value):
+    """Includes every intervention this demo's earlier, broader draft once
+    offered - narrowing the live contract must reject them, not merely the
+    ones that were never valid."""
     from hermes.hermes_agent import child_main
 
     obj, verdict = child_main._validate(
-        _child_obj(recommended_intervention="OFFER_DISCOUNT"), set()
+        _child_obj(recommended_intervention=value), set()
     )
     assert obj is None and verdict == "unknown_intervention"
 
@@ -637,7 +646,7 @@ def test_child_validate_rejects_blank_or_oversized_reason(reason):
     from hermes.hermes_agent import child_main
 
     obj, verdict = child_main._validate(
-        _child_obj(recommended_intervention="HUMAN_FOLLOW_UP",
+        _child_obj(recommended_intervention="PAYMENT_PLAN_REVIEW",
                    human_review_recommended=True, human_review_reason=reason),
         set(),
     )
@@ -658,7 +667,7 @@ def test_child_validate_rejects_unsafe_reason_content(reason):
     from hermes.hermes_agent import child_main
 
     obj, verdict = child_main._validate(
-        _child_obj(recommended_intervention="HUMAN_FOLLOW_UP",
+        _child_obj(recommended_intervention="PAYMENT_PLAN_REVIEW",
                    human_review_recommended=True, human_review_reason=reason),
         set(),
     )
@@ -668,8 +677,8 @@ def test_child_validate_rejects_unsafe_reason_content(reason):
 @pytest.mark.parametrize("intervention,hrr,reason", [
     ("NONE", True, None),
     ("NONE", False, "unexpected reason"),
-    ("MANDATE_REAUTH_REVIEW", False, "a reason"),
-    ("MANDATE_REAUTH_REVIEW", True, None),
+    ("PAYMENT_PLAN_REVIEW", False, "a reason"),
+    ("PAYMENT_PLAN_REVIEW", True, None),
 ])
 def test_child_validate_rejects_every_invalid_combination(intervention, hrr, reason):
     from hermes.hermes_agent import child_main

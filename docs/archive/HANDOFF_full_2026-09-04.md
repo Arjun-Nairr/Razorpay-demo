@@ -2543,3 +2543,42 @@ LEGACY_NOT_STAGED on case-18's pre-milestone recovery action.
 Verified: focused tests/test_hermes_agent.py 41 -> 60 passed; full offline
 373 -> 404 passed, 3 skipped. compileall + git diff --check clean. No
 Gemini/Razorpay/Telegram/webhook/tunnel/new-case activity.
+
+---
+
+## Iteration 24 archived detail (moved from HANDOFF.md during Iteration 25)
+
+Correction-only: fabricated-delivery + instruction fixes. Three review
+findings closed; no new fixture/case, no live call.
+
+Removed the last fabricated-delivery path (engine.py): Iteration 23 made
+message_sent default False only for a provider MISSING
+message_delivery_capable; a provider that SET it True would still have been
+read. That lookup was removed entirely - message_sent was unconditionally
+False there (superseded in Iteration 25, which removed the field-level
+check altogether now that a real Telegram adapter owns SENT). New
+regression (test_a_capability_flag_is_not_evidence_of_delivery) proved a
+provider claiming message_delivery_capable=True still yielded
+message_sent=False, message_status=DRAFTED, and an unchanged contact
+counter.
+
+Fixed a real instruction contradiction (SKILL.md): removed the "unless an
+independent unresolved risk genuinely requires review" exception, which
+contradicted the NONE/UPDATE_PAYMENT_METHOD rule engine._validate_proposal
+actually enforced. The rule became exactly: NONE/UPDATE_PAYMENT_METHOD
+require human_review_recommended=false and reason=null; every other value
+requires true + a nonblank reason - no exception, matching the code
+precisely. (UPDATE_PAYMENT_METHOD and the other four values were removed
+entirely in Iteration 25's advisory narrowing.)
+
+Aligned repair-boundary validation: both child_main._validate() (isolated
+Hermes) and hermes_strategist.parse_proposal() (direct Gemini) rejected an
+unsafe human_review_reason (URL, currency/amount marker, or a payment/
+provider/customer/event/subscription/link/case identifier-shaped token)
+themselves, inside their own one-repair boundary - not only later, once, in
+engine._validate_proposal (kept as canonical defense-in-depth). New tests
+proved an unsafe first reply entered the existing repair path and was
+either fixed or bounded-failed - it could never reach the engine unsafe.
+
+Verified: focused tests/test_hermes_agent.py 60 -> 67 passed; full offline
+404 -> 410 passed, 3 skipped. compileall + git diff --check clean.
